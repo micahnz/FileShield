@@ -33,6 +33,14 @@ static int g_fan_fd = -1;
  * "timeout 30" / zenity --timeout=30 the child enforces. */
 #define DIALOG_OUTER_TIMEOUT_S 40
 
+/*
+ * Internal pseudo-decision: the user picked "Always Allow", but a second
+ * explicit confirmation is required first.  kdialog exits 1 both for the
+ * "No" button and for runtime errors, so the first click is never trusted
+ * with a permanent grant.
+ */
+#define NOTIFY_CONFIRM_ALWAYS 4
+
 void notify_set_fan_fd(int fd)
 {
     g_fan_fd = fd;
@@ -223,13 +231,14 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
 
 static int run_dialog_confirm(const char *bin, const char *text,
                               const char *yes_label, const char *no_label,
-                              int ret_yes, int ret_no)
+                              const char *cancel_label,
+                              int ret_yes, int ret_no, int ret_timeout)
 {
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) < 0)
     {
         log_msg(LOG_ERR, "pipe failed for confirm dialog: %m");
-        return ret_yes;
+        return ret_timeout;
     }
 
     pid_t pid = fork();
@@ -237,7 +246,7 @@ static int run_dialog_confirm(const char *bin, const char *text,
     {
         close(pipefd[0]);
         close(pipefd[1]);
-        return ret_yes;
+        return ret_timeout;
     }
 
     if (pid == 0)
@@ -267,19 +276,17 @@ static int run_dialog_confirm(const char *bin, const char *text,
         else
         {
             /*
-             * kdialog --menu with the label text as the tag: the chosen
-             * tag is printed to stdout, so the decision is verified by
-             * output rather than the exit code.  Cancel (exit 1), timeout
-             * (124) and any error all fall back to ret_yes (the safe
-             * "deny once" default) — an error can never be mistaken for
-             * the permanent choice.
+             * kdialog --yesnocancel with explicit labels: three real
+             * buttons, one click each.  Exit codes: Yes=0, No=1,
+             * Cancel/close/error=2.  No stdout parsing is involved.
              */
             execl("/usr/bin/timeout", "timeout", "30",
                   "/usr/bin/kdialog", "kdialog",
                   "--title", "FileShield",
-                  "--menu", text,
-                  yes_label, yes_label,
-                  no_label, no_label,
+                  "--yesnocancel", text,
+                  "--yes-label", yes_label,
+                  "--no-label", no_label,
+                  "--cancel-label", cancel_label,
                   (char *)NULL);
         }
         _exit(127);
@@ -356,40 +363,40 @@ static int run_dialog_confirm(const char *bin, const char *text,
     close(pipefd[0]);
 
     if (!child_exited || !WIFEXITED(status))
-        return ret_yes;
+        return ret_timeout;
 
     int ec = WEXITSTATUS(status);
 
     if (strcmp(bin, "zenity") == 0)
     {
-        if (ec == 5) /* zenity --timeout → walk-away default: deny once */
+        if (ec == 5) /* zenity --timeout */
+            return ret_timeout;
+        if (ec == 0) /* OK */
             return ret_yes;
-        if (ec == 0)
-            return ret_yes;
-        return ret_no;
-    }
-    else
-    {
-        /* kdialog --menu: the selected tag (== the label text) identifies
-         * the choice; cancel/timeout/error (no matching output) falls back
-         * to ret_yes so a failure can never produce a permanent deny. */
-        if (strncmp(out, yes_label, strlen(yes_label)) == 0)
-            return ret_yes;
-        if (strncmp(out, no_label, strlen(no_label)) == 0)
+        if (ec == 1) /* Cancel */
             return ret_no;
-        return ret_yes;
+        return ret_timeout;
     }
+
+    /* kdialog --yesnocancel: Yes=0, No=1, Cancel/close/error=2. */
+    if (ec == 0)
+        return ret_yes;
+    if (ec == 1)
+        return ret_no;
+    return ret_timeout;
 }
 
 static int run_dialog(const char *bin, const char *text)
 {
     /*
-     * Three-choice dialog (zenity --question --extra-button,
-     * kdialog --menu).  Both backends report the user's choice via
-     * stdout, verified before it is trusted — an exit code alone is
-     * never sufficient.  The fourth action ("Always Deny") is handled
-     * as a follow-up confirmation when the user clicks "Deny" — this
-     * adds a safety step for permanent blocks.
+     * Three-choice dialog:
+     *   - kdialog --yesnocancel with explicit labels (single click each)
+     *   - zenity --question --extra-button (OK / extra / cancel)
+     * The fourth action ("Always Deny") is handled as a follow-up
+     * confirmation when the user clicks "Deny".  kdialog's exit code 1 is
+     * ambiguous (No button vs runtime error), so choosing "Always Allow"
+     * returns NOTIFY_CONFIRM_ALWAYS and notify_ask() requires a second
+     * explicit confirmation before any permanent grant.
      */
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) < 0)
@@ -441,25 +448,20 @@ static int run_dialog(const char *bin, const char *text)
         else
         {
             /*
-             * kdialog --menu (tags == labels):
-             *   Allow Once   → exit 0 + stdout "Allow Once"
-             *   Always Allow → exit 0 + stdout "Always Allow"
-             *   Deny         → exit 0 + stdout "Deny"
-             *   Cancel       → exit 1, no output
-             *   Timeout (timeout(1)) → exit 124
-             *
-             * The decision is verified by stdout, so a kdialog crash or
-             * runtime error (which can also exit 1) can never be mistaken
-             * for the user clicking "Always Allow": everything that is not
-             * an explicit selection fails closed to NOTIFY_DENY.
+             * kdialog --yesnocancel with explicit labels:
+             *   Allow Once   → Yes    → exit 0
+             *   Always Allow → No     → exit 1 (re-confirmed by caller)
+             *   Deny         → Cancel → exit 2
+             * Window close / Escape → Cancel.
+             * Timeout via coreutils timeout(1) → exit 124.
              */
             execl("/usr/bin/timeout", "timeout", "30",
                   "/usr/bin/kdialog", "kdialog",
                   "--title", "FileShield",
-                  "--menu", text,
-                  "Allow Once", "Allow Once",
-                  "Always Allow", "Always Allow",
-                  "Deny", "Deny",
+                  "--yesnocancel", text,
+                  "--yes-label", "Allow Once",
+                  "--no-label", "Always Allow",
+                  "--cancel-label", "Deny",
                   (char *)NULL);
         }
         _exit(127);
@@ -558,8 +560,8 @@ static int run_dialog(const char *bin, const char *text)
 
     if (strcmp(bin, "zenity") == 0)
     {
-        if (ec == 5)
-            return NOTIFY_DENY; /* timeout                  */
+        if (ec == 5) /* timeout → deny once, no follow-up dialog */
+            return -1;
         if (ec == 0)
             return NOTIFY_ALLOW_ONCE; /* OK / Allow Once          */
         /* ec == 1: extra-button OR Cancel — distinguish by stdout */
@@ -567,22 +569,23 @@ static int run_dialog(const char *bin, const char *text)
             return NOTIFY_ALLOW_ALWAYS;
         return NOTIFY_DENY; /* Cancel / Deny → may trigger follow-up */
     }
-    else
-    {
-        if (ec == 124)
-            return NOTIFY_DENY; /* coreutils timeout        */
-        if (ec == 0)
-        {
-            /* Verify the selection by stdout (kdialog --menu prints the
-             * chosen tag).  A runtime error that exits 0 with no output,
-             * or any other exit code, fails closed below. */
-            if (strncmp(out, "Allow Once", 10) == 0)
-                return NOTIFY_ALLOW_ONCE;
-            if (strncmp(out, "Always Allow", 12) == 0)
-                return NOTIFY_ALLOW_ALWAYS;
-        }
-        return NOTIFY_DENY; /* Cancel / Deny / error → may trigger follow-up */
-    }
+
+    /*
+     * kdialog --yesnocancel:
+     *   Yes=0 Allow Once, No=1 Always Allow (needs re-confirmation),
+     *   Cancel=2 Deny; window close/Escape map to Cancel.
+     * Exit code 1 is also what runtime errors produce, so it is never
+     * trusted as a permanent grant on its own.
+     */
+    if (ec == 124) /* timeout → deny once, no follow-up dialog */
+        return -1;
+    if (ec == 0)
+        return NOTIFY_ALLOW_ONCE;
+    if (ec == 1)
+        return NOTIFY_CONFIRM_ALWAYS;
+    if (ec == 2)
+        return NOTIFY_DENY;
+    return -1; /* error → deny once */
 }
 
 int notify_ask(const char *comm, pid_t pid, pid_t ppid,
@@ -651,6 +654,19 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
         int r = run_dialog("kdialog", msg);
         if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_ALLOW_ALWAYS)
             return r;
+        if (r == NOTIFY_CONFIRM_ALWAYS)
+        {
+            /* "Always Allow" chosen: require an explicit second click
+             * (kdialog also exits 1 on runtime errors).  Declining or any
+             * dialog failure denies this attempt. */
+            return run_dialog_confirm("kdialog",
+                                      "Always allow this binary in this call chain?\n\n"
+                                      "\xe2\x80\xa2 Always Allow  \xe2\x80\x94 trust this exact binary\n"
+                                      "                 (re-prompts if the binary changes)\n"
+                                      "\xe2\x80\xa2 Deny Once     \xe2\x80\x94 block this time only",
+                                      "Always Allow", "Deny Once", "Deny Once",
+                                      NOTIFY_ALLOW_ALWAYS, NOTIFY_DENY, NOTIFY_DENY);
+        }
         if (r == NOTIFY_DENY)
             bin = "kdialog";
         else
@@ -681,6 +697,6 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                               "\xe2\x80\xa2 Deny Once     \xe2\x80\x94 block this time only\n"
                               "\xe2\x80\xa2 Always Deny  \xe2\x80\x94 block this binary in this call chain\n"
                               "                 (re-prompts if the binary changes)",
-                              "Deny Once", "Always Deny",
-                              NOTIFY_DENY, NOTIFY_DENY_ALWAYS);
+                              "Deny Once", "Always Deny", "Deny Once",
+                              NOTIFY_DENY, NOTIFY_DENY_ALWAYS, NOTIFY_DENY);
 }
