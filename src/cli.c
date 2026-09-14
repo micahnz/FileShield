@@ -38,7 +38,7 @@ static void print_usage(FILE *f, const char *prog)
 static const char *sha_finger(const char *sha512)
 {
     static char buf[17];
-    if (!sha512 || !sha512[0])
+    if (!sha512 || strlen(sha512) < 16)
         return "N/A";
     memcpy(buf, sha512, 16);
     buf[16] = '\0';
@@ -84,12 +84,22 @@ static const char *fmt_date(time_t t)
  */
 static void print_list(const char *label, const char *filepath)
 {
-    PersistEntry entries[PERSIST_MAX_ENTRIES];
+    /* Heap-allocated: PersistEntry is ~9 KB, and 256 of them would need a
+     * ~2.3 MB stack frame. */
+    PersistEntry *entries = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    int count;
 
-    int count = persist_load(filepath, entries, PERSIST_MAX_ENTRIES);
+    if (!entries)
+    {
+        fprintf(stderr, "Error: out of memory reading %s\n", filepath);
+        return;
+    }
+
+    count = persist_load(filepath, entries, PERSIST_MAX_ENTRIES);
     if (count < 0)
     {
         fprintf(stderr, "Error reading %s\n", filepath);
+        free(entries);
         return;
     }
 
@@ -99,6 +109,7 @@ static void print_list(const char *label, const char *filepath)
     if (count == 0)
     {
         printf("(empty)\n\n");
+        free(entries);
         return;
     }
 
@@ -126,7 +137,13 @@ static void print_list(const char *label, const char *filepath)
             targ_display[30] = '\0';
         }
         else
-            snprintf(targ_display, sizeof(targ_display), "%s", targ);
+        {
+            size_t tlen = strlen(targ);
+            if (tlen >= sizeof(targ_display))
+                tlen = sizeof(targ_display) - 1;
+            memcpy(targ_display, targ, tlen);
+            targ_display[tlen] = '\0';
+        }
         if (bin_len > 19)
         {
             const char *bin_display = bin + bin_len - 19;
@@ -144,6 +161,7 @@ static void print_list(const char *label, const char *filepath)
         printf("\n");
     }
     printf("\n");
+    free(entries);
 }
 
 int main(int argc, char *argv[])

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <syslog.h>
@@ -15,25 +16,43 @@ static int ensure_state_dir(const char *dirpath)
 {
     struct stat st;
 
-    if (stat(dirpath, &st) == 0)
+    /* lstat: never follow a symlink placed at the state directory path. */
+    if (lstat(dirpath, &st) == 0)
     {
+        if (S_ISLNK(st.st_mode))
+        {
+            log_msg(LOG_ERR, "%s is a symlink; refusing to use it", dirpath);
+            return -1;
+        }
         if (!S_ISDIR(st.st_mode))
         {
             log_msg(LOG_ERR, "%s exists but is not a directory", dirpath);
             return -1;
         }
+        if (geteuid() == 0 && st.st_uid != 0)
+        {
+            log_msg(LOG_ERR, "%s is not owned by root; refusing to use it",
+                    dirpath);
+            return -1;
+        }
+        if ((st.st_mode & 0777) != 0700)
+        {
+            if (chmod(dirpath, 0700) < 0)
+                log_msg(LOG_WARNING, "chmod %s: %s", dirpath, strerror(errno));
+        }
         return 0;
+    }
+
+    if (errno != ENOENT)
+    {
+        log_msg(LOG_ERR, "stat %s: %s", dirpath, strerror(errno));
+        return -1;
     }
 
     if (mkdir(dirpath, 0700) < 0)
     {
         log_msg(LOG_ERR, "mkdir %s: %s", dirpath, strerror(errno));
         return -1;
-    }
-
-    if (chmod(dirpath, 0700) < 0)
-    {
-        log_msg(LOG_WARNING, "chmod %s: %s", dirpath, strerror(errno));
     }
 
     return 0;
@@ -247,13 +266,17 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry end: closing brace.  Sanitise and finalise. */
         if (state == S_IN_ENTRY && *p == '}')
         {
+            /* Defense in depth: never index arrays with an out-of-range
+             * depth, even if a previous validation step was bypassed. */
+            if (current->chain_depth < 0)
+                current->chain_depth = 0;
+            if (current->chain_depth > PERSIST_CHAIN_MAX)
+                current->chain_depth = PERSIST_CHAIN_MAX;
             for (int k = current->chain_depth; k < PERSIST_CHAIN_MAX; k++)
             {
                 current->chain_comm[k][0] = '\0';
                 current->chain_sha512[k][0] = '\0';
             }
-            if (current->chain_depth > PERSIST_CHAIN_MAX)
-                current->chain_depth = PERSIST_CHAIN_MAX;
             count++;
             current = NULL;
             state = S_IN_ENTRIES;
@@ -309,7 +332,19 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
             if (sscanf(p, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
                 strcmp(key_buf, "chain_depth") == 0)
             {
-                current->chain_depth = tmp_int;
+                /* chain_depth is used as an array bound: reject anything
+                 * outside [0, PERSIST_CHAIN_MAX] at the parse boundary. */
+                if (tmp_int >= 0 && tmp_int <= PERSIST_CHAIN_MAX)
+                {
+                    current->chain_depth = tmp_int;
+                }
+                else
+                {
+                    log_msg(LOG_WARNING,
+                            "persist_load: chain_depth %d out of range [0,%d], clamping",
+                            tmp_int, PERSIST_CHAIN_MAX);
+                    current->chain_depth = tmp_int < 0 ? 0 : PERSIST_CHAIN_MAX;
+                }
             }
             else if (sscanf(p, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
                      strcmp(key_buf, "created_at") == 0)
@@ -385,10 +420,29 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
 
     snprintf(tmp_file, sizeof(tmp_file), "%s.tmp.%d", filepath, (int)getpid());
 
-    fp = fopen(tmp_file, "w");
-    if (!fp)
+    /* Create the temp file with restrictive permissions from the start
+     * (never world-readable, never following a planted symlink). */
+    int fd = open(tmp_file,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 && errno == EEXIST)
+    {
+        /* Stale temp file from a previous crash: remove and retry once. */
+        unlink(tmp_file);
+        fd = open(tmp_file,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }
+    if (fd < 0)
     {
         log_msg(LOG_ERR, "persist_save: open %s: %s", tmp_file, strerror(errno));
+        return -1;
+    }
+
+    fp = fdopen(fd, "w");
+    if (!fp)
+    {
+        log_msg(LOG_ERR, "persist_save: fdopen %s: %s", tmp_file, strerror(errno));
+        close(fd);
+        unlink(tmp_file);
         return -1;
     }
 
@@ -445,8 +499,15 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     fprintf(fp, "  ]\n");
     fprintf(fp, "}\n");
 
-    if (fflush(fp) < 0 || fchmod(fileno(fp), 0600) < 0)
-        log_msg(LOG_WARNING, "fchmod %s: %s", tmp_file, strerror(errno));
+    if (fflush(fp) < 0)
+    {
+        log_msg(LOG_ERR, "persist_save: flush %s: %s", tmp_file, strerror(errno));
+        fclose(fp);
+        unlink(tmp_file);
+        return -1;
+    }
+    if (fsync(fileno(fp)) < 0)
+        log_msg(LOG_WARNING, "persist_save: fsync %s: %s", tmp_file, strerror(errno));
 
     if (fclose(fp) < 0)
     {
@@ -481,16 +542,26 @@ int persist_delete(const char *filepath)
 int persist_remove_key(const char *filepath, const char *binary,
                        const char *binary_sha512)
 {
-    PersistEntry entries[PERSIST_MAX_ENTRIES];
+    PersistEntry *entries;
     int count;
     int found = 0;
+    int ret;
 
     if (!filepath || !binary || !binary_sha512)
         return -1;
 
+    /* Heap-allocated: PersistEntry is ~9 KB, and 256 of them would need a
+     * ~2.3 MB stack frame. */
+    entries = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    if (!entries)
+        return -1;
+
     count = persist_load(filepath, entries, PERSIST_MAX_ENTRIES);
     if (count < 0)
+    {
+        free(entries);
         return -1;
+    }
 
     for (int i = 0; i < count; i++)
     {
@@ -506,10 +577,19 @@ int persist_remove_key(const char *filepath, const char *binary,
     }
 
     if (!found)
+    {
+        free(entries);
         return 1;
+    }
 
     if (count == 0)
-        return persist_delete(filepath) == 0 ? 0 : -1;
+    {
+        ret = persist_delete(filepath) == 0 ? 0 : -1;
+        free(entries);
+        return ret;
+    }
 
-    return persist_save(filepath, entries, count);
+    ret = persist_save(filepath, entries, count);
+    free(entries);
+    return ret;
 }

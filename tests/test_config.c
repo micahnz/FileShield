@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #include "../src/config.h"
 #include "../src/utils.h"
@@ -148,6 +149,79 @@ static void test_settings_invalid_user_ttl(void)
     free(path);
 }
 
+static void test_whitespace_lines(void)
+{
+    const char *conf =
+        "   \n"
+        "\t\n"
+        "[protected_paths]\n"
+        "/etc/ssh/ssh_config\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config with whitespace lines");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load with whitespace lines succeeds");
+    ASSERT(cfg.protected_count == 1, "whitespace lines ignored");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Paths must be canonicalized at load time so symlinked protected
+ * directories cannot bypass path matching in the daemon.
+ */
+static void test_path_canonicalization(void)
+{
+    char real_dir[128];
+    char link_dir[128];
+    char conf[1024];
+    char target[512];
+
+    snprintf(real_dir, sizeof(real_dir), "/tmp/fileshield_canon_real_%d", (int)getpid());
+    snprintf(link_dir, sizeof(link_dir), "/tmp/fileshield_canon_link_%d", (int)getpid());
+
+    ASSERT(mkdir(real_dir, 0700) == 0, "create real dir");
+    unlink(link_dir);
+    ASSERT(symlink(real_dir, link_dir) == 0, "create symlink");
+
+    snprintf(target, sizeof(target), "%s/secret", link_dir);
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "%s\n"
+             "[allowlist]\n"
+             "%s/bin = 60\n",
+             target, link_dir);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write symlink config");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load with symlink succeeds");
+    ASSERT(cfg.protected_count == 1, "symlink config protected count");
+    ASSERT(strncmp(cfg.protected[0].path, real_dir, strlen(real_dir)) == 0,
+           "protected path canonicalized through symlink");
+    ASSERT(strstr(cfg.protected[0].path, "secret") != NULL,
+           "canonicalized protected basename preserved");
+    ASSERT(cfg.allowlist_count == 1, "symlink config allowlist count");
+    ASSERT(strncmp(cfg.allowlist[0].binary, real_dir, strlen(real_dir)) == 0,
+           "allowlist path canonicalized through symlink");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+    unlink(link_dir);
+    rmdir(real_dir);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -156,6 +230,8 @@ int main(void)
     test_unknown_section();
     test_settings_user_ttl();
     test_settings_invalid_user_ttl();
+    test_whitespace_lines();
+    test_path_canonicalization();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

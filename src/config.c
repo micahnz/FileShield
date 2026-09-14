@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <syslog.h>
+#include <unistd.h>
 
 Config *g_config = NULL;
 
@@ -12,11 +14,58 @@ static char *trim(char *s)
 {
     while (*s == ' ' || *s == '\t')
         s++;
-    char *end = s + strlen(s) - 1;
+    size_t len = strlen(s);
+    if (len == 0)
+        return s;
+    char *end = s + len - 1;
     while (end >= s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
         end--;
     *(end + 1) = '\0';
     return s;
+}
+
+/*
+ * canonicalize_path: resolve symlinks so path comparisons against
+ * /proc/self/fd/N paths (which are always canonical) cannot be bypassed
+ * by a symlinked home/config directory.  If the path does not exist yet,
+ * resolve its parent and keep the basename.
+ */
+static void canonicalize_path(const char *in, char *out, size_t outsz)
+{
+    char buf[PATH_MAX];
+    size_t len;
+    char *resolved;
+
+    snprintf(buf, sizeof(buf), "%s", in);
+    len = strlen(buf);
+    while (len > 1 && buf[len - 1] == '/')
+        buf[--len] = '\0';
+
+    resolved = realpath(buf, NULL);
+    if (resolved)
+    {
+        snprintf(out, outsz, "%s", resolved);
+        free(resolved);
+        return;
+    }
+
+    char *slash = strrchr(buf, '/');
+    if (slash && slash != buf)
+    {
+        *slash = '\0';
+        resolved = realpath(buf, NULL);
+        if (resolved)
+        {
+            if (resolved[1] == '\0')
+                snprintf(out, outsz, "/%s", slash + 1);
+            else
+                snprintf(out, outsz, "%s/%s", resolved, slash + 1);
+            free(resolved);
+            return;
+        }
+    }
+
+    snprintf(out, outsz, "%s", in);
 }
 
 int config_load(const char *path, Config *cfg)
@@ -28,9 +77,22 @@ int config_load(const char *path, Config *cfg)
         return -1;
     }
 
+    /* The daemon runs as root: warn loudly about a config that another
+     * user could modify. */
+    if (geteuid() == 0)
+    {
+        struct stat st;
+        if (fstat(fileno(fp), &st) == 0 && S_ISREG(st.st_mode))
+        {
+            if (st.st_uid != 0)
+                log_msg(LOG_WARNING, "config_load: %s is not owned by root", path);
+            if (st.st_mode & 022)
+                log_msg(LOG_WARNING, "config_load: %s is writable by group/other", path);
+        }
+    }
+
     char line[PATH_MAX * 2];
     int section = 0;
-    size_t len;
 
     memset(cfg, 0, sizeof(*cfg));
 
@@ -88,11 +150,9 @@ int config_load(const char *path, Config *cfg)
                     log_msg(LOG_WARNING, "config_load: too many protected paths (max %d)", MAX_PATHS);
                     break;
                 }
-                len = strlen(paths[pi]);
-                if (len >= PATH_MAX)
-                    len = PATH_MAX - 1;
-                memcpy(cfg->protected[cfg->protected_count].path, paths[pi], len);
-                cfg->protected[cfg->protected_count].path[len] = '\0';
+                canonicalize_path(paths[pi],
+                                  cfg->protected[cfg->protected_count].path,
+                                  sizeof(cfg->protected[cfg->protected_count].path));
                 cfg->protected_count++;
             }
             free_string_array(paths);
@@ -128,11 +188,9 @@ int config_load(const char *path, Config *cfg)
                 fclose(fp);
                 return -1;
             }
-            len = strlen(expanded);
-            if (len >= PATH_MAX)
-                len = PATH_MAX - 1;
-            memcpy(cfg->allowlist[cfg->allowlist_count].binary, expanded, len);
-            cfg->allowlist[cfg->allowlist_count].binary[len] = '\0';
+            canonicalize_path(expanded,
+                              cfg->allowlist[cfg->allowlist_count].binary,
+                              sizeof(cfg->allowlist[cfg->allowlist_count].binary));
             cfg->allowlist[cfg->allowlist_count].ttl_seconds = ttl;
             cfg->allowlist_count++;
             free(expanded);

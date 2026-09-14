@@ -51,6 +51,14 @@ static void test_null_binary(void) {
     ASSERT(cache_lookup(400, NULL) == 0, "null binary not inserted");
 }
 
+static void test_pid_starttime(void) {
+    /* A real PID must carry a verifiable start time and still match. */
+    cache_insert(getpid(), "/bin/real", 60);
+    ASSERT(cache_lookup(getpid(), "/bin/real") > 0,
+           "lookup real pid with starttime");
+    cache_expire();
+}
+
 int main(void) {
     printf("=== test_cache ===\n");
     test_insert_lookup();
@@ -58,6 +66,7 @@ int main(void) {
     test_overwrite();
     test_count();
     test_null_binary();
+    test_pid_starttime();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

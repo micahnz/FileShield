@@ -291,6 +291,109 @@ static int test_persist_json_escaping(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: malformed state files (negative / oversized chain_depth)    */
+/*  Regression test for OOB write in persist_load().                  */
+/* ------------------------------------------------------------------ */
+
+static int write_raw_file(const char *path, const char *content)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+        return -1;
+    fputs(content, fp);
+    fclose(fp);
+    return 0;
+}
+
+static int test_persist_malformed_depth(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "malformed_depth.json");
+    unlink(path);
+
+    const char *negative =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": -1000000,\n"
+        "      \"created_at\": 1\n"
+        "    }\n  ]\n}\n";
+
+    ASSERT(write_raw_file(path, negative) == 0, "write negative depth file");
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc negative depth output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "negative depth entry still loads");
+    ASSERT(out[0].chain_depth == 0, "negative depth clamped to 0");
+    free(out);
+
+    const char *huge =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": 999999,\n"
+        "      \"created_at\": 1\n"
+        "    }\n  ]\n}\n";
+
+    ASSERT(write_raw_file(path, huge) == 0, "write huge depth file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc huge depth output");
+
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "huge depth entry still loads");
+    ASSERT(out[0].chain_depth == PERSIST_CHAIN_MAX, "huge depth clamped");
+    free(out);
+
+    const char *garbage =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": \"not-a-number\",\n"
+        "      \"created_at\": 1\n"
+        "    }\n  ]\n}\n";
+
+    ASSERT(write_raw_file(path, garbage) == 0, "write garbage depth file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc garbage depth output");
+
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "garbage depth entry still loads");
+    ASSERT(out[0].chain_depth == 0, "garbage depth ignored");
+    free(out);
+
+    unlink(path);
+    TEST_PASS("malformed chain_depth handling");
+    return 0;
+}
+
+static int test_persist_truncated(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "truncated.json");
+    unlink(path);
+
+    /* No closing braces: parser must not crash and must report 0 entries. */
+    const char *truncated =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": 2";
+
+    ASSERT(write_raw_file(path, truncated) == 0, "write truncated file");
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc truncated output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "truncated file yields 0 entries");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("truncated state file");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  test: persist_delete                                               */
 /* ------------------------------------------------------------------ */
 
@@ -385,6 +488,8 @@ int main(void)
     failed |= test_persist_save_empty();
     failed |= test_persist_chain_depths();
     failed |= test_persist_json_escaping();
+    failed |= test_persist_malformed_depth();
+    failed |= test_persist_truncated();
     failed |= test_persist_delete();
     failed |= test_persist_remove_key();
 

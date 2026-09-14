@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#include <unistd.h>
 
 #include "cache.h"
 
@@ -11,6 +12,7 @@
 typedef struct
 {
     pid_t pid;
+    unsigned long long starttime; /* /proc/<pid>/stat field 22; 0 = unknown */
     char binary_path[PATH_MAX];
     time_t expiry_time;
 } cache_entry_t;
@@ -22,6 +24,56 @@ static void cache_init(void)
 {
     memset(cache, 0, sizeof(cache));
     cache_initialized = 1;
+}
+
+/*
+ * Read the process start time (field 22 of /proc/<pid>/stat, in clock
+ * ticks since boot).  Returns 0 when it cannot be determined; callers
+ * treat 0 as "unknown" and only match other unknown values, so a PID
+ * that cannot be verified is never silently trusted.
+ */
+static unsigned long long proc_start_time(pid_t pid)
+{
+    char path[64];
+    char buf[1024];
+    FILE *f;
+    size_t n;
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0)
+        return 0;
+    buf[n] = '\0';
+
+    /* The comm field may contain spaces and parentheses: skip past the
+     * last ')' to reach the fixed numeric fields. */
+    char *q = strrchr(buf, ')');
+    if (!q)
+        return 0;
+    q++;
+    while (*q == ' ')
+        q++;
+    if (*q == '\0')
+        return 0;
+    q++; /* skip the single-character state field (field 3) */
+
+    unsigned long long value = 0;
+    /* Read fields 4..22; the last one is starttime. */
+    for (int i = 4; i <= 22; i++)
+    {
+        char *endp;
+        while (*q == ' ')
+            q++;
+        value = strtoull(q, &endp, 10);
+        if (endp == q)
+            return 0;
+        q = endp;
+    }
+    return value;
 }
 
 int cache_lookup(pid_t pid, const char *binary)
@@ -45,6 +97,13 @@ int cache_lookup(pid_t pid, const char *binary)
             continue;
         if (strcmp(cache[i].binary_path, binary) != 0)
             continue;
+
+        /* Reject a different process that reused the same PID. */
+        if (cache[i].starttime != proc_start_time(pid))
+        {
+            cache[i].pid = 0;
+            return 0;
+        }
 
         if (cache[i].expiry_time < now)
         {
@@ -91,6 +150,7 @@ void cache_insert(pid_t pid, const char *binary, int ttl_seconds)
         return;
 
     cache[free_slot].pid = pid;
+    cache[free_slot].starttime = proc_start_time(pid);
     strncpy(cache[free_slot].binary_path, binary, PATH_MAX - 1);
     cache[free_slot].binary_path[PATH_MAX - 1] = '\0';
     cache[free_slot].expiry_time = now + ttl_seconds;
