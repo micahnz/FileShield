@@ -30,8 +30,20 @@ void fanotify_clear_marks(int fd);
 int fanotify_pump(int fan_fd, pid_t dialog_child_pid);
 
 /*
- * Deny and close every deferred permission event.  Called on config reload
- * and shutdown; fail closed.
+ * Queue a read-but-undecided permission event for replay by the main
+ * loop; the kernel event fd must stay open.  Returns 0 when queued,
+ * -1 when the pending queue is full — the caller must then respond
+ * fail-closed (FAN_DENY) and close the event fd.
+ */
+int fanotify_defer_event(const struct fanotify_event_metadata *ev);
+
+/* Current number of deferred (pending) permission events. */
+int fanotify_pending_count(void);
+
+/*
+ * Deny and close every deferred permission event.  Called when the
+ * kernel reports FAN_Q_OVERFLOW (saturation) and on config reload and
+ * shutdown; fail closed.
  */
 void fanotify_flush_pending(int fan_fd);
 

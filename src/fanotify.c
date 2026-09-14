@@ -909,14 +909,22 @@ static unsigned int mark_mask_for_path(const char *path)
 
 int fanotify_setup(void)
 {
-    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE,
+    /*
+     * The event queue is intentionally bounded (no FAN_UNLIMITED_QUEUE).
+     * Under saturation the kernel fails closed: a permission event that
+     * cannot be queued is denied outright, so protection holds even when
+     * the daemon cannot keep up.  The loss of notification events is
+     * reported via FAN_Q_OVERFLOW, which the event loop answers by
+     * denying every deferred permission event (see fanotify_flush_pending).
+     */
+    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT,
                            O_RDONLY | O_LARGEFILE);
     if (fd < 0)
     {
         log_msg(LOG_ERR, "fanotify_init: %s", strerror(errno));
         return -1;
     }
-    log_msg(LOG_INFO, "fanotify fd %d created", fd);
+    log_msg(LOG_INFO, "fanotify fd %d created (bounded event queue)", fd);
     return fd;
 }
 
@@ -1132,6 +1140,29 @@ typedef struct
 
 static PendingEvent g_pending[PENDING_MAX];
 static int g_pending_count = 0;
+
+/*
+ * Queue a read-but-undecided permission event for replay by the main
+ * loop.  The kernel event fd must stay open: the kernel keeps the
+ * permission event pending until a response is written, so closing it
+ * here would block the caller's open() forever and leak the event.
+ * Returns 0 when queued, -1 when the pending queue is full — the caller
+ * must then respond fail-closed (FAN_DENY) and close the event fd.
+ */
+int fanotify_defer_event(const struct fanotify_event_metadata *ev)
+{
+    if (g_pending_count >= PENDING_MAX)
+        return -1;
+    g_pending[g_pending_count].meta = *ev;
+    g_pending_count++;
+    return 0;
+}
+
+/* Current number of deferred permission events awaiting a decision. */
+int fanotify_pending_count(void)
+{
+    return g_pending_count;
+}
 
 /* Real uid of the requesting process, or (uid_t)-1 when unknown. */
 static uid_t proc_uid(pid_t pid)
@@ -1507,15 +1538,9 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                     close(fd_num);
                     responded++;
                 }
-                else if (g_pending_count < PENDING_MAX)
+                else if (fanotify_defer_event(ev) == 0)
                 {
-                    /* Defer to the main loop, keeping the event fd open.
-                     * It must not be closed here: the kernel keeps the
-                     * permission event pending until a response is written,
-                     * so dropping it would block the caller's open() and
-                     * leak the event until the group is released. */
-                    g_pending[g_pending_count].meta = *ev;
-                    g_pending_count++;
+                    /* Deferred to the main loop, event fd kept open. */
                 }
                 else
                 {
@@ -1531,6 +1556,17 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
             else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
             {
                 handle_notification_event(fan_fd, ev);
+            }
+            else if (ev->mask & FAN_Q_OVERFLOW)
+            {
+                /* Saturation while a dialog is open: fail closed by denying
+                 * every deferred permission event immediately rather than
+                 * holding them against state whose events were lost. */
+                log_msg(LOG_WARNING,
+                        "[pump] fanotify queue overflow; denying %d deferred "
+                        "permission events (fail closed)",
+                        g_pending_count);
+                fanotify_flush_pending(fan_fd);
             }
             else if (ev->fd != FAN_NOFD)
             {
@@ -1659,6 +1695,17 @@ void fanotify_loop(int fd)
         {
             if (errno == EINTR)
                 continue;
+            if (errno == EOVERFLOW)
+            {
+                /* Saturation reported as a read error instead of an event:
+                 * same fail-closed path — deny deferred events, keep going. */
+                log_msg(LOG_WARNING,
+                        "fanotify read: EOVERFLOW (queue overflow); denying "
+                        "%d deferred permission events (fail closed)",
+                        g_pending_count);
+                fanotify_flush_pending(fd);
+                continue;
+            }
             log_msg(LOG_ERR, "fanotify read: %s", strerror(errno));
             g_fatal = 1;
             break;
@@ -1687,10 +1734,15 @@ void fanotify_loop(int fd)
                 }
                 else if (ev->mask & FAN_Q_OVERFLOW)
                 {
+                    /* Saturation: events were dropped.  Fail closed by
+                     * denying every permission event we had deferred —
+                     * their opens are still suspended and must not wait
+                     * on decisions made against lost state. */
                     log_msg(LOG_WARNING,
-                            "fanotify queue overflow; events were lost");
-                    if (ev->fd != FAN_NOFD)
-                        close((int)ev->fd);
+                            "fanotify queue overflow; events were lost — "
+                            "denying %d deferred permission events (fail closed)",
+                            g_pending_count);
+                    fanotify_flush_pending(fd);
                 }
                 else if (ev->fd != FAN_NOFD)
                 {

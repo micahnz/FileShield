@@ -26,7 +26,7 @@ DEPS    := $(OBJS:.o=.d)
 CLISRCS := $(SRCDIR)/cli.c
 CLIOBJS := $(CLISRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
-TESTS   := test_cache test_config test_utils test_persist
+TESTS   := test_cache test_config test_utils test_persist test_fanotify
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
 all: $(OBJDIR)/$(TARGET) $(OBJDIR)/$(CLITGT)
@@ -60,6 +60,16 @@ $(OBJDIR)/test_utils: $(OBJDIR)/utils.o $(TSTDIR)/test_utils.c
 $(OBJDIR)/test_persist: $(OBJDIR)/persist.o $(OBJDIR)/utils.o $(TSTDIR)/test_persist.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(TSTDIR)/test_persist.c $(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
+
+# Links the full event pipeline: fanotify.o needs notify/config/cache/
+# sha512/persist/utils, and the test supplies the daemon's signal globals.
+$(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
+                         $(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/sha512.o \
+                         $(OBJDIR)/persist.o $(OBJDIR)/utils.o
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
+		$(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/sha512.o \
+		$(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
 
 test: all $(TSTBINS)
 	@failed=0; \
