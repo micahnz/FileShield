@@ -145,6 +145,22 @@ static int allowlist_match(const char *binary, int *ttl_out)
     return 0;
 }
 
+/*
+ * Config denylist: canonical binary paths that always deny.  Checked
+ * before every allow rule, so an explicit deny wins (fail-closed).
+ */
+static int denylist_match(const char *binary)
+{
+    if (!g_config)
+        return 0;
+    for (int i = 0; i < g_config->denylist_count; i++)
+    {
+        if (strcmp(g_config->denylist[i], binary) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Executable hash cache                                             */
 /* ------------------------------------------------------------------ */
@@ -365,41 +381,6 @@ static int dialog_rate_limited(const char *binary)
 /*  shared persistence helpers for allowlist / denylist               */
 /* ------------------------------------------------------------------ */
 
-/* Copy a DynEntry array to PersistEntry and write to disk. */
-static void persist_dyn_list(const char *filepath, const DynEntry *entries,
-                             int count, const char *name)
-{
-    PersistEntry *buf = calloc(DYN_MAX, sizeof(PersistEntry));
-    if (!buf)
-    {
-        log_msg(LOG_ERR, "out of memory persisting %s", name);
-        return;
-    }
-    for (int i = 0; i < count; i++)
-    {
-        const DynEntry *src = &entries[i];
-        PersistEntry *dst = &buf[i];
-        memcpy(dst->binary, src->binary, sizeof(src->binary));
-        dst->binary[sizeof(dst->binary) - 1] = '\0';
-        memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
-        dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
-        memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
-        dst->target_path[sizeof(dst->target_path) - 1] = '\0';
-        dst->chain_depth = src->chain_depth;
-        for (int j = 0; j < src->chain_depth; j++)
-        {
-            memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
-            dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
-            memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
-            dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
-        }
-        dst->created_at = time(NULL);
-    }
-    if (persist_save(filepath, buf, count) < 0)
-        log_msg(LOG_WARNING, "persist_save failed; %s entry not persisted", name);
-    free(buf);
-}
-
 /* Copy DynEntry entries into a PersistEntry array.  Returns count. */
 static int dyn_to_persist(const DynEntry *entries, int count,
                           PersistEntry *out, int max)
@@ -562,55 +543,6 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
     return 0;
 }
 
-static void dyn_allow_add(const char *binary, const char *bin_sha512,
-                          const ProcChain *chain, const char *target)
-{
-    /* Fail closed at creation: a permanent grant is only recorded when the
-     * binary's SHA-512 was actually computed.  Without it the entry would
-     * match any binary at this path forever. */
-    if (bin_sha512[0] == '\0')
-    {
-        log_msg(LOG_WARNING,
-                "refusing permanent allow for %s: binary SHA-512 unavailable; "
-                "granting one-time access only (re-prompt will occur)",
-                binary);
-        return;
-    }
-
-    if (g_dyn_allow_count >= DYN_MAX)
-    {
-        log_msg(LOG_WARNING, "dynamic allowlist full (%d); dropping oldest entry",
-                DYN_MAX);
-        memmove(&g_dyn_allow[0], &g_dyn_allow[1],
-                sizeof(DynEntry) * (DYN_MAX - 1));
-        g_dyn_allow_count = DYN_MAX - 1;
-    }
-
-    DynEntry *e = &g_dyn_allow[g_dyn_allow_count++];
-    memset(e, 0, sizeof(*e));
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
-    if (target)
-        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
-    e->chain_depth = chain->depth;
-    for (int i = 0; i < chain->depth; i++)
-    {
-        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
-        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
-    }
-
-    char sha_short[17] = "????????????????";
-    if (bin_sha512[0] != '\0')
-        memcpy(sha_short, bin_sha512, 16);
-    sha_short[16] = '\0';
-    log_msg(LOG_INFO,
-            "always-allow added: %s (sha512: %s...) chain-depth=%d -> %s",
-            binary, sha_short, chain->depth, target ? target : "(unknown)");
-
-    persist_dyn_list(PERSIST_STATE_FILE, g_dyn_allow, g_dyn_allow_count,
-                     "allowlist");
-}
-
 /*
  * dyn_deny_match: returns 1 if (binary, bin_sha512, chain) matches a stored
  * "Always Deny" entry, 0 otherwise.
@@ -677,43 +609,6 @@ static int dyn_deny_match(const char *binary, const char *bin_sha512,
             return 1;
     }
     return 0;
-}
-
-static void dyn_deny_add(const char *binary, const char *bin_sha512,
-                         const ProcChain *chain, const char *target)
-{
-    if (g_dyn_deny_count >= DYN_MAX)
-    {
-        log_msg(LOG_WARNING, "dynamic denylist full (%d); dropping oldest entry",
-                DYN_MAX);
-        memmove(&g_dyn_deny[0], &g_dyn_deny[1],
-                sizeof(DynEntry) * (DYN_MAX - 1));
-        g_dyn_deny_count = DYN_MAX - 1;
-    }
-
-    DynEntry *e = &g_dyn_deny[g_dyn_deny_count++];
-    memset(e, 0, sizeof(*e));
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
-    if (target)
-        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
-    e->chain_depth = chain->depth;
-    for (int i = 0; i < chain->depth; i++)
-    {
-        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
-        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
-    }
-
-    char sha_short[17] = "????????????????";
-    if (bin_sha512[0] != '\0')
-        memcpy(sha_short, bin_sha512, 16);
-    sha_short[16] = '\0';
-    log_msg(LOG_INFO,
-            "always-deny added: %s (sha512: %s...) chain-depth=%d -> %s",
-            binary, sha_short, chain->depth, target ? target : "(unknown)");
-
-    persist_dyn_list(PERSIST_DENY_STATE_FILE, g_dyn_deny, g_dyn_deny_count,
-                     "denylist");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1381,6 +1276,17 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
                 binary, (int)pid, target);
     }
 
+    /* config denylist (permanent deny) wins over every allow rule */
+    if (denylist_match(binary))
+    {
+        log_msg(LOG_INFO, "config denylist hit: %s (pid %d) -> %s",
+                binary, (int)pid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        goto cleanup;
+    }
+
     /* allowlist check */
     if (allowlist_match(binary, &ttl))
     {
@@ -1416,8 +1322,8 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
 
     if (sha_ok < 0)
         log_msg(LOG_WARNING, "SHA-512 unavailable for %s (pid %d); "
-                             "\"Always Allow\" will not persist for this "
-                             "decision (access will be re-prompted)",
+                             "stored allow/deny entries that require a hash "
+                             "will not match (access will be re-prompted)",
                 binary, (int)pid);
 
     /* dynamic allowlist check (runtime "Always Allow") */
@@ -1461,20 +1367,26 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
             decision, (int)pid, binary);
 
-    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_ALWAYS)
+    if (decision == NOTIFY_ALLOW_ONCE)
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
         cache_insert(pid, binary, user_ttl);
-        if (decision == NOTIFY_ALLOW_ALWAYS)
-            dyn_allow_add(binary, bin_sha512, &chain, target);
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
     }
-    else if (decision == NOTIFY_DENY_ALWAYS)
+    else if (decision == NOTIFY_ALLOW_SESSION)
     {
-        dyn_deny_add(binary, bin_sha512, &chain, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
+        int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+        if (cache_insert_session(pid, binary, session_ttl) < 0)
+            log_msg(LOG_WARNING,
+                    "\"Allow Session\" grant for %s (pid %d) could not be "
+                    "recorded; access persisted for this request only",
+                    binary, (int)pid);
+        else
+            log_msg(LOG_INFO, "session grant: %s (pid %d) ttl=%ds",
+                    binary, (int)pid, session_ttl);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
     }
     else
     {

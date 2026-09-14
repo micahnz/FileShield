@@ -180,6 +180,64 @@ static void test_ttl_clamping(void)
     free(path);
 }
 
+static void test_settings_session_ttl(void)
+{
+    Config cfg;
+    char *path;
+
+    path = write_temp("[settings]\nsession_ttl = 1800\n");
+    ASSERT(path != NULL, "write temp config for session_ttl");
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load session_ttl");
+    ASSERT(cfg.session_ttl_seconds == 1800, "session_ttl parsed");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    path = write_temp("[settings]\nsession_ttl = 0\n");
+    ASSERT(path != NULL, "write temp config for session_ttl=0");
+    memset(&cfg, 0, sizeof(cfg));
+    config_load(path, &cfg);
+    ASSERT(cfg.session_ttl_seconds == 0, "session_ttl 0 accepted");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    path = write_temp("[settings]\nsession_ttl = -5\n");
+    ASSERT(path != NULL, "write temp config for invalid session_ttl");
+    memset(&cfg, 0, sizeof(cfg));
+    config_load(path, &cfg);
+    ASSERT(cfg.session_ttl_seconds == 0, "negative session_ttl rejected");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+static void test_denylist(void)
+{
+    const char *conf =
+        "[denylist]\n"
+        "/tmp/fileshield_deny_test\n"
+        "/usr/bin/socat\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config with denylist");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    ASSERT(config_load(path, &cfg) == 0, "config_load denylist succeeds");
+    ASSERT(cfg.denylist_count == 2, "2 denylist entries");
+    ASSERT(strstr(cfg.denylist[0], "fileshield_deny_test") != NULL,
+           "denylist first entry");
+    ASSERT(strstr(cfg.denylist[1], "socat") != NULL,
+           "denylist second entry");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 static void test_whitespace_lines(void)
 {
     const char *conf =
@@ -262,6 +320,8 @@ int main(void)
     test_settings_user_ttl();
     test_settings_invalid_user_ttl();
     test_ttl_clamping();
+    test_settings_session_ttl();
+    test_denylist();
     test_whitespace_lines();
     test_path_canonicalization();
     if (failures)

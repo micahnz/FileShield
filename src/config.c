@@ -134,6 +134,8 @@ int config_load(const char *path, Config *cfg)
                 section = 2;
             else if (strcmp(s + 1, "settings") == 0)
                 section = 3;
+            else if (strcmp(s + 1, "denylist") == 0)
+                section = 4;
             else
                 section = 0;
             continue;
@@ -209,6 +211,27 @@ int config_load(const char *path, Config *cfg)
             cfg->allowlist_count++;
             free(expanded);
         }
+        else if (section == 4)
+        {
+            /* [denylist] absolute or ~/ binary paths that always deny. */
+            if (cfg->denylist_count >= MAX_ALLOWLIST)
+            {
+                log_msg(LOG_WARNING, "config_load: too many denylist entries (max %d)",
+                        MAX_ALLOWLIST);
+                continue;
+            }
+            char *expanded = expand_home(s);
+            if (!expanded)
+            {
+                log_msg(LOG_ERR, "config_load: out of memory");
+                fclose(fp);
+                return -1;
+            }
+            canonicalize_path(expanded,
+                              cfg->denylist[cfg->denylist_count], PATH_MAX);
+            cfg->denylist_count++;
+            free(expanded);
+        }
         else if (section == 3)
         {
             /* [settings] key = value */
@@ -234,6 +257,25 @@ int config_load(const char *path, Config *cfg)
                 }
                 else
                     log_msg(LOG_ERR, "config_load: invalid user_ttl: %s", val);
+            }
+            else if (strcmp(key, "session_ttl") == 0)
+            {
+                /* Seconds to cap an "Allow Session" grant; 0 means the
+                 * grant lasts until the session (grant root) exits. */
+                int ttl;
+                if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
+                {
+                    if (ttl > MAX_TTL_SECONDS)
+                    {
+                        log_msg(LOG_WARNING,
+                                "config_load: session_ttl %d clamped to %d seconds",
+                                ttl, MAX_TTL_SECONDS);
+                        ttl = MAX_TTL_SECONDS;
+                    }
+                    cfg->session_ttl_seconds = ttl;
+                }
+                else
+                    log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
             }
         }
     }
