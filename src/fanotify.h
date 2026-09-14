@@ -17,13 +17,23 @@ void fanotify_clear_marks(int fd);
 
 /*
  * Drain pending FAN_OPEN_PERM events without blocking.
- * Auto-allows events from dialog_child_pid (and its descendants that share
- * the same PPID) and non-protected opens. Events that would require a user
- * decision are left in the queue for the main loop.
+ * Auto-allows events from the dialog process group (dialog child and its
+ * children, e.g. kdialog behind timeout(1)), events from direct daemon
+ * children, and non-protected opens.  Events that require a user decision
+ * are copied to a deferred queue (their event fd stays open) and are
+ * replayed by the main loop once the dialog finishes.  Closing such an
+ * event fd instead would leave the caller's open() blocked forever and
+ * leak a kernel permission event.
  * Called by notify.c while waiting for the dialog child to finish.
- * Returns the number of events processed.
+ * Returns the number of events responded to immediately.
  */
 int fanotify_pump(int fan_fd, pid_t dialog_child_pid);
+
+/*
+ * Deny and close every deferred permission event.  Called on config reload
+ * and shutdown; fail closed.
+ */
+void fanotify_flush_pending(int fan_fd);
 
 /*
  * Dynamic allowlist / denylist management: export the in-memory lists for

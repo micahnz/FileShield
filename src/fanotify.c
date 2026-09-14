@@ -22,9 +22,13 @@
 
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_need_reload;
+extern volatile sig_atomic_t g_fatal;
 extern Config *g_config;
 
 #define BUF_SIZE 4096
+
+/* Defined later in this file; declared early for the call-chain hasher. */
+static int is_path_under_protected(const char *path);
 
 /* ------------------------------------------------------------------ */
 /*  proc helpers                                                       */
@@ -105,7 +109,7 @@ static int read_cmdline(pid_t pid, char *out, size_t size)
 {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
-    int fd_c = open(path, O_RDONLY);
+    int fd_c = open(path, O_RDONLY | O_CLOEXEC);
     if (fd_c < 0)
         return -1;
 
@@ -142,6 +146,80 @@ static int allowlist_match(const char *binary, int *ttl_out)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Executable hash cache                                             */
+/* ------------------------------------------------------------------ */
+/*
+ * Hashing forks sha512sum and runs on the event-loop critical path while
+ * the requesting process is suspended, so repeat lookups of the same
+ * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime); any
+ * metadata change invalidates the entry.
+ */
+#define HASH_CACHE_MAX 64
+
+typedef struct
+{
+    dev_t dev;
+    ino_t ino;
+    off_t size;
+    time_t mtime_sec;
+    long mtime_nsec;
+    char hex[129];
+} HashCacheEntry;
+
+static HashCacheEntry g_hash_cache[HASH_CACHE_MAX];
+static int g_hash_cache_count = 0;
+static int g_hash_cache_next = 0;
+
+static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
+{
+    char proc_path[64];
+    struct stat st;
+    char hex[129];
+    int r;
+
+    int n = snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", (int)pid);
+    if (n < 0 || (size_t)n >= sizeof(proc_path))
+        return -1;
+
+    if (stat(proc_path, &st) != 0)
+        return sha512_proc_exe(pid, hex_out);
+
+    for (int i = 0; i < g_hash_cache_count; i++)
+    {
+        HashCacheEntry *e = &g_hash_cache[i];
+        if (e->dev == st.st_dev && e->ino == st.st_ino &&
+            e->size == st.st_size &&
+            e->mtime_sec == st.st_mtim.tv_sec &&
+            e->mtime_nsec == st.st_mtim.tv_nsec)
+        {
+            memcpy(hex_out, e->hex, sizeof(e->hex));
+            return 0;
+        }
+    }
+
+    r = sha512_proc_exe(pid, hex);
+    if (r < 0)
+        return -1;
+
+    int slot;
+    if (g_hash_cache_count < HASH_CACHE_MAX)
+        slot = g_hash_cache_count++;
+    else
+    {
+        slot = g_hash_cache_next;
+        g_hash_cache_next = (g_hash_cache_next + 1) % HASH_CACHE_MAX;
+    }
+    g_hash_cache[slot].dev = st.st_dev;
+    g_hash_cache[slot].ino = st.st_ino;
+    g_hash_cache[slot].size = st.st_size;
+    g_hash_cache[slot].mtime_sec = st.st_mtim.tv_sec;
+    g_hash_cache[slot].mtime_nsec = st.st_mtim.tv_nsec;
+    memcpy(g_hash_cache[slot].hex, hex, sizeof(hex));
+    memcpy(hex_out, hex, sizeof(hex));
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  process call-chain (parent → grandparent → great-grandparent)     */
 /* ------------------------------------------------------------------ */
 
@@ -169,11 +247,14 @@ static void build_proc_chain(pid_t start_pid, ProcChain *c)
         if (exe)
         {
             snprintf(c->exe[i], sizeof(c->exe[i]), "%s", exe);
+            /* Hash via /proc/<pid>/exe so containerised binaries
+             * (Podman/Docker) are reachable even if their path doesn't
+             * exist on the host.  Never open a protected path to hash it:
+             * the daemon would intercept its own helper. */
+            if (!is_path_under_protected(exe))
+                cached_sha512_proc_exe(p, c->sha512[i]); /* best-effort */
             free(exe);
         }
-        /* Hash via /proc/<pid>/exe so containerised binaries (Podman/Docker)
-         * are reachable even if their path doesn't exist on the host. */
-        sha512_proc_exe(p, c->sha512[i]); /* best-effort; empty on failure */
         c->depth = i + 1;
         cur = p;
     }
@@ -200,6 +281,85 @@ static int g_dyn_allow_count = 0;
 
 static DynEntry g_dyn_deny[DYN_MAX];
 static int g_dyn_deny_count = 0;
+
+/* ------------------------------------------------------------------ */
+/*  Dialog rate limiting                                              */
+/* ------------------------------------------------------------------ */
+/*
+ * A process can exec itself repeatedly (new PID each time) so that the
+ * per-PID cache never helps, flooding the user with dialogs while each
+ * open is suspended.  Bound prompts per binary path and fail closed
+ * (deny) for a cooldown window once the bound is exceeded.
+ */
+#define DIALOG_RATE_MAX 16
+#define DIALOG_RATE_PROMPTS 20
+#define DIALOG_RATE_WINDOW_S 60
+#define DIALOG_RATE_COOLDOWN_S 30
+
+typedef struct
+{
+    char binary[PATH_MAX];
+    time_t window_start;
+    int prompts;
+    time_t blocked_until;
+} DialogRateEntry;
+
+static DialogRateEntry g_dialog_rate[DIALOG_RATE_MAX];
+static int g_dialog_rate_count = 0;
+static int g_dialog_rate_next = 0;
+
+/* Returns 1 when the dialog should be skipped (deny) to bound flooding. */
+static int dialog_rate_limited(const char *binary)
+{
+    time_t now = time(NULL);
+    DialogRateEntry *e = NULL;
+
+    for (int i = 0; i < g_dialog_rate_count; i++)
+    {
+        if (strcmp(g_dialog_rate[i].binary, binary) == 0)
+        {
+            e = &g_dialog_rate[i];
+            break;
+        }
+    }
+
+    if (!e)
+    {
+        int slot;
+        if (g_dialog_rate_count < DIALOG_RATE_MAX)
+            slot = g_dialog_rate_count++;
+        else
+        {
+            slot = g_dialog_rate_next;
+            g_dialog_rate_next = (g_dialog_rate_next + 1) % DIALOG_RATE_MAX;
+        }
+        e = &g_dialog_rate[slot];
+        memset(e, 0, sizeof(*e));
+        snprintf(e->binary, sizeof(e->binary), "%s", binary);
+        e->window_start = now;
+    }
+
+    if (now < e->blocked_until)
+        return 1;
+
+    if (now - e->window_start > DIALOG_RATE_WINDOW_S)
+    {
+        e->window_start = now;
+        e->prompts = 0;
+    }
+
+    if (++e->prompts > DIALOG_RATE_PROMPTS)
+    {
+        e->blocked_until = now + DIALOG_RATE_COOLDOWN_S;
+        log_msg(LOG_WARNING,
+                "dialog rate limit: %s exceeded %d prompts in %ds; "
+                "denying further prompts for %ds",
+                binary, DIALOG_RATE_PROMPTS, DIALOG_RATE_WINDOW_S,
+                DIALOG_RATE_COOLDOWN_S);
+        return 1;
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  shared persistence helpers for allowlist / denylist               */
@@ -273,10 +433,19 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                           const PersistEntry *entries, int count,
                           const char *name)
 {
-    if (!entries || count <= 0 || count > DYN_MAX)
-        return;
+    /* Always replace the in-memory list so a CLI "clear" (file removed)
+     * or a corrupt/unreadable state file cannot leave stale grants or
+     * denies active in the running daemon. */
     memset(list, 0, sizeof(DynEntry) * DYN_MAX);
     *list_count = 0;
+
+    if (!entries || count <= 0)
+    {
+        log_msg(LOG_DEBUG, "cleared persisted %s entries", name);
+        return;
+    }
+    if (count > DYN_MAX)
+        count = DYN_MAX;
     for (int i = 0; i < count; i++)
     {
         const PersistEntry *src = &entries[i];
@@ -607,6 +776,8 @@ static int is_path_under_protected(const char *path)
     {
         const char *p = g_config->protected[i].path;
         size_t plen = strlen(p);
+        if (plen == 0) /* defensive: never index p[plen - 1] */
+            continue;
         if (strncmp(path, p, plen) == 0)
         {
             if (path[plen] == '\0' || path[plen] == '/' || p[plen - 1] == '/')
@@ -617,12 +788,93 @@ static int is_path_under_protected(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
+/*  mark bookkeeping                                                  */
+/* ------------------------------------------------------------------ */
+/*
+ * fanotify_mark() removal needs the same event mask that was used to add
+ * the mark (file and directory marks differ), so the mask is recorded per
+ * path.  The table also tracks directory marks auto-added for directories
+ * created inside protected trees, and lets a reload remove every mark the
+ * daemon installed.
+ */
+#define MAX_MARK_TABLE 4096
+#define MAX_AUTO_MARKS 1024
+
+typedef struct
+{
+    char *path; /* strdup'd */
+    unsigned int mask;
+} MarkEntry;
+
+static MarkEntry g_marks[MAX_MARK_TABLE];
+static int g_mark_count = 0;
+static int g_auto_mark_count = 0;
+
+static MarkEntry *mark_find(const char *path)
+{
+    for (int i = 0; i < g_mark_count; i++)
+        if (strcmp(g_marks[i].path, path) == 0)
+            return &g_marks[i];
+    return NULL;
+}
+
+static void mark_table_add(const char *path, unsigned int mask)
+{
+    MarkEntry *e = mark_find(path);
+    if (e)
+    {
+        e->mask = mask;
+        return;
+    }
+    if (g_mark_count >= MAX_MARK_TABLE)
+    {
+        log_msg(LOG_WARNING, "mark table full; cannot track %s", path);
+        return;
+    }
+    char *copy = strdup(path);
+    if (!copy)
+    {
+        log_msg(LOG_WARNING, "out of memory tracking mark %s", path);
+        return;
+    }
+    g_marks[g_mark_count].path = copy;
+    g_marks[g_mark_count].mask = mask;
+    g_mark_count++;
+}
+
+static void mark_table_remove(const char *path)
+{
+    for (int i = 0; i < g_mark_count; i++)
+    {
+        if (strcmp(g_marks[i].path, path) == 0)
+        {
+            free(g_marks[i].path);
+            memmove(&g_marks[i], &g_marks[i + 1],
+                    sizeof(MarkEntry) * (size_t)(g_mark_count - i - 1));
+            g_mark_count--;
+            return;
+        }
+    }
+}
+
+/* File marks only get open events; directory marks also report creation
+ * of children so newly created files can be added to the inode table. */
+static unsigned int mark_mask_for_path(const char *path)
+{
+    unsigned int mask = FAN_OPEN_PERM | FAN_EVENT_ON_CHILD;
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        mask |= FAN_CREATE | FAN_MOVED_TO;
+    return mask;
+}
+
+/* ------------------------------------------------------------------ */
 /*  public API                                                         */
 /* ------------------------------------------------------------------ */
 
 int fanotify_setup(void)
 {
-    int fd = fanotify_init(FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE,
+    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE,
                            O_RDONLY | O_LARGEFILE);
     if (fd < 0)
     {
@@ -635,13 +887,14 @@ int fanotify_setup(void)
 
 int fanotify_add_mark(int fd, const char *path)
 {
-    if (fanotify_mark(fd, FAN_MARK_ADD,
-                      FAN_OPEN_PERM | FAN_EVENT_ON_CHILD,
-                      AT_FDCWD, path) < 0)
+    unsigned int mask = mark_mask_for_path(path);
+
+    if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, path) < 0)
     {
         log_msg(LOG_ERR, "fanotify_mark ADD %s: %s", path, strerror(errno));
         return -1;
     }
+    mark_table_add(path, mask);
     log_msg(LOG_INFO, "fanotify mark added: %s", path);
 
     /* Populate the inode table so hard-link accesses are detected even when
@@ -699,15 +952,71 @@ int fanotify_add_mark(int fd, const char *path)
 
 int fanotify_remove_mark(int fd, const char *path)
 {
-    if (fanotify_mark(fd, FAN_MARK_REMOVE,
-                      FAN_OPEN_PERM | FAN_EVENT_ON_CHILD,
-                      AT_FDCWD, path) < 0)
+    MarkEntry *e = mark_find(path);
+    unsigned int mask = e ? e->mask : mark_mask_for_path(path);
+
+    if (fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, path) < 0)
     {
         log_msg(LOG_ERR, "fanotify_mark REMOVE %s: %s", path, strerror(errno));
         return -1;
     }
+    mark_table_remove(path);
     log_msg(LOG_INFO, "fanotify mark removed: %s", path);
     return 0;
+}
+
+/*
+ * Newly created directories inside a protected tree need their own mark:
+ * directory marks are not recursive, and this keeps path matching (and
+ * hard-link inode tracking) effective for their contents.  Bounded by
+ * MAX_AUTO_MARKS so a runaway create storm cannot exhaust marks.
+ */
+static void auto_mark_created_path(int fan_fd, const char *path)
+{
+    if (g_auto_mark_count >= MAX_AUTO_MARKS)
+        return;
+    if (mark_find(path))
+        return;
+    if (fanotify_add_mark(fan_fd, path) == 0)
+    {
+        g_auto_mark_count++;
+        log_msg(LOG_INFO, "auto-marked created object: %s", path);
+    }
+}
+
+/*
+ * Notification events (FAN_CREATE / FAN_MOVED_TO) are not permission
+ * events: no response is written, but the event fd must be closed and the
+ * created object's inode is recorded so hard links to it stay protected.
+ */
+static void handle_notification_event(int fan_fd,
+                                      const struct fanotify_event_metadata *ev)
+{
+    if (!(ev->mask & (FAN_CREATE | FAN_MOVED_TO)))
+    {
+        if (ev->fd != FAN_NOFD)
+            close((int)ev->fd);
+        return;
+    }
+
+    if (ev->fd == FAN_NOFD)
+        return;
+
+    struct stat st;
+    if (fstat((int)ev->fd, &st) == 0)
+    {
+        inode_table_add(st.st_dev, st.st_ino);
+        if (S_ISDIR(st.st_mode))
+        {
+            char *created = resolve_fd_path((int)ev->fd);
+            if (created)
+            {
+                auto_mark_created_path(fan_fd, created);
+                free(created);
+            }
+        }
+    }
+    close((int)ev->fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -770,6 +1079,293 @@ static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino)
 }
 
 /* ------------------------------------------------------------------ */
+/*  deferred permission events                                        */
+/* ------------------------------------------------------------------ */
+/*
+ * fanotify_pump() runs while a dialog is displayed.  It may read events it
+ * cannot decide (protected paths); those are copied here with their event
+ * fd left open and replayed by the main loop once the dialog is finished.
+ * Closing the event fd without a response would leave the caller's open()
+ * blocked forever and leak a kernel permission event.
+ */
+#define PENDING_MAX 256
+
+typedef struct
+{
+    struct fanotify_event_metadata meta;
+} PendingEvent;
+
+static PendingEvent g_pending[PENDING_MAX];
+static int g_pending_count = 0;
+
+/* Real uid of the requesting process, or (uid_t)-1 when unknown. */
+static uid_t proc_uid(pid_t pid)
+{
+    char path[64], line[256];
+    FILE *f;
+    unsigned int uid = 0;
+    int found = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    f = fopen(path, "r");
+    if (!f)
+        return (uid_t)-1;
+    while (fgets(line, sizeof(line), f))
+    {
+        if (sscanf(line, "Uid:\t%u", &uid) == 1)
+        {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found ? (uid_t)uid : (uid_t)-1;
+}
+
+/*
+ * Returns 1 if pid is the dialog child, a direct child of it (timeout(1)
+ * execs kdialog), or in the dialog's process group (the dialog child calls
+ * setpgid(0,0) before exec).
+ */
+static int process_in_dialog_group(pid_t pid, pid_t dialog_pid)
+{
+    if (dialog_pid <= 0)
+        return 0;
+    if (pid == dialog_pid)
+        return 1;
+    if (get_ppid(pid) == dialog_pid)
+        return 1;
+
+    char path[64], buf[512];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (!fgets(buf, sizeof(buf), f))
+    {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    char *p = strrchr(buf, ')');
+    if (!p)
+        return 0;
+    p++;
+    long pgrp = 0;
+    if (sscanf(p, " %*c %*d %ld", &pgrp) != 1)
+        return 0;
+    return (pid_t)pgrp == dialog_pid;
+}
+
+/*
+ * Full decision path for a FAN_OPEN_PERM event.  Takes ownership of ev->fd:
+ * every path responds and closes the event fd, or (in the pump) defers it.
+ */
+static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
+{
+    pid_t pid = ev->pid;
+    int fd_num = (int)ev->fd;
+    char *binary = NULL;
+    char *target = NULL;
+    int ttl = 0;
+    pid_t ppid = 0;
+    char comm[256] = "";
+    char pcomm[256] = "";
+    char cmdline[512] = "";
+    dev_t ev_dev = 0;
+    ino_t ev_ino = 0;
+    char bin_sha512[129] = "";
+    ProcChain chain;
+    int sha_ok = -1;
+    int decision;
+
+    log_msg(LOG_DEBUG, "[event] FAN_OPEN_PERM pid=%d fd=%d", (int)pid, fd_num);
+
+    if (fd_num == FAN_NOFD)
+    {
+        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying", (int)pid);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        return;
+    }
+
+    /* Resolve the target file path from the daemon's fd table.  Done early
+     * so the mount-mark fast-path below can reuse it. */
+    target = resolve_fd_path(fd_num);
+    if (!target)
+    {
+        log_msg(LOG_WARNING, "[event] resolve_fd_path failed for pid=%d fd=%d, denying",
+                (int)pid, fd_num);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        return;
+    }
+    log_msg(LOG_DEBUG, "[event] resolved target: pid=%d target=%s", (int)pid, target);
+
+    /* Fast-path filter for mount-mark noise. */
+    if (g_mount_count > 0)
+    {
+        struct stat fast_st;
+        if (fstat(fd_num, &fast_st) == 0 &&
+            !inode_is_protected(fast_st.st_dev, fast_st.st_ino) &&
+            !is_path_under_protected(target))
+        {
+            log_msg(LOG_DEBUG, "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
+                    (int)pid, target);
+            fanotify_respond(fan_fd, ev, FAN_ALLOW);
+            close(fd_num);
+            free(target);
+            return;
+        }
+    }
+
+    /* Deduplication: directory + mount marks can fire twice for one open. */
+    {
+        struct stat dedup_st;
+        if (fstat(fd_num, &dedup_st) == 0)
+        {
+            ev_dev = dedup_st.st_dev;
+            ev_ino = dedup_st.st_ino;
+            int cached = recent_cache_lookup(pid, ev_dev, ev_ino);
+            if (cached != -1)
+            {
+                log_msg(LOG_DEBUG,
+                        "[dedup] reusing cached decision=%s for pid=%d target=%s",
+                        cached == (int)FAN_ALLOW ? "ALLOW" : "DENY", (int)pid, target);
+                fanotify_respond(fan_fd, ev, (unsigned int)cached);
+                close(fd_num);
+                free(target);
+                return;
+            }
+        }
+    }
+
+    binary = proc_exe_path(pid);
+    if (!binary)
+    {
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        free(target);
+        return;
+    }
+
+    /* Hard-link bypass detection: a path outside every protected prefix
+     * means the event came from the mount mark, i.e. a hard link. */
+    if (!is_path_under_protected(target))
+    {
+        log_msg(LOG_WARNING,
+                "hard-link bypass attempt: %s (pid %d) opened "
+                "protected inode via unprotected path \"%s\"",
+                binary, (int)pid, target);
+    }
+
+    /* allowlist check */
+    if (allowlist_match(binary, &ttl))
+    {
+        cache_insert(pid, binary, ttl);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* cache check */
+    if (cache_lookup(pid, binary) > 0)
+    {
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    read_comm(pid, comm, sizeof(comm));
+    ppid = get_ppid(pid);
+    if (ppid > 0)
+        read_comm(ppid, pcomm, sizeof(pcomm));
+    read_cmdline(pid, cmdline, sizeof(cmdline));
+
+    /* Hash the binary and build the call chain while the target process is
+     * kernel-suspended so its /proc entry is still valid.  Hashing a path
+     * that is itself protected would make the daemon intercept its own
+     * helper, so skip it and let the path+chain decision stand alone. */
+    if (!is_path_under_protected(binary))
+        sha_ok = cached_sha512_proc_exe(pid, bin_sha512);
+    build_proc_chain(pid, &chain);
+
+    if (sha_ok < 0)
+        log_msg(LOG_WARNING, "SHA-512 computation failed for %s (pid %d); "
+                             "permanent decisions will rely on path + chain only",
+                binary, (int)pid);
+
+    /* dynamic allowlist check (runtime "Always Allow") */
+    if (dyn_allow_match(binary, bin_sha512, &chain))
+    {
+        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+        cache_insert(pid, binary, user_ttl);
+        log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
+                binary, (int)pid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* dynamic denylist check (runtime "Always Deny") */
+    if (dyn_deny_match(binary, bin_sha512, &chain))
+    {
+        log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
+                binary, (int)pid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* Rate-limit dialog floods from rapidly re-exec'ing processes. */
+    if (dialog_rate_limited(binary))
+    {
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* ask user consent */
+    log_msg(LOG_INFO, "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
+            (int)pid, binary, target, comm);
+    decision = notify_ask(comm, pid, ppid, pcomm, binary, cmdline, target,
+                          proc_uid(pid));
+    log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
+            decision, (int)pid, binary);
+
+    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_ALWAYS)
+    {
+        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+        cache_insert(pid, binary, user_ttl);
+        if (decision == NOTIFY_ALLOW_ALWAYS)
+            dyn_allow_add(binary, bin_sha512, &chain, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+    }
+    else if (decision == NOTIFY_DENY_ALWAYS)
+    {
+        dyn_deny_add(binary, bin_sha512, &chain, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+    }
+    else
+    {
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+    }
+    close(fd_num);
+
+cleanup:
+    free(binary);
+    free(target);
+}
+
+/* ------------------------------------------------------------------ */
 /*  fanotify_pump: drain pending events while dialog child is running */
 /* ------------------------------------------------------------------ */
 /*
@@ -788,7 +1384,6 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
     char buf[BUF_SIZE]
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
-    /* Peek at how much data is available; if none, return immediately. */
     int responded = 0;
     ssize_t n;
 
@@ -816,17 +1411,26 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 int fd_num = (int)ev->fd;
                 int allow = 0;
 
-                /* Always allow file opens from the dialog child. */
-                if (dialog_child_pid > 0 && ev->pid == dialog_child_pid)
+                if (dialog_child_pid > 0 &&
+                    process_in_dialog_group(ev->pid, dialog_child_pid))
                 {
                     log_msg(LOG_DEBUG,
-                            "[pump] ALLOW fd=%d pid=%d (dialog child)",
+                            "[pump] ALLOW fd=%d pid=%d (dialog group)",
+                            fd_num, (int)ev->pid);
+                    allow = 1;
+                }
+                else if (get_ppid(ev->pid) == getpid())
+                {
+                    /* Direct child of the daemon (sha512sum hashing for
+                     * the event being handled) must never stall. */
+                    log_msg(LOG_DEBUG,
+                            "[pump] ALLOW fd=%d pid=%d (daemon child)",
                             fd_num, (int)ev->pid);
                     allow = 1;
                 }
                 else
                 {
-                    /* Apply fast-path: allow if neither inode-protected nor
+                    /* Fast-path: allow if neither inode-protected nor
                      * under a protected path. */
                     struct stat st;
                     if (fstat(fd_num, &st) == 0 &&
@@ -845,7 +1449,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                             else
                             {
                                 log_msg(LOG_DEBUG,
-                                        "[pump] SKIP fd=%d pid=%d path=%s (protected, defer to main loop)",
+                                        "[pump] QUEUE fd=%d pid=%d path=%s (protected)",
                                         fd_num, (int)ev->pid, tgt);
                             }
                             free(tgt);
@@ -867,11 +1471,34 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                     close(fd_num);
                     responded++;
                 }
-                /* else: leave unanswered — main event loop will handle it. */
+                else if (g_pending_count < PENDING_MAX)
+                {
+                    /* Defer to the main loop, keeping the event fd open.
+                     * It must not be closed here: the kernel keeps the
+                     * permission event pending until a response is written,
+                     * so dropping it would block the caller's open() and
+                     * leak the event until the group is released. */
+                    g_pending[g_pending_count].meta = *ev;
+                    g_pending_count++;
+                }
+                else
+                {
+                    /* Queue full: fail closed rather than hang or lose it. */
+                    log_msg(LOG_WARNING,
+                            "[pump] pending queue full; denying fd=%d pid=%d",
+                            fd_num, (int)ev->pid);
+                    fanotify_respond(fan_fd, ev, FAN_DENY);
+                    close(fd_num);
+                    responded++;
+                }
+            }
+            else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
+            {
+                handle_notification_event(fan_fd, ev);
             }
             else if (ev->fd != FAN_NOFD)
             {
-                close(ev->fd);
+                close((int)ev->fd);
             }
 
             ev = FAN_EVENT_NEXT(ev, remaining);
@@ -883,9 +1510,27 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
 void fanotify_clear_marks(int fd)
 {
-    /* Remove all mount marks from the kernel and clear the in-memory tables.
-     * Called before a config reload so the tables are rebuilt cleanly by
-     * the subsequent fanotify_add_mark() calls. */
+    /* Remove every mark this daemon installed (tracked in g_marks),
+     * including auto-added directory marks, then the mount marks, and
+     * clear the in-memory tables.  Called before a config reload so the
+     * tables are rebuilt cleanly by the subsequent fanotify_add_mark()
+     * calls.  Any deferred permission event is denied first (fail closed). */
+    fanotify_flush_pending(fd);
+
+    for (int i = g_mark_count - 1; i >= 0; i--)
+    {
+        if (fanotify_mark(fd, FAN_MARK_REMOVE, g_marks[i].mask,
+                          AT_FDCWD, g_marks[i].path) < 0)
+        {
+            log_msg(LOG_WARNING, "fanotify mark remove failed for %s: %s",
+                    g_marks[i].path, strerror(errno));
+        }
+        free(g_marks[i].path);
+        g_marks[i].path = NULL;
+    }
+    g_mark_count = 0;
+    g_auto_mark_count = 0;
+
     for (int i = 0; i < g_mount_count; i++)
     {
         if (fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
@@ -897,7 +1542,7 @@ void fanotify_clear_marks(int fd)
     }
     g_mount_count = 0;
     g_inode_count = 0;
-    log_msg(LOG_INFO, "mount marks and inode table cleared");
+    log_msg(LOG_INFO, "marks and inode table cleared");
 }
 
 int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
@@ -923,6 +1568,37 @@ int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
     return 0;
 }
 
+/* Decide all permission events that fanotify_pump() had to defer. */
+static int fanotify_process_pending(int fan_fd)
+{
+    int processed = 0;
+
+    while (g_pending_count > 0)
+    {
+        PendingEvent ev = g_pending[0];
+        memmove(&g_pending[0], &g_pending[1],
+                sizeof(PendingEvent) * (size_t)(g_pending_count - 1));
+        g_pending_count--;
+        process_open_perm(fan_fd, &ev.meta);
+        processed++;
+    }
+    return processed;
+}
+
+/* Deny and close every deferred event (reload/shutdown, fail closed). */
+void fanotify_flush_pending(int fan_fd)
+{
+    for (int i = 0; i < g_pending_count; i++)
+    {
+        fanotify_respond(fan_fd, &g_pending[i].meta, FAN_DENY);
+        close((int)g_pending[i].meta.fd);
+    }
+    if (g_pending_count > 0)
+        log_msg(LOG_WARNING, "denied %d pending permission events",
+                g_pending_count);
+    g_pending_count = 0;
+}
+
 void fanotify_loop(int fd)
 {
     char buf[BUF_SIZE]
@@ -934,12 +1610,21 @@ void fanotify_loop(int fd)
 
     while (g_running && !g_need_reload)
     {
+        /* Replay events deferred while a dialog was open. */
+        if (g_pending_count > 0)
+        {
+            fanotify_process_pending(fd);
+            if (!g_running || g_need_reload || g_fatal)
+                break;
+        }
+
         n = read(fd, buf, sizeof(buf));
         if (n < 0)
         {
             if (errno == EINTR)
                 continue;
             log_msg(LOG_ERR, "fanotify read: %s", strerror(errno));
+            g_fatal = 1;
             break;
         }
 
@@ -950,254 +1635,30 @@ void fanotify_loop(int fd)
             while (FAN_EVENT_OK(ev, (size_t)remaining))
             {
                 if (ev->vers != FANOTIFY_METADATA_VERSION)
+                {
+                    if (ev->fd != FAN_NOFD)
+                        close((int)ev->fd);
                     goto advance;
+                }
 
                 if (ev->mask & FAN_OPEN_PERM)
                 {
-                    pid_t pid = ev->pid;
-                    int fd_num = (int)ev->fd;
-                    char *binary = NULL;
-                    char *target = NULL;
-                    int ttl = 0;
-                    pid_t ppid = 0;
-                    char comm[256] = "";
-                    char pcomm[256] = "";
-                    char cmdline[512] = "";
-                    /* device + inode cached for dedup insert after decision */
-                    dev_t ev_dev = 0;
-                    ino_t ev_ino = 0;
-
-                    log_msg(LOG_DEBUG, "[event] FAN_OPEN_PERM pid=%d fd=%d",
-                            (int)pid, fd_num);
-
-                    if (fd_num == FAN_NOFD)
-                    {
-                        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying", (int)pid);
-                        fanotify_respond(fd, ev, FAN_DENY);
-                        goto advance;
-                    }
-
-                    /* Resolve the target file path from the daemon's fd table.
-                     * Done early so the mount-mark fast-path below can reuse
-                     * it, avoiding a redundant readlink(2). */
-                    target = resolve_fd_path(fd_num);
-                    if (!target)
-                    {
-                        log_msg(LOG_WARNING, "[event] resolve_fd_path failed for pid=%d fd=%d, denying",
-                                (int)pid, fd_num);
-                        fanotify_respond(fd, ev, FAN_DENY);
-                        close(fd_num);
-                        goto advance;
-                    }
-                    log_msg(LOG_DEBUG, "[event] resolved target: pid=%d target=%s",
-                            (int)pid, target);
-
-                    /* Fast-path filter for mount-mark noise.
-                     *
-                     * When FAN_MARK_MOUNT is active the kernel fires
-                     * FAN_OPEN_PERM for every file open on the filesystem,
-                     * not just protected paths.  fstat() the event fd and
-                     * check the inode table; if the inode is not protected
-                     * AND the resolved target path falls outside every
-                     * protected directory, allow it immediately.
-                     *
-                     * A protected inode that arrives via a path outside the
-                     * watched directories (hard link) will fail this check
-                     * because the path is outside protected dirs; the full
-                     * logic below handles it and logs the bypass.
-                     *
-                     * Files created inside a protected directory after
-                     * startup are not in the inode table yet, but they
-                     * WILL be caught by is_path_under_protected (directory
-                     * mark is the authoritative guard for those). */
-                    if (g_mount_count > 0)
-                    {
-                        struct stat fast_st;
-                        if (fstat(fd_num, &fast_st) == 0 &&
-                            !inode_is_protected(fast_st.st_dev, fast_st.st_ino) &&
-                            !is_path_under_protected(target))
-                        {
-                            log_msg(LOG_DEBUG,
-                                    "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
-                                    (int)pid, target);
-                            fanotify_respond(fd, ev, FAN_ALLOW);
-                            close(fd_num);
-                            free(target);
-                            target = NULL;
-                            goto advance;
-                        }
-                        log_msg(LOG_DEBUG,
-                                "[fast-path] MISS pid=%d target=%s "
-                                "inode_protected=%d path_protected=%d -- proceeding to full check",
-                                (int)pid, target,
-                                (fstat(fd_num, &fast_st) == 0) ? inode_is_protected(fast_st.st_dev, fast_st.st_ino) : -1,
-                                is_path_under_protected(target));
-                    }
-
-                    /* Resolve the binary path of the suspended process.
-                     * TOCTOU note: the process is kernel-suspended so it
-                     * cannot execve(), but its on-disk binary could be
-                     * replaced between readlink() and the cache/allowlist
-                     * check.  This is an inherent limitation of the
-                     * fanotify approach and is documented in LIMITATIONS.
-                     *
-                     * Deduplication check: when both a directory mark and a
-                     * mount mark are active the kernel fires two separate
-                     * FAN_OPEN_PERM events for the same open.  If we already
-                     * decided for this (pid, dev, ino) tuple recently, reuse
-                     * that decision and skip the dialog. */
-                    {
-                        struct stat dedup_st;
-                        if (fstat(fd_num, &dedup_st) == 0)
-                        {
-                            ev_dev = dedup_st.st_dev;
-                            ev_ino = dedup_st.st_ino;
-                            int cached = recent_cache_lookup(pid, ev_dev, ev_ino);
-                            if (cached != -1)
-                            {
-                                log_msg(LOG_DEBUG,
-                                        "[dedup] reusing cached decision=%s for pid=%d target=%s",
-                                        cached == (int)FAN_ALLOW ? "ALLOW" : "DENY",
-                                        (int)pid, target);
-                                fanotify_respond(fd, ev, (unsigned int)cached);
-                                close(fd_num);
-                                free(target);
-                                target = NULL;
-                                goto advance;
-                            }
-                        }
-                    }
-                    binary = proc_exe_path(pid);
-                    if (!binary)
-                    {
-                        fanotify_respond(fd, ev, FAN_DENY);
-                        close(fd_num);
-                        free(target);
-                        target = NULL;
-                        goto advance;
-                    }
-
-                    /* Hard-link bypass detection: if the resolved path does
-                     * not fall under any protected path the event was fired
-                     * by the mount mark, meaning the file was accessed via a
-                     * hard link outside the watched directories. */
-                    if (!is_path_under_protected(target))
-                    {
-                        log_msg(LOG_WARNING,
-                                "hard-link bypass attempt: %s (pid %d) opened "
-                                "protected inode via unprotected path \"%s\"",
-                                binary, (int)pid, target);
-                    }
-
-                    /* allowlist check */
-                    if (allowlist_match(binary, &ttl))
-                    {
-                        cache_insert(pid, binary, ttl);
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-                        fanotify_respond(fd, ev, FAN_ALLOW);
-                        close(fd_num);
-                        goto cleanup;
-                    }
-
-                    /* cache check */
-                    if (cache_lookup(pid, binary) > 0)
-                    {
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-                        fanotify_respond(fd, ev, FAN_ALLOW);
-                        close(fd_num);
-                        goto cleanup;
-                    }
-
-                    /* resolve process comm and parent comm */
-                    read_comm(pid, comm, sizeof(comm));
-                    ppid = get_ppid(pid);
-                    if (ppid > 0)
-                        read_comm(ppid, pcomm, sizeof(pcomm));
-                    read_cmdline(pid, cmdline, sizeof(cmdline));
-
-                    /*
-                     * Compute SHA-512 of the binary and build the ancestor
-                     * call chain.  Both are done while the target process is
-                     * kernel-suspended so its /proc entry is still valid.
-                     *
-                     * SHA-512 computation is deferred until after the static
-                     * allowlist / TTL-cache checks above (those are O(1)).
-                     * We only pay the fork+sha512sum cost on genuine cache
-                     * misses that will show a dialog anyway.
-                     */
-                    char bin_sha512[129] = "";
-                    ProcChain chain;
-                    /* Hash via /proc/<pid>/exe — works for containerised
-                     * processes (Podman/Docker) whose binary path does not
-                     * exist on the host filesystem. */
-                    int sha_ok = sha512_proc_exe(pid, bin_sha512);
-                    build_proc_chain(pid, &chain);
-
-                    if (sha_ok < 0)
-                        log_msg(LOG_WARNING, "SHA-512 computation failed for %s (pid %d); "
-                                             "permanent decisions will rely on path + chain only",
-                                binary, (int)pid);
-
-                    /* dynamic allowlist check (runtime "Always Allow") */
-                    if (dyn_allow_match(binary, bin_sha512, &chain))
-                    {
-                        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-                        cache_insert(pid, binary, user_ttl);
-                        log_msg(LOG_INFO,
-                                "dynamic allowlist hit: %s (pid %d) -> %s",
-                                binary, (int)pid, target);
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-                        fanotify_respond(fd, ev, FAN_ALLOW);
-                        close(fd_num);
-                        goto cleanup;
-                    }
-
-                    /* dynamic denylist check (runtime "Always Deny") */
-                    if (dyn_deny_match(binary, bin_sha512, &chain))
-                    {
-                        log_msg(LOG_INFO,
-                                "dynamic denylist hit: %s (pid %d) -> %s",
-                                binary, (int)pid, target);
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-                        fanotify_respond(fd, ev, FAN_DENY);
-                        close(fd_num);
-                        goto cleanup;
-                    }
-
-                    /* ask user consent */
-                    log_msg(LOG_INFO,
-                            "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
-                            (int)pid, binary, target, comm);
-                    int decision = notify_ask(comm, pid, ppid, pcomm,
-                                              binary, cmdline, target);
-                    log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
-                            decision, (int)pid, binary);
-                    if (decision == NOTIFY_ALLOW_ONCE ||
-                        decision == NOTIFY_ALLOW_ALWAYS)
-                    {
-                        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-                        cache_insert(pid, binary, user_ttl);
-                        if (decision == NOTIFY_ALLOW_ALWAYS)
-                            dyn_allow_add(binary, bin_sha512, &chain, target);
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-                        fanotify_respond(fd, ev, FAN_ALLOW);
-                    }
-                    else if (decision == NOTIFY_DENY_ALWAYS)
-                    {
-                        dyn_deny_add(binary, bin_sha512, &chain, target);
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-                        fanotify_respond(fd, ev, FAN_DENY);
-                    }
-                    else
-                    {
-                        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-                        fanotify_respond(fd, ev, FAN_DENY);
-                    }
-                    close(fd_num);
-
-                cleanup:
-                    free(binary);
-                    free(target);
+                    process_open_perm(fd, ev);
+                }
+                else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
+                {
+                    handle_notification_event(fd, ev);
+                }
+                else if (ev->mask & FAN_Q_OVERFLOW)
+                {
+                    log_msg(LOG_WARNING,
+                            "fanotify queue overflow; events were lost");
+                    if (ev->fd != FAN_NOFD)
+                        close((int)ev->fd);
+                }
+                else if (ev->fd != FAN_NOFD)
+                {
+                    close((int)ev->fd);
                 }
 
             advance:
@@ -1208,7 +1669,7 @@ void fanotify_loop(int fd)
             }
         }
 
-        if (!g_running || g_need_reload)
+        if (!g_running || g_need_reload || g_fatal)
             break;
 
         /* periodic cache expiry — every 100 events or 10 seconds */

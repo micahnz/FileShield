@@ -19,6 +19,7 @@
 
 volatile sig_atomic_t g_running = 1;
 volatile sig_atomic_t g_need_reload = 0;
+volatile sig_atomic_t g_fatal = 0;
 
 static void sigterm_handler(int sig)
 {
@@ -154,14 +155,14 @@ int main(int argc, char *argv[])
 
     log_msg(LOG_INFO, "FileShield started, watching %d paths", cfg->protected_count);
 
-    /* Load persisted "Always Allow" entries from the previous session. */
+    /* Load persisted "Always Allow" entries from the previous session.
+     * A read error is treated as an empty list (fail secure). */
     {
         PersistEntry *persist_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
         if (persist_buf)
         {
             int persist_count = persist_load(PERSIST_STATE_FILE, persist_buf, PERSIST_MAX_ENTRIES);
-            if (persist_count > 0)
-                fanotify_load_dyn_allowlist(persist_buf, persist_count);
+            fanotify_load_dyn_allowlist(persist_buf, persist_count < 0 ? 0 : persist_count);
             free(persist_buf);
         }
     }
@@ -172,8 +173,7 @@ int main(int argc, char *argv[])
         if (deny_buf)
         {
             int deny_count = persist_load(PERSIST_DENY_STATE_FILE, deny_buf, PERSIST_MAX_ENTRIES);
-            if (deny_count > 0)
-                fanotify_load_dyn_denylist(deny_buf, deny_count);
+            fanotify_load_dyn_denylist(deny_buf, deny_count < 0 ? 0 : deny_count);
             free(deny_buf);
         }
     }
@@ -181,6 +181,8 @@ int main(int argc, char *argv[])
     while (g_running)
     {
         fanotify_loop(fan_fd);
+        if (g_fatal)
+            break;
         if (g_need_reload)
         {
             g_need_reload = 0;
@@ -192,11 +194,10 @@ int main(int argc, char *argv[])
             }
             else if (config_load(config_path, new_cfg) == 0)
             {
-                /* Remove old marks first so paths present in both configs
-                 * are never unprotected (remove-then-add order). */
+                /* clear_marks() removes every mark the daemon installed
+                 * (including auto-added directory marks) with the exact
+                 * masks they were added with. */
                 fanotify_clear_marks(fan_fd);
-                for (int i = 0; i < cfg->protected_count; i++)
-                    fanotify_remove_mark(fan_fd, cfg->protected[i].path);
                 for (int i = 0; i < new_cfg->protected_count; i++)
                     fanotify_add_mark(fan_fd, new_cfg->protected[i].path);
                 log_msg(LOG_INFO, "config reloaded, watching %d paths", new_cfg->protected_count);
@@ -209,22 +210,22 @@ int main(int argc, char *argv[])
                 log_msg(LOG_ERR, "config reload failed, keeping old config");
                 free(new_cfg);
             }
-            /* Reload persist files so CLI-managed changes take effect. */
+            /* Reload persist files so CLI-managed changes take effect.
+             * A missing/corrupt file clears the in-memory list rather
+             * than keeping stale grants. */
             {
                 PersistEntry *allow_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
                 if (allow_buf)
                 {
                     int n = persist_load(PERSIST_STATE_FILE, allow_buf, PERSIST_MAX_ENTRIES);
-                    if (n >= 0)
-                        fanotify_load_dyn_allowlist(allow_buf, n);
+                    fanotify_load_dyn_allowlist(allow_buf, n < 0 ? 0 : n);
                     free(allow_buf);
                 }
                 PersistEntry *deny_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
                 if (deny_buf)
                 {
                     int n = persist_load(PERSIST_DENY_STATE_FILE, deny_buf, PERSIST_MAX_ENTRIES);
-                    if (n >= 0)
-                        fanotify_load_dyn_denylist(deny_buf, n);
+                    fanotify_load_dyn_denylist(deny_buf, n < 0 ? 0 : n);
                     free(deny_buf);
                 }
             }
@@ -233,9 +234,10 @@ int main(int argc, char *argv[])
     }
 
     log_msg(LOG_INFO, "FileShield shutting down");
+    fanotify_flush_pending(fan_fd);
     close(fan_fd);
     config_reset(cfg);
     free(cfg);
     closelog();
-    return EXIT_SUCCESS;
+    return g_fatal ? EXIT_FAILURE : EXIT_SUCCESS;
 }

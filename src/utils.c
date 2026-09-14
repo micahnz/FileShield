@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <syslog.h>
 #include <unistd.h>
 
@@ -177,4 +178,25 @@ void free_string_array(char **arr)
     for (int i = 0; arr[i] != NULL; i++)
         free(arr[i]);
     free(arr);
+}
+
+/*
+ * Close all fds >= first.  close_range(2) is the fast path; the fallback
+ * loop is capped so a huge RLIMIT_NOFILE cannot turn this into a long scan.
+ */
+void close_fds_from(int first)
+{
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, (unsigned int)first, ~0U, 0U) == 0)
+        return;
+#endif
+
+    long max = sysconf(_SC_OPEN_MAX);
+    if (max < 0)
+        max = 1024;
+    if (max > 65536)
+        max = 65536;
+
+    for (int fd = first; fd < (int)max; fd++)
+        close(fd);
 }
