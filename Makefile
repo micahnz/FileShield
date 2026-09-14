@@ -2,7 +2,8 @@
 
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 \
-           -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE \
+           -fstack-protector-strong -fstack-clash-protection \
+           -Wformat-security -D_FORTIFY_SOURCE=2 -fPIE \
            -D_DEFAULT_SOURCE -D_GNU_SOURCE
 LDFLAGS := -Wl,-z,relro -Wl,-z,now -pie
 
@@ -88,6 +89,6 @@ lint:
 		--suppress=unusedFunction --suppress=checkersReport \
 		$(SRCDIR)/*.c $(TSTDIR)/*.c 2>&1 || true
 
-debug: CFLAGS += -O0 -g -fsanitize=address,undefined
+debug: CFLAGS += -O0 -g -U_FORTIFY_SOURCE -fsanitize=address,undefined
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean all

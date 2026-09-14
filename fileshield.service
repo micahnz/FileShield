@@ -20,6 +20,10 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 StateDirectory=fileshield
+StateDirectoryMode=0700
+UMask=0077
+RestrictSUIDSGID=yes
+ProtectProc=invisible
 # ProtectHome cannot be enabled: the daemon places fanotify marks on the real
 # /home mount. ProtectHome would create a separate bind-mount namespace, making
 # fanotify_mark() target a shadow mount that user processes never open, so all
@@ -39,8 +43,10 @@ SystemCallArchitectures=native
 # (e.g. /home/user drwxr-x--- ) so that fanotify_mark can resolve their paths.
 # CAP_SETUID + CAP_SETGID are required to drop to the desktop user before
 # spawning kdialog/zenity (session sockets are mode 0600, owner=user).
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+# CAP_KILL is required to terminate a hung dialog after the outer timeout;
+# the dialog child has already dropped to the desktop UID by then.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
 
 [Install]
 WantedBy=multi-user.target

@@ -91,7 +91,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set — without losing the in-memory allow/deny lists.
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted *Always Allow* / *Always Deny* lists are reloaded from disk at the same time, so `fileshield-cli` changes take effect on reload.
 
 ### Default Protected Paths
 
@@ -170,7 +170,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 
    • Allow Once    — grant access this time only
    • Always Allow  — trust this exact binary (SHA-512 verified)
-                   in this call chain permanently
+                   in this call chain; re-prompts if it changes
    • Deny          — block access
    ```
 
@@ -238,7 +238,10 @@ cat /var/lib/fileshield/runtime-allowlist.json | jq .
 - **GUI dependency**: Requires a desktop session for popups.
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
+- **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on, and does not report `mmap(2)` accesses. Bind-mount aliases of protected paths, or a process that already holds an open descriptor, are outside the threat model.
+- **Hard links and symlinks**: Protected paths are canonicalized at load time (so a symlinked `~/.ssh` is still matched), and files created or moved into a protected tree are tracked by inode. Access through a hard link outside the watched directories is detected and prompts; this is best-effort for files that never appeared under a protected path.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
+- **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
 
 ---
 

@@ -48,7 +48,7 @@ int path_under(const char *path, const char *dir);
 ### `config.h` — parse `fileshield.conf`
 
 ```c
-#define MAX_PATHS 256
+#define MAX_PATHS 1024
 #define MAX_ALLOWLIST 128
 
 typedef struct {
