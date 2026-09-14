@@ -936,10 +936,92 @@ int fanotify_setup(void)
     return fd;
 }
 
+/* Add a FAN_MARK_MOUNT for the filesystem containing st, if not already
+ * tracked.  "path" may be any existing path on that filesystem; it is
+ * remembered for mark removal. */
+static void add_mount_mark_if_needed(int fd, const struct stat *st,
+                                     const char *path)
+{
+    for (int i = 0; i < g_mount_count; i++)
+    {
+        if (g_mounts[i].dev == st->st_dev)
+            return;
+    }
+
+    if (g_mount_count >= MAX_MOUNTS)
+    {
+        log_msg(LOG_WARNING, "mount table full; hard-link detection limited");
+        return;
+    }
+
+    if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+                      FAN_OPEN_PERM, AT_FDCWD, path) == 0)
+    {
+        g_mounts[g_mount_count].dev = st->st_dev;
+        snprintf(g_mounts[g_mount_count].path,
+                 sizeof(g_mounts[g_mount_count].path), "%s", path);
+        g_mount_count++;
+        log_msg(LOG_INFO, "fanotify mount mark added (dev %lu) for hard-link detection",
+                (unsigned long)st->st_dev);
+    }
+    else
+    {
+        log_msg(LOG_WARNING,
+                "fanotify mount mark failed for %s: %s "
+                "(hard-link detection disabled for this filesystem)",
+                path, strerror(errno));
+    }
+}
+
+/*
+ * A configured path that does not exist yet cannot be marked directly.
+ * Walk up to the nearest existing ancestor and make sure its filesystem
+ * carries a mount mark, so an open of the path after it is created is
+ * still intercepted and matched by is_path_under_protected().
+ */
+static void ensure_mount_mark_for_missing(int fd, const char *path)
+{
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s", path);
+
+    char *slash;
+    while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
+    {
+        *slash = '\0';
+        struct stat st;
+        if (stat(buf, &st) == 0)
+        {
+            add_mount_mark_if_needed(fd, &st, buf);
+            return;
+        }
+    }
+
+    struct stat st;
+    if (stat("/", &st) == 0)
+        add_mount_mark_if_needed(fd, &st, "/");
+}
+
 int fanotify_add_mark(int fd, const char *path)
 {
-    unsigned int mask = fanotify_mark_mask();
+    struct stat st;
 
+    if (stat(path, &st) != 0)
+    {
+        if (errno == ENOENT)
+        {
+            /* Not an error: the secret file simply does not exist yet.
+             * The mount mark keeps the path monitored once it appears. */
+            ensure_mount_mark_for_missing(fd, path);
+            log_msg(LOG_WARNING,
+                    "protected path does not exist yet, skipping direct mark: %s",
+                    path);
+            return 1;
+        }
+        log_msg(LOG_ERR, "stat %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    unsigned int mask = fanotify_mark_mask();
     if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, path) < 0)
     {
         log_msg(LOG_ERR, "fanotify_mark ADD %s: %s", path, strerror(errno));
@@ -948,57 +1030,19 @@ int fanotify_add_mark(int fd, const char *path)
     mark_table_add(path, mask);
     log_msg(LOG_INFO, "fanotify mark added: %s", path);
 
-    /* Populate the inode table so hard-link accesses are detected even when
-     * the attacker opens the file via a path outside our watched directories. */
-    struct stat st;
-    if (stat(path, &st) == 0)
-    {
-        if (S_ISREG(st.st_mode))
-            inode_table_add(st.st_dev, st.st_ino);
-        else if (S_ISDIR(st.st_mode))
-            inode_walk_dir(path, st.st_dev, 0);
+    if (S_ISREG(st.st_mode))
+        inode_table_add(st.st_dev, st.st_ino);
+    else if (S_ISDIR(st.st_mode))
+        inode_walk_dir(path, st.st_dev, 0);
 
-        /* Add a FAN_MARK_MOUNT for this filesystem if not already tracked.
-         * The mount mark fires for every open on the filesystem; the inode
-         * table is used as a fast filter so non-protected opens are allowed
-         * with minimal overhead. */
-        int found = 0;
-        for (int i = 0; i < g_mount_count; i++)
-        {
-            if (g_mounts[i].dev == st.st_dev)
-            {
-                found = 1;
-                break;
-            }
-        }
-        if (!found && g_mount_count < MAX_MOUNTS)
-        {
-            if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                              FAN_OPEN_PERM, AT_FDCWD, path) == 0)
-            {
-                g_mounts[g_mount_count].dev = st.st_dev;
-                snprintf(g_mounts[g_mount_count].path,
-                         sizeof(g_mounts[g_mount_count].path), "%s", path);
-                g_mount_count++;
-                log_msg(LOG_INFO, "fanotify mount mark added (dev %lu) for hard-link detection",
-                        (unsigned long)st.st_dev);
-            }
-            else
-            {
-                log_msg(LOG_WARNING,
-                        "fanotify mount mark failed for %s: %s "
-                        "(hard-link detection disabled for this filesystem)",
-                        path, strerror(errno));
-            }
-        }
-    }
-    else
-    {
-        log_msg(LOG_WARNING, "stat(%s) failed: %s (hard-link detection unavailable for this path)",
-                path, strerror(errno));
-    }
-
+    add_mount_mark_if_needed(fd, &st, path);
     return 0;
+}
+
+/* Non-zero when at least one file/directory or mount mark is active. */
+int fanotify_any_mark_active(void)
+{
+    return g_mark_count > 0 || g_mount_count > 0;
 }
 
 int fanotify_remove_mark(int fd, const char *path)

@@ -138,6 +138,8 @@ FileShield ships with the following paths protected out of the box:
 ~/.env
 ```
 
+Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start only if no configured path on any filesystem could be marked at all.
+
 ### Allowlist
 
 The `[allowlist]` section is **empty by default**. Pre-allowlisting a binary by path is risky: if that binary is replaced, wrapped, or symlinked by a compromised package, it inherits silent access to every protected resource without any popup.

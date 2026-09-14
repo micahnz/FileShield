@@ -159,12 +159,20 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     int mark_failures = 0;
+    int mark_skipped = 0;
     for (int i = 0; i < cfg->protected_count; i++)
     {
-        if (fanotify_add_mark(fan_fd, cfg->protected[i].path) < 0)
+        int rc = fanotify_add_mark(fan_fd, cfg->protected[i].path);
+        if (rc < 0)
         {
             log_msg(LOG_ERR, "failed to add mark for %s", cfg->protected[i].path);
             mark_failures++;
+        }
+        else if (rc > 0)
+        {
+            /* Path does not exist yet; the filesystem mount mark covers
+             * it if created later. */
+            mark_skipped++;
         }
     }
     if (mark_failures > 0)
@@ -179,6 +187,27 @@ int main(int argc, char *argv[])
         closelog();
         return EXIT_FAILURE;
     }
+
+    /* Fail closed if nothing at all is being watched: every configured
+     * path was missing and no filesystem could be mount-marked either. */
+    if (!fanotify_any_mark_active())
+    {
+        log_msg(LOG_ERR,
+                "no protected path could be marked on any filesystem; "
+                "refusing to start");
+        close(fan_fd);
+        config_reset(cfg);
+        free(cfg);
+        closelog();
+        return EXIT_FAILURE;
+    }
+
+    if (mark_skipped > 0)
+        log_msg(LOG_WARNING,
+                "%d protected path(s) do not exist yet; they are covered by "
+                "the filesystem mount mark if created later (reload for a "
+                "direct mark)",
+                mark_skipped);
 
     log_msg(LOG_INFO, "FileShield started, watching %d paths", cfg->protected_count);
 
@@ -227,22 +256,28 @@ int main(int argc, char *argv[])
                 fanotify_clear_marks(fan_fd);
 
                 int add_failures = 0;
+                int add_skipped = 0;
                 for (int i = 0; i < new_cfg->protected_count; i++)
                 {
-                    if (fanotify_add_mark(fan_fd, new_cfg->protected[i].path) < 0)
+                    int rc = fanotify_add_mark(fan_fd, new_cfg->protected[i].path);
+                    if (rc < 0)
                     {
                         log_msg(LOG_ERR, "reload: failed to add mark for %s",
                                 new_cfg->protected[i].path);
                         add_failures++;
                     }
+                    else if (rc > 0)
+                        add_skipped++;
                 }
 
                 /* Fail closed: never leave the daemon partially or fully
                  * unprotected.  A failed (or protection-less) reload rolls
                  * back to the previous mark set and keeps the old config;
                  * if even that cannot be restored, shut down so systemd
-                 * restarts from a clean state. */
-                if (add_failures > 0 || new_cfg->protected_count == 0)
+                 * restarts from a clean state.  Config paths that do not
+                 * exist yet (rc 1) are skipped, not fatal. */
+                if (add_failures > 0 || new_cfg->protected_count == 0 ||
+                    !fanotify_any_mark_active())
                 {
                     log_msg(LOG_ERR,
                             "reload rejected (%d mark failures, %d paths); "
@@ -264,7 +299,10 @@ int main(int argc, char *argv[])
                 }
                 else
                 {
-                    log_msg(LOG_INFO, "config reloaded, watching %d paths", new_cfg->protected_count);
+                    log_msg(LOG_INFO,
+                            "config reloaded, watching %d paths (%d missing, "
+                            "covered by mount marks)",
+                            new_cfg->protected_count, add_skipped);
                     free(cfg);
                     cfg = new_cfg;
                     g_config = cfg;

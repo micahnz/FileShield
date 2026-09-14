@@ -69,6 +69,24 @@ static void test_mark_mask_rejects_fid_events(void) {
 }
 
 /*
+ * Part 0b: a configured path that does not exist is skipped (returns 1)
+ * rather than treated as a fatal mark failure, and skipping registers no
+ * mark state.  The default config lists many secrets paths that may not
+ * exist on a given machine; those must not crash the daemon.
+ */
+static void test_missing_path_is_skipped(void) {
+    ASSERT(fanotify_any_mark_active() == 0, "no mark state before skip test");
+    int rc = fanotify_add_mark(-1, "/nonexistent/fileshield/missing-secret");
+    ASSERT(rc == 1, "missing configured path is skipped (rc 1)");
+    ASSERT(fanotify_any_mark_active() == 0, "skipped path adds no mark state");
+
+    /* An existing path with an unusable group fd is a real failure. */
+    rc = fanotify_add_mark(-1, "/");
+    ASSERT(rc == -1, "existing path mark failure is fatal (rc -1)");
+    ASSERT(fanotify_any_mark_active() == 0, "failed mark adds no state");
+}
+
+/*
  * Part 1: fill the deferred queue to capacity, verify a full queue
  * refuses further events, then verify the fail-closed flush denies and
  * closes every deferred event.
@@ -277,6 +295,7 @@ cleanup:
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
+    test_missing_path_is_skipped();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
     if (failures) {
