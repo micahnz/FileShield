@@ -145,12 +145,39 @@ int main(int argc, char *argv[])
     }
     notify_set_fan_fd(fan_fd);
 
+    /* Fail closed: a security daemon must never run in a silently
+     * degraded state.  Any path we could not mark would be unprotected
+     * while the user believes it is watched, so startup aborts and
+     * systemd's Restart=on-failure retries it. */
+    if (cfg->protected_count == 0)
+    {
+        log_msg(LOG_ERR, "no protected paths configured; refusing to start");
+        close(fan_fd);
+        config_reset(cfg);
+        free(cfg);
+        closelog();
+        return EXIT_FAILURE;
+    }
+    int mark_failures = 0;
     for (int i = 0; i < cfg->protected_count; i++)
     {
         if (fanotify_add_mark(fan_fd, cfg->protected[i].path) < 0)
         {
-            log_msg(LOG_WARNING, "failed to add mark for %s", cfg->protected[i].path);
+            log_msg(LOG_ERR, "failed to add mark for %s", cfg->protected[i].path);
+            mark_failures++;
         }
+    }
+    if (mark_failures > 0)
+    {
+        log_msg(LOG_ERR,
+                "%d of %d protected paths could not be marked; refusing to "
+                "start with incomplete protection",
+                mark_failures, cfg->protected_count);
+        close(fan_fd);
+        config_reset(cfg);
+        free(cfg);
+        closelog();
+        return EXIT_FAILURE;
     }
 
     log_msg(LOG_INFO, "FileShield started, watching %d paths", cfg->protected_count);
@@ -198,12 +225,50 @@ int main(int argc, char *argv[])
                  * (including auto-added directory marks) with the exact
                  * masks they were added with. */
                 fanotify_clear_marks(fan_fd);
+
+                int add_failures = 0;
                 for (int i = 0; i < new_cfg->protected_count; i++)
-                    fanotify_add_mark(fan_fd, new_cfg->protected[i].path);
-                log_msg(LOG_INFO, "config reloaded, watching %d paths", new_cfg->protected_count);
-                free(cfg);
-                cfg = new_cfg;
-                g_config = cfg;
+                {
+                    if (fanotify_add_mark(fan_fd, new_cfg->protected[i].path) < 0)
+                    {
+                        log_msg(LOG_ERR, "reload: failed to add mark for %s",
+                                new_cfg->protected[i].path);
+                        add_failures++;
+                    }
+                }
+
+                /* Fail closed: never leave the daemon partially or fully
+                 * unprotected.  A failed (or protection-less) reload rolls
+                 * back to the previous mark set and keeps the old config;
+                 * if even that cannot be restored, shut down so systemd
+                 * restarts from a clean state. */
+                if (add_failures > 0 || new_cfg->protected_count == 0)
+                {
+                    log_msg(LOG_ERR,
+                            "reload rejected (%d mark failures, %d paths); "
+                            "restoring previous protection",
+                            add_failures, new_cfg->protected_count);
+                    for (int i = 0; i < cfg->protected_count; i++)
+                    {
+                        if (fanotify_add_mark(fan_fd, cfg->protected[i].path) < 0)
+                        {
+                            log_msg(LOG_ERR,
+                                    "rollback failed for %s; shutting down",
+                                    cfg->protected[i].path);
+                            g_fatal = 1;
+                        }
+                    }
+                    free(new_cfg);
+                    if (g_fatal)
+                        break;
+                }
+                else
+                {
+                    log_msg(LOG_INFO, "config reloaded, watching %d paths", new_cfg->protected_count);
+                    free(cfg);
+                    cfg = new_cfg;
+                    g_config = cfg;
+                }
             }
             else
             {
