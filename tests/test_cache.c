@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -59,6 +60,16 @@ static void test_pid_starttime(void) {
     cache_expire();
 }
 
+static void test_ttl_clamp(void) {
+    /* Absurd TTLs must be clamped so expiry arithmetic cannot overflow
+     * into the past on any time_t width. */
+    cache_insert(500, "/bin/huge", INT_MAX);
+    int ttl = cache_lookup(500, "/bin/huge");
+    ASSERT(ttl > 0, "clamped entry still valid");
+    ASSERT(ttl <= (365 * 24 * 60 * 60), "clamped TTL bounded to one year");
+    cache_expire();
+}
+
 int main(void) {
     printf("=== test_cache ===\n");
     test_insert_lookup();
@@ -67,6 +78,7 @@ int main(void) {
     test_count();
     test_null_binary();
     test_pid_starttime();
+    test_ttl_clamp();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

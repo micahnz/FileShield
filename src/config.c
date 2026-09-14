@@ -10,6 +10,13 @@
 
 Config *g_config = NULL;
 
+/*
+ * Sanity bound for TTLs (1 year): keeps cache expiry arithmetic safe on
+ * 32-bit time_t and prevents a typo from silently granting access for
+ * decades.  cache_insert() clamps again defensively.
+ */
+#define MAX_TTL_SECONDS (365 * 24 * 60 * 60)
+
 static char *trim(char *s)
 {
     while (*s == ' ' || *s == '\t')
@@ -180,6 +187,13 @@ int config_load(const char *path, Config *cfg)
                 log_msg(LOG_ERR, "config_load: invalid TTL in allowlist: %s", ttl_str);
                 continue;
             }
+            if (ttl > MAX_TTL_SECONDS)
+            {
+                log_msg(LOG_WARNING,
+                        "config_load: allowlist TTL %d for %s clamped to %d seconds",
+                        ttl, binary, MAX_TTL_SECONDS);
+                ttl = MAX_TTL_SECONDS;
+            }
 
             char *expanded = expand_home(binary);
             if (!expanded)
@@ -208,7 +222,16 @@ int config_load(const char *path, Config *cfg)
             {
                 int ttl;
                 if (sscanf(val, "%d", &ttl) == 1 && ttl > 0)
+                {
+                    if (ttl > MAX_TTL_SECONDS)
+                    {
+                        log_msg(LOG_WARNING,
+                                "config_load: user_ttl %d clamped to %d seconds",
+                                ttl, MAX_TTL_SECONDS);
+                        ttl = MAX_TTL_SECONDS;
+                    }
                     cfg->user_ttl_seconds = ttl;
+                }
                 else
                     log_msg(LOG_ERR, "config_load: invalid user_ttl: %s", val);
             }

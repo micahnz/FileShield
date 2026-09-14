@@ -149,6 +149,37 @@ static void test_settings_invalid_user_ttl(void)
     free(path);
 }
 
+/*
+ * Absurd TTL values must be clamped (to one year) so cache expiry
+ * arithmetic cannot overflow on any time_t width.
+ */
+static void test_ttl_clamping(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/ttl_clamp_test\n"
+        "[settings]\n"
+        "user_ttl = 2000000000\n"
+        "[allowlist]\n"
+        "/usr/bin/huge = 999999999\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for ttl clamp");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load ttl clamp success");
+    ASSERT(cfg.allowlist_count == 1, "allowlist parsed for ttl clamp");
+    ASSERT(cfg.allowlist[0].ttl_seconds == 31536000, "allowlist TTL clamped to one year");
+    ASSERT(cfg.user_ttl_seconds == 31536000, "user_ttl clamped to one year");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 static void test_whitespace_lines(void)
 {
     const char *conf =
@@ -230,6 +261,7 @@ int main(void)
     test_unknown_section();
     test_settings_user_ttl();
     test_settings_invalid_user_ttl();
+    test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
     if (failures)
