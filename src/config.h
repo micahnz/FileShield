@@ -24,7 +24,9 @@ typedef struct
     int protected_count;
     AllowlistEntry allowlist[MAX_ALLOWLIST];
     int allowlist_count;
-    int user_ttl_seconds; /* TTL for user-approved accesses (default 300) */
+    int user_ttl_seconds;    /* TTL for user-approved accesses (default 300) */
+    int session_ttl_seconds; /* TTL cap for session decisions; 0 = for as long
+                                as the session leader (shell) lives          */
 } Config;
 
 int config_load(const char *path, Config *cfg);

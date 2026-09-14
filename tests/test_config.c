@@ -128,6 +128,73 @@ static void test_settings_user_ttl(void)
     free(path);
 }
 
+static void test_settings_session_ttl(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "user_ttl = 120\n"
+        "session_ttl = 0\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for session settings");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load session settings success");
+    ASSERT(cfg.user_ttl_seconds == 120, "user_ttl parsed alongside session_ttl");
+    ASSERT(cfg.session_ttl_seconds == 0, "session_ttl 0 (leader lifetime) parsed");
+
+    config_reset(&cfg);
+    ASSERT(cfg.session_ttl_seconds == 0, "config_reset clears session_ttl");
+
+    unlink(path);
+    free(path);
+}
+
+static void test_settings_session_ttl_value(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "session_ttl = 900\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for session_ttl value");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    config_load(path, &cfg);
+    ASSERT(cfg.session_ttl_seconds == 900, "session_ttl value parsed");
+    /* Absent session_ttl must default to 0, not inherit user_ttl. */
+    ASSERT(cfg.user_ttl_seconds == 0, "user_ttl absent defaults to 0");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+static void test_settings_invalid_session_ttl(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "session_ttl = -5\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for invalid session_ttl");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    config_load(path, &cfg);
+    ASSERT(cfg.session_ttl_seconds == 0, "invalid session_ttl not applied");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 static void test_settings_invalid_user_ttl(void)
 {
     const char *conf =
@@ -160,6 +227,7 @@ static void test_ttl_clamping(void)
         "/tmp/ttl_clamp_test\n"
         "[settings]\n"
         "user_ttl = 2000000000\n"
+        "session_ttl = 2000000000\n"
         "[allowlist]\n"
         "/usr/bin/huge = 999999999\n";
 
@@ -174,6 +242,7 @@ static void test_ttl_clamping(void)
     ASSERT(cfg.allowlist_count == 1, "allowlist parsed for ttl clamp");
     ASSERT(cfg.allowlist[0].ttl_seconds == 31536000, "allowlist TTL clamped to one year");
     ASSERT(cfg.user_ttl_seconds == 31536000, "user_ttl clamped to one year");
+    ASSERT(cfg.session_ttl_seconds == 31536000, "session_ttl clamped to one year");
 
     config_reset(&cfg);
     unlink(path);
@@ -260,6 +329,9 @@ int main(void)
     test_missing_file();
     test_unknown_section();
     test_settings_user_ttl();
+    test_settings_session_ttl();
+    test_settings_session_ttl_value();
+    test_settings_invalid_session_ttl();
     test_settings_invalid_user_ttl();
     test_ttl_clamping();
     test_whitespace_lines();

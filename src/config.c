@@ -235,6 +235,25 @@ int config_load(const char *path, Config *cfg)
                 else
                     log_msg(LOG_ERR, "config_load: invalid user_ttl: %s", val);
             }
+            else if (strcmp(key, "session_ttl") == 0)
+            {
+                /* 0 is a valid value: session decisions then live exactly
+                 * as long as the session leader (the shell). */
+                int ttl;
+                if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
+                {
+                    if (ttl > MAX_TTL_SECONDS)
+                    {
+                        log_msg(LOG_WARNING,
+                                "config_load: session_ttl %d clamped to %d seconds",
+                                ttl, MAX_TTL_SECONDS);
+                        ttl = MAX_TTL_SECONDS;
+                    }
+                    cfg->session_ttl_seconds = ttl;
+                }
+                else
+                    log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
+            }
         }
     }
 
