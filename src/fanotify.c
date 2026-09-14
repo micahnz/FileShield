@@ -428,10 +428,15 @@ static int dyn_to_persist(const DynEntry *entries, int count,
     return n;
 }
 
-/* Load PersistEntry entries into a DynEntry array. */
+/*
+ * Load PersistEntry entries into a DynEntry array.
+ * When require_binary_sha512 is set, entries without a binary SHA-512 are
+ * dropped (fail closed): a permanent grant that cannot prove which binary
+ * was approved must never be trusted as a wildcard.
+ */
 static void load_dyn_list(DynEntry *list, int *list_count,
                           const PersistEntry *entries, int count,
-                          const char *name)
+                          const char *name, int require_binary_sha512)
 {
     /* Always replace the in-memory list so a CLI "clear" (file removed)
      * or a corrupt/unreadable state file cannot leave stale grants or
@@ -446,14 +451,17 @@ static void load_dyn_list(DynEntry *list, int *list_count,
     }
     if (count > DYN_MAX)
         count = DYN_MAX;
+    int n = 0;
     for (int i = 0; i < count; i++)
     {
         const PersistEntry *src = &entries[i];
-        DynEntry *dst = &list[i];
+        DynEntry *dst = &list[n];
         snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
         snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
         snprintf(dst->target_path, sizeof(dst->target_path), "%s", src->target_path);
         int depth = src->chain_depth;
+        if (depth < 0)
+            depth = 0;
         if (depth > PERSIST_CHAIN_MAX)
             depth = PERSIST_CHAIN_MAX;
         dst->chain_depth = depth;
@@ -462,9 +470,18 @@ static void load_dyn_list(DynEntry *list, int *list_count,
             snprintf(dst->chain_comm[j], sizeof(dst->chain_comm[j]), "%s", src->chain_comm[j]);
             snprintf(dst->chain_sha512[j], sizeof(dst->chain_sha512[j]), "%s", src->chain_sha512[j]);
         }
+        if (require_binary_sha512 && dst->binary_sha512[0] == '\0')
+        {
+            log_msg(LOG_WARNING,
+                    "dropping %s entry \"%s\": no binary SHA-512 recorded "
+                    "(fail closed)",
+                    name, dst->binary);
+            continue;
+        }
+        n++;
     }
-    *list_count = count;
-    log_msg(LOG_INFO, "loaded %d persisted %s entries", count, name);
+    *list_count = n;
+    log_msg(LOG_INFO, "loaded %d persisted %s entries", n, name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -497,6 +514,12 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
         DynEntry *e = &g_dyn_allow[i];
 
         if (strcmp(e->binary, binary) != 0)
+            continue;
+
+        /* Fail closed: an entry without a binary SHA-512 cannot prove the
+         * binary identity was ever verified, so it must never act as a
+         * wildcard grant. */
+        if (e->binary_sha512[0] == '\0')
             continue;
 
         /* SHA-512 check on the binary itself. */
@@ -542,6 +565,18 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
 static void dyn_allow_add(const char *binary, const char *bin_sha512,
                           const ProcChain *chain, const char *target)
 {
+    /* Fail closed at creation: a permanent grant is only recorded when the
+     * binary's SHA-512 was actually computed.  Without it the entry would
+     * match any binary at this path forever. */
+    if (bin_sha512[0] == '\0')
+    {
+        log_msg(LOG_WARNING,
+                "refusing permanent allow for %s: binary SHA-512 unavailable; "
+                "granting one-time access only (re-prompt will occur)",
+                binary);
+        return;
+    }
+
     if (g_dyn_allow_count >= DYN_MAX)
     {
         log_msg(LOG_WARNING, "dynamic allowlist full (%d); dropping oldest entry",
@@ -1293,8 +1328,9 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     build_proc_chain(pid, &chain);
 
     if (sha_ok < 0)
-        log_msg(LOG_WARNING, "SHA-512 computation failed for %s (pid %d); "
-                             "permanent decisions will rely on path + chain only",
+        log_msg(LOG_WARNING, "SHA-512 unavailable for %s (pid %d); "
+                             "\"Always Allow\" will not persist for this "
+                             "decision (access will be re-prompted)",
                 binary, (int)pid);
 
     /* dynamic allowlist check (runtime "Always Allow") */
@@ -1699,7 +1735,8 @@ int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries)
 
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 {
-    load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count, "always-allow");
+    load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count,
+                  "always-allow", 1);
 }
 
 int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
@@ -1711,5 +1748,6 @@ int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
 
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 {
-    load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries, count, "always-deny");
+    load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries, count,
+                  "always-deny", 0);
 }
