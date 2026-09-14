@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 
 #include "notify.h"
 #include "fanotify.h"
+#include "session.h"
 #include "utils.h"
 
 /* UID of the desktop user whose session was detected. 0 = not found. */
@@ -31,6 +33,178 @@ static int g_fan_fd = -1;
 /* Total wall-clock budget for a dialog, slightly longer than the inner
  * "timeout 30" the child enforces. */
 #define DIALOG_OUTER_TIMEOUT_S 40
+
+/* ------------------------------------------------------------------ */
+/*  user session environment forwarding                                */
+/* ------------------------------------------------------------------ */
+/*
+ * The daemon runs as root from systemd with a bare environment, so a
+ * kdialog child would miss the user's desktop session variables and Qt
+ * falls back to the generic light theme instead of the user's theme
+ * (on Plasma, KDE_FULL_SESSION / XDG_CURRENT_DESKTOP drive platform
+ * theme selection).  Forward a fixed whitelist of cosmetic variables
+ * from the user's own session.
+ *
+ * Deliberately NOT forwarded:
+ *   - DISPLAY / WAYLAND_DISPLAY / XAUTHORITY / DBUS_SESSION_BUS_ADDRESS:
+ *     the prompt must stay on the display FileShield detected, never one
+ *     a malicious process points at.
+ *   - LD_* / PATH / QT_PLUGIN_PATH / QT_QPA_PLATFORM*: no code loading or
+ *     platform override.
+ * The forwarded values are cosmetic only and length-capped; a malicious
+ * value can at worst make the dialog look wrong or fail, which still
+ * fails closed.
+ */
+static const char *const g_dialog_env_keys[] = {
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "KDE_FULL_SESSION",
+    "KDE_SESSION_VERSION",
+    "KDE_APPLICATIONS_AS_SCOPE",
+    "QT_QPA_PLATFORMTHEME",
+    "QT_STYLE_OVERRIDE",
+    "QT_AUTO_SCREEN_SCALE_FACTOR",
+    "QT_SCALE_FACTOR",
+    "QT_SCREEN_SCALE_FACTORS",
+    "QT_FONT_DPI",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "XCURSOR_THEME",
+    "XCURSOR_SIZE",
+    "GTK_THEME",
+    NULL};
+
+#define DIALOG_ENV_MAX 24
+#define DIALOG_ENV_KEY_MAX 32
+#define DIALOG_ENV_VALUE_MAX 256
+#define DIALOG_ENV_FILE_MAX (128 * 1024)
+
+typedef struct
+{
+    char key[DIALOG_ENV_KEY_MAX];
+    char value[DIALOG_ENV_VALUE_MAX];
+} DialogEnvSetting;
+
+static int dialog_env_key_allowed(const char *key)
+{
+    for (int i = 0; g_dialog_env_keys[i] != NULL; i++)
+    {
+        if (strcmp(g_dialog_env_keys[i], key) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int dialog_env_collected(const DialogEnvSetting *out, int count,
+                                const char *key)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (strcmp(out[i].key, key) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Merge NUL-separated KEY=VALUE entries from a /proc environ buffer. */
+static int merge_proc_environ(const char *buf, size_t len,
+                              DialogEnvSetting *out, int count, int max)
+{
+    size_t pos = 0;
+
+    while (pos < len && count < max)
+    {
+        const char *entry = buf + pos;
+        size_t entry_len = strnlen(entry, len - pos);
+        const char *eq = memchr(entry, '=', entry_len);
+
+        if (eq != NULL && (size_t)(eq - entry) < DIALOG_ENV_KEY_MAX)
+        {
+            char key[DIALOG_ENV_KEY_MAX];
+            size_t klen = (size_t)(eq - entry);
+
+            memcpy(key, entry, klen);
+            key[klen] = '\0';
+
+            if (dialog_env_key_allowed(key) &&
+                !dialog_env_collected(out, count, key))
+            {
+                size_t vlen = entry_len - klen - 1;
+                if (vlen >= DIALOG_ENV_VALUE_MAX)
+                    vlen = DIALOG_ENV_VALUE_MAX - 1;
+                snprintf(out[count].key, sizeof(out[count].key), "%s", key);
+                memcpy(out[count].value, eq + 1, vlen);
+                out[count].value[vlen] = '\0';
+                count++;
+            }
+        }
+        pos += entry_len + 1;
+    }
+    return count;
+}
+
+static int read_proc_environ(pid_t pid, char *buf, size_t bufsz)
+{
+    char path[64];
+    int fd;
+    ssize_t n;
+
+    snprintf(path, sizeof(path), "/proc/%d/environ", (int)pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, bufsz - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    return (int)n;
+}
+
+/*
+ * Collect the whitelisted variables for requester.  The session leader
+ * (the user's shell) holds the authoritative session environment; the
+ * requester fills any gaps.  Returns the number of settings found.
+ */
+static int collect_dialog_env(pid_t requester, DialogEnvSetting *out, int max)
+{
+    char *buf = malloc(DIALOG_ENV_FILE_MAX);
+    pid_t leader = 0;
+    int count = 0;
+    int n;
+
+    if (buf == NULL)
+        return 0;
+
+    if (session_id_of(requester, &leader, NULL) == 0 && leader > 0)
+    {
+        n = read_proc_environ(leader, buf, DIALOG_ENV_FILE_MAX);
+        if (n > 0)
+            count = merge_proc_environ(buf, (size_t)n, out, count, max);
+    }
+
+    if (count < max && requester != leader)
+    {
+        n = read_proc_environ(requester, buf, DIALOG_ENV_FILE_MAX);
+        if (n > 0)
+            count = merge_proc_environ(buf, (size_t)n, out, count, max);
+    }
+
+    free(buf);
+    return count;
+}
+
+/* Called in the dialog child after dropping to the desktop user. */
+static void apply_dialog_env(const DialogEnvSetting *env, int count)
+{
+    for (int i = 0; i < count; i++)
+        setenv(env[i].key, env[i].value, 1);
+}
 
 void notify_set_fan_fd(int fd)
 {
@@ -214,7 +388,8 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
  * events on mount-marked filesystems and would otherwise deadlock the
  * helper behind the daemon's blocked event.
  */
-static int run_kdialog_3choice(const char *text, const char *yes_label,
+static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
+                               const char *text, const char *yes_label,
                                const char *no_label, const char *cancel_label)
 {
     pid_t pid = fork();
@@ -231,6 +406,8 @@ static int run_kdialog_3choice(const char *text, const char *yes_label,
          * and so events from every dialog helper can be recognized. */
         setpgid(0, 0);
         drop_to_session_user();
+        /* Let kdialog see the user's theme/font/scale/locale settings. */
+        apply_dialog_env(env, env_count);
         close_fds_from(3);
 
         execl("/usr/bin/timeout", "timeout", "30",
@@ -377,8 +554,16 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
         return NOTIFY_DENY;
     }
 
+    /* Forward the user's theme/font/scale/locale environment so kdialog
+     * renders like the rest of their desktop. */
+    DialogEnvSetting dialog_env[DIALOG_ENV_MAX];
+    int dialog_env_count = collect_dialog_env(pid, dialog_env, DIALOG_ENV_MAX);
+    log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
+            dialog_env_count);
+
     /* First dialog: Allow Once / Allow / Deny. */
-    int r = run_kdialog_3choice(msg, "Allow Once", "Allow", "Deny");
+    int r = run_kdialog_3choice(dialog_env, dialog_env_count, msg,
+                                "Allow Once", "Allow", "Deny");
 
     if (r == 0)
         return NOTIFY_ALLOW_ONCE;
@@ -397,8 +582,8 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                  "\xe2\x80\xa2 Cancel        \xe2\x80\x94 deny this time",
                  path_s);
 
-        int r2 = run_kdialog_3choice(msg2, "Allow Session", "Allow Always",
-                                     "Cancel");
+        int r2 = run_kdialog_3choice(dialog_env, dialog_env_count, msg2,
+                                     "Allow Session", "Allow Always", "Cancel");
         if (r2 == 0)
             return NOTIFY_ALLOW_SESSION;
         if (r2 == 1)
@@ -424,7 +609,8 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
              "\xe2\x80\xa2 Deny         \xe2\x80\x94 this time only",
              path_s);
 
-    int r3 = run_kdialog_3choice(msg2, "Deny Session", "Deny Always", "Deny");
+    int r3 = run_kdialog_3choice(dialog_env, dialog_env_count, msg2,
+                                 "Deny Session", "Deny Always", "Deny");
     if (r3 == 0)
         return NOTIFY_DENY_SESSION;
     if (r3 == 1)

@@ -160,6 +160,14 @@ Stage 1 is `Allow Once / Allow / Deny`; `Allow` and `Deny` open a second
 dialog offering session or permanent scopes.  Any failure (missing kdialog,
 timeout, unexpected exit code) returns `NOTIFY_DENY` (fail closed).
 
+The dialog child forwards a whitelist of the user's session appearance
+variables (desktop identity, Qt theme/scale, locale, cursor) read from
+`/proc/<pid>/environ` so kdialog follows the desktop theme.  Display,
+session-bus, `LD_*`, `PATH` and `QT_PLUGIN_PATH`/`QT_QPA_PLATFORM*` variables
+are deliberately never forwarded: the prompt must stay on the display
+FileShield detected, and no code-loading or platform override may come from
+the requesting process.
+
 ### `main.c` — daemon lifecycle
 
 ```c

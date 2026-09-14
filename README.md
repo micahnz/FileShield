@@ -9,7 +9,7 @@
 ## Features
 
 - **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
-- **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed (zenity is not supported).
+- **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed (zenity is not supported); the dialog inherits your session's Qt theme, fonts and scaling.
 - **Scoped decisions**: *Allow Once* is file-scoped with a `user_ttl`; *Allow Session* lasts until you close the terminal; *Allow Always* is a persistent per-file rule bound to the binary hash, call chain and exact command line. Matching deny scopes exist too.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
 
@@ -19,6 +19,7 @@
 
 - Linux kernel **5.0+** (5.1+ recommended)
 - **`kdialog`** (for GUI popups; part of KDE but works in other desktop environments too)
+- On non-KDE desktops, a Qt platform theme integration (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`) if you want the dialog to match the system theme; without one kdialog falls back to Qt's default light theme
 
 ---
 
@@ -316,7 +317,7 @@ cat /var/lib/fileshield/runtime-denylist.json | jq .
 ## Limitations
 
 - **Root processes**: A process running as root can bypass fanotify. FileShield protects against unprivileged or compromised user-space processes.
-- **GUI dependency**: Requires a desktop session for popups.
+- **GUI dependency**: Requires a desktop session for popups; on non-KDE desktops the popup matches the system theme only when a Qt platform theme integration is installed.
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
 - **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on, and does not report `mmap(2)` accesses. Bind-mount aliases of protected paths, or a process that already holds an open descriptor, are outside the threat model.
@@ -432,6 +433,7 @@ Runs `cppcheck` over all sources in `src/` and `tests/`. Requires `cppcheck` to 
 ## Troubleshooting
 
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). zenity is not supported; if kdialog is missing or fails, access is denied (fail closed).
+- **Dialog does not match your theme?** The daemon runs as root with a bare environment, so FileShield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
 - **Dialog behavior on failure**: timeouts, exec failures and unexpected kdialog exit codes deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — this is a documented, accepted trade-off; *Allow Session* remains available and exec failures/timeouts always fail closed.
 - **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
