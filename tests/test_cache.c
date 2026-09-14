@@ -11,51 +11,83 @@ static int failures = 0;
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
-        fprintf(stderr, "FAIL: %s\n", msg); \
+        fprintf(stderr, "FAIL: %s\n", (msg)); \
         failures++; \
     } \
 } while(0)
 
 static void test_insert_lookup(void) {
-    cache_insert(42, "/usr/bin/evil", 60);
-    ASSERT(cache_lookup(42, "/usr/bin/evil") > 0, "lookup after insert");
-    ASSERT(cache_lookup(42, "/usr/bin/other") == 0, "lookup wrong binary");
-    ASSERT(cache_lookup(99, "/usr/bin/evil") == 0, "lookup wrong pid");
+    cache_insert(42, "/usr/bin/evil", "/home/u/.ssh/id_rsa", 60);
+    ASSERT(cache_lookup(42, "/usr/bin/evil", "/home/u/.ssh/id_rsa") > 0,
+           "lookup after insert");
+    ASSERT(cache_lookup(42, "/usr/bin/other", "/home/u/.ssh/id_rsa") == 0,
+           "lookup wrong binary");
+    ASSERT(cache_lookup(99, "/usr/bin/evil", "/home/u/.ssh/id_rsa") == 0,
+           "lookup wrong pid");
     cache_expire();
-    ASSERT(cache_lookup(42, "/usr/bin/evil") > 0, "lookup still valid after expire");
+    ASSERT(cache_lookup(42, "/usr/bin/evil", "/home/u/.ssh/id_rsa") > 0,
+           "lookup still valid after expire");
+}
+
+static void test_target_scoping(void) {
+    cache_insert(600, "/bin/scope", "/home/u/.kube/config", 60);
+    ASSERT(cache_lookup(600, "/bin/scope", "/home/u/.kube/config") > 0,
+           "exact target matches");
+    ASSERT(cache_lookup(600, "/bin/scope", "/home/u/.ssh/id_rsa") == 0,
+           "other target does not match");
+    ASSERT(cache_lookup(600, "/bin/scope", NULL) == 0,
+           "file-scoped entry does not match a wildcard lookup");
+    cache_expire();
+}
+
+static void test_wildcard(void) {
+    cache_insert(700, "/usr/bin/git", NULL, 60);
+    ASSERT(cache_lookup(700, "/usr/bin/git", "/any/path") > 0,
+           "wildcard matches any target");
+    ASSERT(cache_lookup(700, "/usr/bin/git", NULL) > 0,
+           "wildcard matches a NULL target");
+    ASSERT(cache_lookup(700, "/usr/bin/git2", "/any/path") == 0,
+           "wildcard is still binary-scoped");
+    cache_expire();
 }
 
 static void test_ttl_expiry(void) {
-    cache_insert(100, "/bin/ls", 1);
-    ASSERT(cache_lookup(100, "/bin/ls") > 0, "lookup before expiry");
+    cache_insert(100, "/bin/ls", "/tmp/a", 1);
+    ASSERT(cache_lookup(100, "/bin/ls", "/tmp/a") > 0, "lookup before expiry");
     sleep(2);
-    ASSERT(cache_lookup(100, "/bin/ls") == 0, "lookup after expiry");
+    ASSERT(cache_lookup(100, "/bin/ls", "/tmp/a") == 0, "lookup after expiry");
 }
 
 static void test_overwrite(void) {
-    cache_insert(200, "/bin/a", 60);
-    cache_insert(200, "/bin/a", 120);
-    int ttl = cache_lookup(200, "/bin/a");
-    ASSERT(ttl > 0 && ttl <= 120, "overwrite refresh ttl");
+    cache_insert(200, "/bin/a", "/tmp/a", 60);
+    cache_insert(200, "/bin/a", "/tmp/a", 120);
+    int ttl = cache_lookup(200, "/bin/a", "/tmp/a");
+    ASSERT(ttl > 0 && ttl <= 120, "overwrite refreshes ttl");
+
+    /* A different target is a distinct entry, not an overwrite. */
+    int before = cache_entry_count();
+    cache_insert(200, "/bin/a", "/tmp/b", 60);
+    ASSERT(cache_entry_count() == before + 1,
+           "different target is a new cache entry");
 }
 
 static void test_count(void) {
     int before = cache_entry_count();
-    cache_insert(300, "/bin/x", 60);
+    cache_insert(300, "/bin/x", "/tmp/x", 60);
     ASSERT(cache_entry_count() == before + 1, "count after insert");
-    cache_insert(300, "/bin/x", 60);
+    cache_insert(300, "/bin/x", "/tmp/x", 60);
     ASSERT(cache_entry_count() == before + 1, "count unchanged on overwrite");
 }
 
 static void test_null_binary(void) {
-    cache_insert(400, NULL, 60);
-    ASSERT(cache_lookup(400, NULL) == 0, "null binary not inserted");
+    cache_insert(400, NULL, "/tmp/x", 60);
+    ASSERT(cache_lookup(400, NULL, "/tmp/x") == 0, "null binary not inserted");
 }
 
 static void test_pid_starttime(void) {
     /* A real PID must carry a verifiable start time and still match. */
-    cache_insert(getpid(), "/bin/real", 60);
-    ASSERT(cache_lookup(getpid(), "/bin/real") > 0,
+    cache_insert(getpid(), "/bin/real", "/tmp/real", 60);
+    ASSERT(cache_lookup(getpid(), "/bin/real", "/tmp/real") > 0,
            "lookup real pid with starttime");
     cache_expire();
 }
@@ -63,8 +95,8 @@ static void test_pid_starttime(void) {
 static void test_ttl_clamp(void) {
     /* Absurd TTLs must be clamped so expiry arithmetic cannot overflow
      * into the past on any time_t width. */
-    cache_insert(500, "/bin/huge", INT_MAX);
-    int ttl = cache_lookup(500, "/bin/huge");
+    cache_insert(500, "/bin/huge", "/tmp/huge", INT_MAX);
+    int ttl = cache_lookup(500, "/bin/huge", "/tmp/huge");
     ASSERT(ttl > 0, "clamped entry still valid");
     ASSERT(ttl <= (365 * 24 * 60 * 60), "clamped TTL bounded to one year");
     cache_expire();
@@ -73,6 +105,8 @@ static void test_ttl_clamp(void) {
 int main(void) {
     printf("=== test_cache ===\n");
     test_insert_lookup();
+    test_target_scoping();
+    test_wildcard();
     test_ttl_expiry();
     test_overwrite();
     test_count();

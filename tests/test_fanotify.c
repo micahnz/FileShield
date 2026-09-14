@@ -87,6 +87,53 @@ static void test_missing_path_is_skipped(void) {
 }
 
 /*
+ * Part 1b: persisted allow/deny entries are file-scoped.  An entry without
+ * a target_path (legacy or hand-edited state file) must be dropped at load
+ * so it cannot act as a wildcard grant or a blanket denial.
+ */
+static void test_empty_target_entries_dropped(void) {
+    const char *sha =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    PersistEntry entries[2];
+    memset(entries, 0, sizeof(entries));
+
+    /* Valid file-scoped allow entry. */
+    snprintf(entries[0].binary, sizeof(entries[0].binary), "/usr/bin/kubectl");
+    snprintf(entries[0].binary_sha512, sizeof(entries[0].binary_sha512), "%s", sha);
+    snprintf(entries[0].target_path, sizeof(entries[0].target_path),
+             "/home/u/.kube/config");
+
+    /* Legacy wildcard entry: no target recorded. */
+    snprintf(entries[1].binary, sizeof(entries[1].binary), "/usr/bin/ssh");
+    snprintf(entries[1].binary_sha512, sizeof(entries[1].binary_sha512), "%s", sha);
+
+    fanotify_load_dyn_allowlist(entries, 2);
+
+    PersistEntry out[4];
+    memset(out, 0, sizeof(out));
+    int n = fanotify_get_dyn_allowlist(out, 4);
+    ASSERT(n == 1, "empty-target allow entry dropped at load");
+    ASSERT(strcmp(out[0].target_path, "/home/u/.kube/config") == 0,
+           "remaining allow entry keeps its target");
+
+    /* Denies do not require a SHA-512, but still require a target. */
+    PersistEntry dentries[1];
+    memset(dentries, 0, sizeof(dentries));
+    snprintf(dentries[0].binary, sizeof(dentries[0].binary), "/usr/bin/curl");
+
+    fanotify_load_dyn_denylist(dentries, 1);
+    memset(out, 0, sizeof(out));
+    n = fanotify_get_dyn_denylist(out, 4);
+    ASSERT(n == 0, "empty-target deny entry dropped at load");
+
+    /* Reload an empty list so later tests see the daemon's clean state. */
+    fanotify_load_dyn_allowlist(NULL, 0);
+    fanotify_load_dyn_denylist(NULL, 0);
+}
+
+/*
  * Part 1: fill the deferred queue to capacity, verify a full queue
  * refuses further events, then verify the fail-closed flush denies and
  * closes every deferred event.
@@ -296,6 +343,7 @@ int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_missing_path_is_skipped();
+    test_empty_target_entries_dropped();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
     if (failures) {

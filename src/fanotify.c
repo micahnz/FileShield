@@ -16,6 +16,7 @@
 #include "utils.h"
 #include "config.h"
 #include "cache.h"
+#include "session.h"
 #include "notify.h"
 #include "sha512.h"
 #include "persist.h"
@@ -433,10 +434,14 @@ static int dyn_to_persist(const DynEntry *entries, int count,
  * When require_binary_sha512 is set, entries without a binary SHA-512 are
  * dropped (fail closed): a permanent grant that cannot prove which binary
  * was approved must never be trusted as a wildcard.
+ * When require_target_path is set, entries without a target path are
+ * dropped (fail closed): file-scoped matching cannot honour a wildcard
+ * grant from an old or hand-edited state file.
  */
 static void load_dyn_list(DynEntry *list, int *list_count,
                           const PersistEntry *entries, int count,
-                          const char *name, int require_binary_sha512)
+                          const char *name, int require_binary_sha512,
+                          int require_target_path)
 {
     /* Always replace the in-memory list so a CLI "clear" (file removed)
      * or a corrupt/unreadable state file cannot leave stale grants or
@@ -478,6 +483,14 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                     name, dst->binary);
             continue;
         }
+        if (require_target_path && dst->target_path[0] == '\0')
+        {
+            log_msg(LOG_WARNING,
+                    "dropping %s entry \"%s\": no target path recorded "
+                    "(fail closed)",
+                    name, dst->binary);
+            continue;
+        }
         n++;
     }
     *list_count = n;
@@ -489,15 +502,15 @@ static void load_dyn_list(DynEntry *list, int *list_count,
 /* ------------------------------------------------------------------ */
 
 /*
- * dyn_allow_match: returns 1 if (binary, bin_sha512, chain) matches a stored
- * "Always Allow" entry, 0 otherwise.
+ * dyn_allow_match: returns 1 if the (binary, bin_sha512, chain, target)
+ * tuple matches a stored "Always Allow" entry, 0 otherwise.
  *
- * Note: target_path is NOT checked during matching -- an "Always Allow"
- * entry grants access to ALL protected files for this binary+chain, not
- * just the file that originally triggered the dialog.  target_path is
- * stored for audit visibility only.
+ * Entries are scoped to the exact file that triggered the dialog:
+ * approving kubectl for ~/.kube/config must not silently grant access to
+ * ~/.ssh/id_rsa.  target_path is therefore a matching key, not audit-only.
  *
  * Matching rules (fail-secure):
+ *   - Target path must match exactly.
  *   - Binary path must match.
  *   - If both sides have a SHA-512, they must be equal.
  *   - If the stored entry has a SHA-512 but we failed to compute one now
@@ -507,13 +520,19 @@ static void load_dyn_list(DynEntry *list, int *list_count,
  *     they must be equal; if stored has one but current is missing, DENY.
  */
 static int dyn_allow_match(const char *binary, const char *bin_sha512,
-                           const ProcChain *chain)
+                           const ProcChain *chain, const char *target)
 {
+    if (!target || target[0] == '\0')
+        return 0;
+
     for (int i = 0; i < g_dyn_allow_count; i++)
     {
         DynEntry *e = &g_dyn_allow[i];
 
         if (strcmp(e->binary, binary) != 0)
+            continue;
+
+        if (strcmp(e->target_path, target) != 0)
             continue;
 
         /* Fail closed: an entry without a binary SHA-512 cannot prove the
@@ -612,13 +631,12 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
 }
 
 /*
- * dyn_deny_match: returns 1 if (binary, bin_sha512, chain) matches a stored
- * "Always Deny" entry, 0 otherwise.
- *
- * Note: target_path is NOT checked during matching (audit-only; see
- * dyn_allow_match for rationale).
+ * dyn_deny_match: returns 1 if the (binary, bin_sha512, chain, target)
+ * tuple matches a stored "Always Deny" entry, 0 otherwise.  Like
+ * dyn_allow_match, entries are scoped to the exact file.
  *
  * Matching rules (fail-open for denial safety):
+ *   - Target path must match exactly.
  *   - Binary path must match.
  *   - If both sides have a SHA-512, they must be equal.
  *   - If the stored entry has a SHA-512 but the current binary's hash
@@ -631,13 +649,19 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
  *     (preserve allow — we cannot verify the ancestor).
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
-                          const ProcChain *chain)
+                          const ProcChain *chain, const char *target)
 {
+    if (!target || target[0] == '\0')
+        return 0;
+
     for (int i = 0; i < g_dyn_deny_count; i++)
     {
         DynEntry *e = &g_dyn_deny[i];
 
         if (strcmp(e->binary, binary) != 0)
+            continue;
+
+        if (strcmp(e->target_path, target) != 0)
             continue;
 
         if (e->binary_sha512[0] != '\0')
@@ -1298,6 +1322,8 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     dev_t ev_dev = 0;
     ino_t ev_ino = 0;
     char bin_sha512[129] = "";
+    pid_t sid = 0;
+    unsigned long long sid_start = 0;
     ProcChain chain;
     int sha_ok = -1;
     int decision;
@@ -1381,19 +1407,10 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
                 binary, (int)pid, target);
     }
 
-    /* allowlist check */
+    /* Config allowlist: an explicit admin opt-in, binary-wide. */
     if (allowlist_match(binary, &ttl))
     {
-        cache_insert(pid, binary, ttl);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
-        close(fd_num);
-        goto cleanup;
-    }
-
-    /* cache check */
-    if (cache_lookup(pid, binary) > 0)
-    {
+        cache_insert(pid, binary, NULL, ttl);
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
         close(fd_num);
@@ -1420,26 +1437,73 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
                              "decision (access will be re-prompted)",
                 binary, (int)pid);
 
-    /* dynamic allowlist check (runtime "Always Allow") */
-    if (dyn_allow_match(binary, bin_sha512, &chain))
+    /* Session identity, best effort.  Without it session-scoped decisions
+     * cannot be matched or recorded (they degrade to one-time decisions). */
+    int have_sid = session_id_of(pid, &sid, &sid_start) == 0;
+    if (!have_sid)
+        log_msg(LOG_WARNING,
+                "cannot determine session for pid=%d; session decisions "
+                "unavailable for %s",
+                (int)pid, binary);
+
+    /*
+     * Decision order (a denial always wins over a grant):
+     *   config allowlist (above)
+     *   -> session deny -> permanent deny -> file cache
+     *   -> session allow -> permanent allow -> rate limit -> dialog
+     */
+
+    /* session denylist (runtime "Deny Session") */
+    if (have_sid && session_deny_match(sid, binary, bin_sha512, target))
     {
-        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-        cache_insert(pid, binary, user_ttl);
-        log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
+        log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
+                binary, (int)pid, (int)sid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* dynamic denylist check (runtime "Deny Always") */
+    if (dyn_deny_match(binary, bin_sha512, &chain, target))
+    {
+        log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
                 binary, (int)pid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* file cache check ("Allow Once", config/dynamic allow fast paths) */
+    if (cache_lookup(pid, binary, target) > 0)
+    {
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
         close(fd_num);
         goto cleanup;
     }
 
-    /* dynamic denylist check (runtime "Always Deny") */
-    if (dyn_deny_match(binary, bin_sha512, &chain))
+    /* session allowlist (runtime "Allow Session") */
+    if (have_sid && session_allow_match(sid, binary, bin_sha512, target))
     {
-        log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
+        log_msg(LOG_INFO, "session allowlist hit: %s (pid %d, sid %d) -> %s",
+                binary, (int)pid, (int)sid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        close(fd_num);
+        goto cleanup;
+    }
+
+    /* dynamic allowlist check (runtime "Allow Always") */
+    if (dyn_allow_match(binary, bin_sha512, &chain, target))
+    {
+        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+        cache_insert(pid, binary, target, user_ttl);
+        log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
                 binary, (int)pid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
         close(fd_num);
         goto cleanup;
     }
@@ -1461,14 +1525,56 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
             decision, (int)pid, binary);
 
-    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_ALWAYS)
+    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_SESSION ||
+        decision == NOTIFY_ALLOW_ALWAYS)
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-        cache_insert(pid, binary, user_ttl);
-        if (decision == NOTIFY_ALLOW_ALWAYS)
+        int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+
+        if (decision == NOTIFY_ALLOW_ONCE)
+        {
+            cache_insert(pid, binary, target, user_ttl);
+        }
+        else if (decision == NOTIFY_ALLOW_SESSION)
+        {
+            if (have_sid)
+            {
+                session_allow_add(sid, sid_start, binary, bin_sha512, target,
+                                  session_ttl);
+            }
+            else
+            {
+                log_msg(LOG_WARNING,
+                        "session unavailable; degrading Allow Session to "
+                        "Allow Once for %s",
+                        binary);
+                cache_insert(pid, binary, target, user_ttl);
+            }
+        }
+        else /* NOTIFY_ALLOW_ALWAYS */
+        {
             dyn_allow_add(binary, bin_sha512, &chain, target);
+        }
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
+    }
+    else if (decision == NOTIFY_DENY_SESSION)
+    {
+        int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+
+        if (have_sid)
+        {
+            session_deny_add(sid, sid_start, binary, bin_sha512, target,
+                             session_ttl);
+        }
+        else
+        {
+            log_msg(LOG_WARNING,
+                    "session unavailable; denying %s for this attempt only",
+                    binary);
+        }
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
     }
     else if (decision == NOTIFY_DENY_ALWAYS)
     {
@@ -1844,7 +1950,7 @@ int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries)
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 {
     load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count,
-                  "always-allow", 1);
+                  "always-allow", 1, 1);
 }
 
 int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
@@ -1857,5 +1963,5 @@ int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 {
     load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries, count,
-                  "always-deny", 0);
+                  "always-deny", 0, 1);
 }

@@ -22,6 +22,7 @@ typedef struct
     pid_t pid;
     unsigned long long starttime; /* /proc/<pid>/stat field 22; 0 = unknown */
     char binary_path[PATH_MAX];
+    char target_path[PATH_MAX];   /* "" = wildcard (any file)             */
     time_t expiry_time;
 } cache_entry_t;
 
@@ -84,7 +85,7 @@ static unsigned long long proc_start_time(pid_t pid)
     return value;
 }
 
-int cache_lookup(pid_t pid, const char *binary)
+int cache_lookup(pid_t pid, const char *binary, const char *target)
 {
     time_t now;
     int i;
@@ -106,6 +107,12 @@ int cache_lookup(pid_t pid, const char *binary)
         if (strcmp(cache[i].binary_path, binary) != 0)
             continue;
 
+        /* Wildcard entries (config [allowlist] hits) cover every target;
+         * a file-scoped entry must match the requested path exactly. */
+        if (cache[i].target_path[0] != '\0' &&
+            (!target || strcmp(cache[i].target_path, target) != 0))
+            continue;
+
         /* Reject a different process that reused the same PID. */
         if (cache[i].starttime != proc_start_time(pid))
         {
@@ -125,11 +132,13 @@ int cache_lookup(pid_t pid, const char *binary)
     return 0;
 }
 
-void cache_insert(pid_t pid, const char *binary, int ttl_seconds)
+void cache_insert(pid_t pid, const char *binary, const char *target,
+                  int ttl_seconds)
 {
     time_t now;
     int i;
     int free_slot = -1;
+    const char *tgt;
 
     if (!cache_initialized)
         cache_init();
@@ -142,13 +151,17 @@ void cache_insert(pid_t pid, const char *binary, int ttl_seconds)
     if (ttl_seconds > CACHE_MAX_TTL_SECONDS)
         ttl_seconds = CACHE_MAX_TTL_SECONDS;
 
+    /* Normalise NULL and "" to the wildcard representation. */
+    tgt = (target && target[0] != '\0') ? target : "";
+
     now = time(NULL);
 
     for (i = 0; i < CACHE_MAX_ENTRIES; i++)
     {
         if (cache[i].pid != 0)
         {
-            if (cache[i].pid == pid && strcmp(cache[i].binary_path, binary) == 0)
+            if (cache[i].pid == pid && strcmp(cache[i].binary_path, binary) == 0 &&
+                strcmp(cache[i].target_path, tgt) == 0)
             {
                 free_slot = i;
                 break;
@@ -166,6 +179,8 @@ void cache_insert(pid_t pid, const char *binary, int ttl_seconds)
     cache[free_slot].starttime = proc_start_time(pid);
     strncpy(cache[free_slot].binary_path, binary, PATH_MAX - 1);
     cache[free_slot].binary_path[PATH_MAX - 1] = '\0';
+    strncpy(cache[free_slot].target_path, tgt, PATH_MAX - 1);
+    cache[free_slot].target_path[PATH_MAX - 1] = '\0';
     cache[free_slot].expiry_time = now + ttl_seconds;
 }
 
