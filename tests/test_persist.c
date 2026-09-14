@@ -437,7 +437,7 @@ static int test_persist_remove_key(void)
 
     ASSERT(persist_save(path, in, 3) == 0, "persist_save for remove_key");
 
-    int r = persist_remove_key(path, "/usr/bin/vim", SHA_VIM);
+    int r = persist_remove_key(path, "/usr/bin/vim", SHA_VIM, NULL);
     ASSERT(r == 0, "persist_remove_key middle entry");
 
     PersistEntry out[3];
@@ -449,14 +449,59 @@ static int test_persist_remove_key(void)
 
     r = persist_remove_key(path, "/bin/nope",
                            "00000000000000000000000000000000000000000000000000"
-                           "000000000000000000000000");
+                           "000000000000000000000000", NULL);
     ASSERT(r == 1, "persist_remove_key nonexistent returns 1");
 
-    ASSERT(persist_remove_key(path, "/usr/bin/git", SHA_GIT) == 0, "remove git");
-    ASSERT(persist_remove_key(path, "/usr/bin/ssh", SHA_SSH) == 0, "remove ssh");
+    ASSERT(persist_remove_key(path, "/usr/bin/git", SHA_GIT, NULL) == 0,
+           "remove git");
+    ASSERT(persist_remove_key(path, "/usr/bin/ssh", SHA_SSH, NULL) == 0,
+           "remove ssh");
 
     FILE *fp = fopen(path, "r");
     ASSERT(fp == NULL, "file deleted when last entry removed");
+    if (fp) fclose(fp);
+
+    /*
+     * Target-scoped removal: two entries share binary+sha but cover
+     * different files (the file-scoped runtime allowlist shape).
+     */
+    PersistEntry multi[2];
+    memset(multi, 0, sizeof(multi));
+
+    snprintf(multi[0].binary, sizeof(multi[0].binary), "/usr/bin/kubectl");
+    snprintf(multi[0].binary_sha512, sizeof(multi[0].binary_sha512), SHA_GIT);
+    snprintf(multi[0].target_path, sizeof(multi[0].target_path),
+             "/home/u/.kube/config");
+
+    snprintf(multi[1].binary, sizeof(multi[1].binary), "/usr/bin/kubectl");
+    snprintf(multi[1].binary_sha512, sizeof(multi[1].binary_sha512), SHA_GIT);
+    snprintf(multi[1].target_path, sizeof(multi[1].target_path),
+             "/home/u/.kube/cache");
+
+    ASSERT(persist_save(path, multi, 2) == 0, "persist_save two targets");
+
+    r = persist_remove_key(path, "/usr/bin/kubectl", SHA_GIT,
+                           "/home/u/.kube/cache");
+    ASSERT(r == 0, "target-scoped remove");
+
+    PersistEntry out2[2];
+    memset(out2, 0, sizeof(out2));
+    count = persist_load(path, out2, 2);
+    ASSERT(count == 1, "one entry left after target-scoped remove");
+    ASSERT(strcmp(out2[0].target_path, "/home/u/.kube/config") == 0,
+           "remaining entry is the other target");
+
+    r = persist_remove_key(path, "/usr/bin/kubectl", SHA_GIT,
+                           "/home/u/.kube/none");
+    ASSERT(r == 1, "wrong target finds nothing");
+    count = persist_load(path, out2, 2);
+    ASSERT(count == 1, "file unchanged after wrong-target remove");
+
+    ASSERT(persist_remove_key(path, "/usr/bin/kubectl", SHA_GIT, NULL) == 0,
+           "NULL target removes all entries for binary+sha");
+
+    fp = fopen(path, "r");
+    ASSERT(fp == NULL, "file deleted after NULL-target remove of last entry");
     if (fp) fclose(fp);
 
     TEST_PASS("persist_remove_key");

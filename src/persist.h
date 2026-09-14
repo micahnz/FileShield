@@ -39,11 +39,13 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count);
 int persist_delete(const char *filepath);
 
 /*
- * Remove one entry from a persist JSON file, matched by binary path
- * and SHA-512 hash.  Returns 0 on success, 1 if no matching entry
- * was found, -1 on error.
+ * Remove entries from a persist JSON file, matched by binary path and
+ * SHA-512 hash.  When target_path is non-NULL, only the entry with that
+ * exact target_path is removed; when NULL, every entry for the
+ * binary+hash pair is removed.  Returns 0 on success, 1 if no matching
+ * entry was found, -1 on error.
  */
 int persist_remove_key(const char *filepath, const char *binary,
-                       const char *binary_sha512);
+                       const char *binary_sha512, const char *target_path);
 
 #endif

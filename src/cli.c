@@ -17,8 +17,10 @@ static void print_usage(FILE *f, const char *prog)
             "\n"
             "Commands:\n"
             "  list [allow|deny]         List entries (default: both)\n"
-            "  remove allow|deny BINARY SHA512\n"
-            "                            Remove one entry by key\n"
+            "  remove allow|deny BINARY SHA512 [TARGET]\n"
+            "                            Remove entries by key.  With TARGET,\n"
+            "                            only that file; without, every file\n"
+            "                            recorded for the binary+sha pair\n"
             "  clear allow|deny           Delete all entries\n"
             "  -h, --help                 Show this help\n"
             "  -v, --version              Show version\n"
@@ -228,7 +230,7 @@ int main(int argc, char *argv[])
         if (optind + 2 >= argc)
         {
             fprintf(stderr,
-                    "Usage: %s remove allow|deny <binary> <sha512>\n",
+                    "Usage: %s remove allow|deny <binary> <sha512> [target]\n",
                     argv[0]);
             return 1;
         }
@@ -236,6 +238,7 @@ int main(int argc, char *argv[])
         const char *type = argv[optind++];
         const char *binary = argv[optind++];
         const char *sha512 = argv[optind++];
+        const char *target = (optind < argc) ? argv[optind++] : NULL;
 
         const char *filepath;
         const char *label;
@@ -256,7 +259,7 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        int r = persist_remove_key(filepath, binary, sha512);
+        int r = persist_remove_key(filepath, binary, sha512, target);
         if (r < 0)
         {
             fprintf(stderr, "Error: failed to update %s\n", label);
@@ -273,6 +276,10 @@ int main(int argc, char *argv[])
         printf("Removed entry from %s:\n", label);
         printf("  binary:  %s\n", binary);
         printf("  sha512:  %s\n", sha512);
+        if (target)
+            printf("  target:  %s\n", target);
+        else
+            printf("  target:  (all files for this binary+sha)\n");
         printf("\nRun 'systemctl reload fileshield' to apply changes.\n");
         return 0;
     }

@@ -540,11 +540,11 @@ int persist_delete(const char *filepath)
 }
 
 int persist_remove_key(const char *filepath, const char *binary,
-                       const char *binary_sha512)
+                       const char *binary_sha512, const char *target_path)
 {
     PersistEntry *entries;
     int count;
-    int found = 0;
+    int removed = 0;
     int ret;
 
     if (!filepath || !binary || !binary_sha512)
@@ -563,20 +563,28 @@ int persist_remove_key(const char *filepath, const char *binary,
         return -1;
     }
 
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < count;)
     {
-        if (strcmp(entries[i].binary, binary) == 0 &&
-            strcmp(entries[i].binary_sha512, binary_sha512) == 0)
+        int matches = strcmp(entries[i].binary, binary) == 0 &&
+                      strcmp(entries[i].binary_sha512, binary_sha512) == 0;
+
+        /* With a target argument, only that exact file is removed. */
+        if (matches && target_path &&
+            strcmp(entries[i].target_path, target_path) != 0)
+            matches = 0;
+
+        if (matches)
         {
             memmove(&entries[i], &entries[i + 1],
                     (size_t)(count - i - 1) * sizeof(PersistEntry));
             count--;
-            found = 1;
-            break;
+            removed = 1;
+            continue;
         }
+        i++;
     }
 
-    if (!found)
+    if (!removed)
     {
         free(entries);
         return 1;
