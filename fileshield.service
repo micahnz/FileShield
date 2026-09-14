@@ -42,7 +42,7 @@ SystemCallArchitectures=native
 # CAP_DAC_READ_SEARCH is required to traverse home directories with mode 750
 # (e.g. /home/user drwxr-x--- ) so that fanotify_mark can resolve their paths.
 # CAP_SETUID + CAP_SETGID are required to drop to the desktop user before
-# spawning kdialog/zenity (session sockets are mode 0600, owner=user).
+# spawning kdialog (session sockets are mode 0600, owner=user).
 # CAP_KILL is required to terminate a hung dialog after the outer timeout;
 # the dialog child has already dropped to the desktop UID by then.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
