@@ -17,51 +17,24 @@
 /* Upper bound on hashing a single executable before the helper is killed. */
 #define SHA512_TIMEOUT_S 15
 
-int sha512_file(const char *path, char hex_out[129])
+/* Child-side: silence helper error output (callers treat non-zero as failure). */
+static void silence_stderr(void)
 {
-    int pipefd[2];
-    if (pipe2(pipefd, O_CLOEXEC) < 0)
-        return -1;
-
-    pid_t pid = fork();
-    if (pid < 0)
+    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devnull >= 0)
     {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
     }
+}
 
-    if (pid == 0)
-    {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
-            _exit(127);
-        close(pipefd[1]);
-        /* Silence error output — callers treat a non-zero exit as failure. */
-        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (devnull >= 0)
-        {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        /* Do not leak the daemon's fanotify/event/pipe fds into the helper. */
-        close_fds_from(3);
-        /*
-         * Pass the path as a separate argument — no shell involved, so
-         * no command-injection risk regardless of the path content.
-         */
-        execl("/usr/bin/sha512sum", "sha512sum", "--", path, (char *)NULL);
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-
-    /*
-     * Read sha512sum's stdout until EOF (or the buffer is full).  Output
-     * format: "<128-hex-digits>  <filename>\n"; only the first 128 bytes
-     * are used.  The deadline stops a helper that is stuck on a hung or
-     * very large file from blocking the daemon's event loop forever.
-     */
+/*
+ * Read sha512sum's stdout until EOF (or the buffer is full), enforce the
+ * deadline, reap the child and validate the digest.  Output format:
+ * "<128-hex-digits>  <filename>\n"; only the first 128 bytes are used.
+ */
+static int collect_digest(int fd, pid_t pid, char hex_out[129])
+{
     char buf[200];
     ssize_t total = 0;
     time_t deadline = time(NULL) + SHA512_TIMEOUT_S;
@@ -73,23 +46,22 @@ int sha512_file(const char *path, char hex_out[129])
             break;
 
         struct pollfd pfd;
-        pfd.fd = pipefd[0];
+        pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
         if (poll(&pfd, 1, remaining_ms) <= 0)
             break;
 
-        ssize_t n = read(pipefd[0], buf + total,
-                         sizeof(buf) - 1 - (size_t)total);
+        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
         if (n <= 0)
             break;
         total += n;
     }
-    close(pipefd[0]);
+    close(fd);
 
     if (total < 128)
     {
-        log_msg(LOG_ERR, "sha512_file: timed out or short read on %s", path);
+        log_msg(LOG_ERR, "sha512: timed out or short read");
         kill(pid, SIGKILL);
         while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
             ;
@@ -116,6 +88,142 @@ int sha512_file(const char *path, char hex_out[129])
     memcpy(hex_out, buf, 128);
     hex_out[128] = '\0';
     return 0;
+}
+
+int sha512_file(const char *path, char hex_out[129])
+{
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) < 0)
+        return -1;
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+        silence_stderr();
+        /* Do not leak the daemon's fanotify/event/pipe fds into the helper. */
+        close_fds_from(3);
+        /*
+         * Pass the path as a separate argument — no shell involved, so
+         * no command-injection risk regardless of the path content.
+         */
+        execl("/usr/bin/sha512sum", "sha512sum", "--", path, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    return collect_digest(pipefd[0], pid, hex_out);
+}
+
+/* Write the whole buffer, retrying short writes.  SIGPIPE is blocked by
+ * the caller so a dead helper surfaces as EPIPE instead of killing us. */
+static int write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len)
+    {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+int sha512_string(const char *str, char hex_out[129])
+{
+    int inpipe[2], outpipe[2];
+
+    if (!str)
+        return -1;
+    if (pipe2(inpipe, O_CLOEXEC) < 0)
+        return -1;
+    if (pipe2(outpipe, O_CLOEXEC) < 0)
+    {
+        close(inpipe[0]);
+        close(inpipe[1]);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(inpipe[0]);
+        close(inpipe[1]);
+        close(outpipe[0]);
+        close(outpipe[1]);
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        close(inpipe[1]);
+        close(outpipe[0]);
+        /* sha512sum with no file argument hashes stdin. */
+        if (dup2(inpipe[0], STDIN_FILENO) < 0)
+            _exit(127);
+        if (dup2(outpipe[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(inpipe[0]);
+        close(outpipe[1]);
+        silence_stderr();
+        close_fds_from(3);
+        execl("/usr/bin/sha512sum", "sha512sum", (char *)NULL);
+        _exit(127);
+    }
+
+    close(inpipe[0]);
+    close(outpipe[1]);
+
+    /*
+     * Block SIGPIPE while feeding the helper: if sha512sum is missing or
+     * exits early, the write must surface as EPIPE.  A SIGPIPE generated
+     * while blocked stays pending and would kill the caller when the mask
+     * is restored, so consume it before unblocking.
+     */
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &block, &old);
+
+    int w = write_all(inpipe[1], str, strlen(str));
+    close(inpipe[1]); /* EOF for sha512sum */
+    if (w == 0)
+    {
+        sigset_t pending;
+        if (sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE))
+        {
+            struct timespec zero = {0, 0};
+            sigtimedwait(&block, NULL, &zero);
+        }
+    }
+    sigprocmask(SIG_SETMASK, &old, NULL);
+
+    if (w < 0)
+    {
+        close(outpipe[0]);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+            ;
+        return -1;
+    }
+
+    return collect_digest(outpipe[0], pid, hex_out);
 }
 
 /*

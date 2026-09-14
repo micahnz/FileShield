@@ -61,6 +61,9 @@ static int test_persist_roundtrip(void)
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     snprintf(in[0].target_path, sizeof(in[0].target_path), "/home/user/.ssh/id_rsa");
+    snprintf(in[0].cmdline_sha512, sizeof(in[0].cmdline_sha512),
+             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
     in[0].chain_depth = 2;
     snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "code");
     snprintf(in[0].chain_sha512[0], sizeof(in[0].chain_sha512[0]),
@@ -94,6 +97,8 @@ static int test_persist_roundtrip(void)
     ASSERT(strcmp(out[0].binary, "/usr/bin/git") == 0, "entry0 binary");
     ASSERT(strcmp(out[0].binary_sha512, in[0].binary_sha512) == 0, "entry0 sha512");
     ASSERT(strcmp(out[0].target_path, "/home/user/.ssh/id_rsa") == 0, "entry0 target_path");
+    ASSERT(strcmp(out[0].cmdline_sha512, in[0].cmdline_sha512) == 0,
+           "entry0 cmdline_sha512");
     ASSERT(out[0].chain_depth == 2, "entry0 chain_depth");
     ASSERT(strcmp(out[0].chain_comm[0], "code") == 0, "entry0 chain_comm[0]");
     ASSERT(strcmp(out[0].chain_comm[1], "systemd") == 0, "entry0 chain_comm[1]");

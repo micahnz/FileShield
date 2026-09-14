@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "../src/fanotify.h"
+#include "../src/sha512.h"
 #include "../src/utils.h"
 
 /* Globals referenced by fanotify.c (normally defined in main.c). */
@@ -87,49 +88,119 @@ static void test_missing_path_is_skipped(void) {
 }
 
 /*
- * Part 1b: persisted allow/deny entries are file-scoped.  An entry without
- * a target_path (legacy or hand-edited state file) must be dropped at load
- * so it cannot act as a wildcard grant or a blanket denial.
+ * Part 1b: persisted allow/deny entries are file- and command-scoped.
+ * An entry without a target_path or without a command-line fingerprint
+ * (legacy or hand-edited state file) must be dropped at load so it cannot
+ * act as a wildcard grant or a blanket denial.
  */
 static void test_empty_target_entries_dropped(void) {
     const char *sha =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    PersistEntry entries[2];
+    PersistEntry entries[3];
     memset(entries, 0, sizeof(entries));
 
-    /* Valid file-scoped allow entry. */
+    /* Valid file- and command-scoped allow entry. */
     snprintf(entries[0].binary, sizeof(entries[0].binary), "/usr/bin/kubectl");
     snprintf(entries[0].binary_sha512, sizeof(entries[0].binary_sha512), "%s", sha);
     snprintf(entries[0].target_path, sizeof(entries[0].target_path),
              "/home/u/.kube/config");
+    snprintf(entries[0].cmdline_sha512, sizeof(entries[0].cmdline_sha512),
+             "%s", sha);
 
     /* Legacy wildcard entry: no target recorded. */
     snprintf(entries[1].binary, sizeof(entries[1].binary), "/usr/bin/ssh");
     snprintf(entries[1].binary_sha512, sizeof(entries[1].binary_sha512), "%s", sha);
+    snprintf(entries[1].cmdline_sha512, sizeof(entries[1].cmdline_sha512),
+             "%s", sha);
 
-    fanotify_load_dyn_allowlist(entries, 2);
+    /* Entry without a command fingerprint: would cover every invocation. */
+    snprintf(entries[2].binary, sizeof(entries[2].binary), "/usr/bin/aws");
+    snprintf(entries[2].binary_sha512, sizeof(entries[2].binary_sha512), "%s", sha);
+    snprintf(entries[2].target_path, sizeof(entries[2].target_path),
+             "/home/u/.aws/credentials");
+
+    fanotify_load_dyn_allowlist(entries, 3);
 
     PersistEntry out[4];
     memset(out, 0, sizeof(out));
     int n = fanotify_get_dyn_allowlist(out, 4);
-    ASSERT(n == 1, "empty-target allow entry dropped at load");
+    ASSERT(n == 1, "entries missing target or command fingerprint are dropped");
     ASSERT(strcmp(out[0].target_path, "/home/u/.kube/config") == 0,
            "remaining allow entry keeps its target");
+    ASSERT(strcmp(out[0].cmdline_sha512, sha) == 0,
+           "remaining allow entry keeps its command fingerprint");
 
-    /* Denies do not require a SHA-512, but still require a target. */
-    PersistEntry dentries[1];
+    /* Denies do not require a binary SHA-512, but require both scopes. */
+    PersistEntry dentries[2];
     memset(dentries, 0, sizeof(dentries));
     snprintf(dentries[0].binary, sizeof(dentries[0].binary), "/usr/bin/curl");
 
-    fanotify_load_dyn_denylist(dentries, 1);
+    snprintf(dentries[1].binary, sizeof(dentries[1].binary), "/usr/bin/wget");
+    snprintf(dentries[1].target_path, sizeof(dentries[1].target_path),
+             "/home/u/.netrc");
+
+    fanotify_load_dyn_denylist(dentries, 2);
     memset(out, 0, sizeof(out));
     n = fanotify_get_dyn_denylist(out, 4);
-    ASSERT(n == 0, "empty-target deny entry dropped at load");
+    ASSERT(n == 0, "incomplete deny entries dropped at load");
 
     /* Reload an empty list so later tests see the daemon's clean state. */
     fanotify_load_dyn_allowlist(NULL, 0);
+    fanotify_load_dyn_denylist(NULL, 0);
+}
+
+/*
+ * Part 1c: permanent entries are scoped to the exact command line.  A
+ * grant recorded for "kubectl get pods" must not cover "kubectl get
+ * secrets" for the same binary, hash, file and call chain.
+ */
+static void test_cmdline_scoping(void) {
+    const char *sha =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char cmd_pods[129];
+    char cmd_secrets[129];
+
+    ASSERT(sha512_string("kubectl get pods", cmd_pods) == 0,
+           "digest of approved command");
+    ASSERT(sha512_string("kubectl get secrets", cmd_secrets) == 0,
+           "digest of other command");
+    ASSERT(strcmp(cmd_pods, cmd_secrets) != 0, "command digests differ");
+
+    PersistEntry e[1];
+    memset(e, 0, sizeof(e));
+    snprintf(e[0].binary, sizeof(e[0].binary), "/usr/bin/kubectl");
+    snprintf(e[0].binary_sha512, sizeof(e[0].binary_sha512), "%s", sha);
+    snprintf(e[0].target_path, sizeof(e[0].target_path),
+             "/home/u/.kube/config");
+    snprintf(e[0].cmdline_sha512, sizeof(e[0].cmdline_sha512), "%s",
+             cmd_pods);
+
+    fanotify_load_dyn_allowlist(e, 1);
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl get pods") == 1,
+           "exact command matches the allow entry");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl get secrets") == 0,
+           "different command does not match the allow entry");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.ssh/id_rsa", "kubectl get pods") == 0,
+           "different target does not match the allow entry");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", "deadbeef",
+           "/home/u/.kube/config", "kubectl get pods") == 0,
+           "unverifiable binary hash does not match");
+    fanotify_load_dyn_allowlist(NULL, 0);
+
+    /* The deny side mirrors the same scoping. */
+    fanotify_load_dyn_denylist(e, 1);
+    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl get pods") == 1,
+           "exact command matches the deny entry");
+    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl get secrets") == 0,
+           "different command does not match the deny entry");
     fanotify_load_dyn_denylist(NULL, 0);
 }
 
@@ -344,6 +415,7 @@ int main(void) {
     test_mark_mask_rejects_fid_events();
     test_missing_path_is_skipped();
     test_empty_target_entries_dropped();
+    test_cmdline_scoping();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
     if (failures) {

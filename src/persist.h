@@ -19,6 +19,7 @@ typedef struct
     char binary[PATH_MAX];
     char binary_sha512[129];
     char target_path[PATH_MAX];
+    char cmdline_sha512[129]; /* fingerprint of the exact command line */
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;

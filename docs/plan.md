@@ -30,6 +30,7 @@ FileShield/
     ├── test_config.c            # unit tests for config parser
     ├── test_session.c           # unit tests for session decisions
     ├── test_persist.c           # unit tests for JSON state files
+    ├── test_sha512.c            # known-answer tests for digest helpers
     ├── test_fanotify.c          # mark mask, deferred queue, state loading
     └── test_utils.c             # unit tests for utility functions
 ```
@@ -172,12 +173,12 @@ timeout, unexpected exit code) returns `NOTIFY_DENY` (fail closed).
 |----------|-----------|----------|-----------|
 | Allow Once | PID + binary + target file | `user_ttl` (default 300s) | memory |
 | Allow/Deny Session | SID + leader start + binary (+SHA-512) + target | `session_ttl` (0 = shell lifetime) | memory |
-| Allow/Deny Always | binary SHA-512 + call chain + target file | until removed | JSON state files |
+| Allow/Deny Always | binary SHA-512 + call chain + target file + command-line fingerprint | until removed | JSON state files |
 
 Lookup order (a denial always wins): config allowlist (binary-wide) → session
 deny → permanent deny → file cache → session allow → permanent allow →
-dialog rate limit → prompt.  Persisted entries without a `target_path` are
-dropped at load (fail closed).
+dialog rate limit → prompt.  Persisted entries without a `target_path` or a
+command-line fingerprint are dropped at load (fail closed).
 
 ## Build & Test
 
@@ -194,7 +195,8 @@ dropped at load (fail closed).
 - **`test_config`**: parse valid/invalid .conf, ~ expansion, user_ttl/session_ttl, clamping, edge cases
 - **`test_session`**: SID resolution, allow/deny matching, hash verification, TTL, dead leaders
 - **`test_persist`**: save/load roundtrip, escaping, malformed input, remove with/without target
-- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, empty-target state entries dropped
+- **`test_sha512`**: FIPS 180-4 known-answer vectors for file/string digests
+- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping
 - **`test_utils`**: proc_exe_path (mock /proc), home expansion, path_under
 - Tests are self-contained C files linked against the module `.o` files
 - Each test returns 0 on pass, non-zero on failure. `make test` runs them all and reports aggregate.

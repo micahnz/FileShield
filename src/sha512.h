@@ -24,4 +24,11 @@ int sha512_file(const char *path, char hex_out[129]);
  */
 int sha512_proc_exe(pid_t pid, char hex_out[129]);
 
+/*
+ * Compute the SHA-512 digest of an in-memory string (used to fingerprint
+ * command lines without persisting potentially secret arguments).
+ * Same return semantics as sha512_file().
+ */
+int sha512_string(const char *str, char hex_out[129]);
+
 #endif /* FILESHIELD_SHA512_H */

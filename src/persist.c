@@ -324,6 +324,14 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 memcpy(current->target_path, val_buf, len);
                 current->target_path[len] = '\0';
             }
+            else if (strcmp(key_buf, "cmdline_sha512") == 0)
+            {
+                size_t len = strlen(val_buf);
+                if (len >= sizeof(current->cmdline_sha512))
+                    len = sizeof(current->cmdline_sha512) - 1;
+                memcpy(current->cmdline_sha512, val_buf, len);
+                current->cmdline_sha512[len] = '\0';
+            }
         }
         else
         {
@@ -469,6 +477,11 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
             fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"target_path\": \"\",\n");
+
+        if (json_escape_string(e->cmdline_sha512, escaped, sizeof(escaped)) > 0)
+            fprintf(fp, "      \"cmdline_sha512\": \"%s\",\n", escaped);
+        else
+            fprintf(fp, "      \"cmdline_sha512\": \"\",\n");
 
         fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
         fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);

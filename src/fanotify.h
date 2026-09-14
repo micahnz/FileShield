@@ -84,4 +84,15 @@ int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries);
 /* Load persisted entries into the dynamic denylist. Called on daemon startup. */
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count);
 
+/*
+ * Test seams: evaluate the loaded runtime lists against a synthetic
+ * request with a zero-depth call chain.  Used by test_fanotify to
+ * regression-test target and command-line scoping without a kernel
+ * permission event.
+ */
+int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
+                                  const char *target, const char *cmdline);
+int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
+                                 const char *target, const char *cmdline);
+
 #endif

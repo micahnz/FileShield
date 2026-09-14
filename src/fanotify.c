@@ -271,7 +271,8 @@ typedef struct
 {
     char binary[PATH_MAX];
     char binary_sha512[129];
-    char target_path[PATH_MAX]; /* audit only — not used for matching */
+    char target_path[PATH_MAX];  /* exact file this entry applies to     */
+    char cmdline_sha512[129];    /* fingerprint of the approved command  */
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;
@@ -386,6 +387,9 @@ static void persist_dyn_list(const char *filepath, const DynEntry *entries,
         dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
         memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
         dst->target_path[sizeof(dst->target_path) - 1] = '\0';
+        memcpy(dst->cmdline_sha512, src->cmdline_sha512,
+               sizeof(src->cmdline_sha512));
+        dst->cmdline_sha512[sizeof(dst->cmdline_sha512) - 1] = '\0';
         dst->chain_depth = src->chain_depth;
         for (int j = 0; j < src->chain_depth; j++)
         {
@@ -417,6 +421,9 @@ static int dyn_to_persist(const DynEntry *entries, int count,
         dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
         memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
         dst->target_path[sizeof(dst->target_path) - 1] = '\0';
+        memcpy(dst->cmdline_sha512, src->cmdline_sha512,
+               sizeof(src->cmdline_sha512));
+        dst->cmdline_sha512[sizeof(dst->cmdline_sha512) - 1] = '\0';
         dst->chain_depth = src->chain_depth;
         for (int j = 0; j < src->chain_depth; j++)
         {
@@ -437,11 +444,14 @@ static int dyn_to_persist(const DynEntry *entries, int count,
  * When require_target_path is set, entries without a target path are
  * dropped (fail closed): file-scoped matching cannot honour a wildcard
  * grant from an old or hand-edited state file.
+ * When require_cmdline_sha512 is set, entries without a command-line
+ * fingerprint are dropped too: an entry that cannot pin the exact
+ * invocation would silently cover every command of that binary.
  */
 static void load_dyn_list(DynEntry *list, int *list_count,
                           const PersistEntry *entries, int count,
                           const char *name, int require_binary_sha512,
-                          int require_target_path)
+                          int require_target_path, int require_cmdline_sha512)
 {
     /* Always replace the in-memory list so a CLI "clear" (file removed)
      * or a corrupt/unreadable state file cannot leave stale grants or
@@ -464,6 +474,7 @@ static void load_dyn_list(DynEntry *list, int *list_count,
         snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
         snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
         snprintf(dst->target_path, sizeof(dst->target_path), "%s", src->target_path);
+        snprintf(dst->cmdline_sha512, sizeof(dst->cmdline_sha512), "%s", src->cmdline_sha512);
         int depth = src->chain_depth;
         if (depth < 0)
             depth = 0;
@@ -491,6 +502,14 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                     name, dst->binary);
             continue;
         }
+        if (require_cmdline_sha512 && dst->cmdline_sha512[0] == '\0')
+        {
+            log_msg(LOG_WARNING,
+                    "dropping %s entry \"%s\": no command-line fingerprint "
+                    "recorded (fail closed)",
+                    name, dst->binary);
+            continue;
+        }
         n++;
     }
     *list_count = n;
@@ -502,12 +521,13 @@ static void load_dyn_list(DynEntry *list, int *list_count,
 /* ------------------------------------------------------------------ */
 
 /*
- * dyn_allow_match: returns 1 if the (binary, bin_sha512, chain, target)
- * tuple matches a stored "Always Allow" entry, 0 otherwise.
+ * dyn_allow_match: returns 1 if the (binary, bin_sha512, chain, target,
+ * command line) tuple matches a stored "Always Allow" entry, 0 otherwise.
  *
- * Entries are scoped to the exact file that triggered the dialog:
- * approving kubectl for ~/.kube/config must not silently grant access to
- * ~/.ssh/id_rsa.  target_path is therefore a matching key, not audit-only.
+ * Entries are scoped to the exact file and the exact invocation that
+ * triggered the dialog: approving a prompt plugin's "kubectl config view"
+ * must not silently grant a later "kubectl get secrets" from the same
+ * shell.
  *
  * Matching rules (fail-secure):
  *   - Target path must match exactly.
@@ -518,10 +538,17 @@ static void load_dyn_list(DynEntry *list, int *list_count,
  *   - Call-chain depth must match exactly.
  *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
  *     they must be equal; if stored has one but current is missing, DENY.
+ *   - The command-line fingerprint must match.  It is computed lazily,
+ *     only after every cheaper key has matched, so unrelated events never
+ *     pay for a sha512sum run.
  */
 static int dyn_allow_match(const char *binary, const char *bin_sha512,
-                           const ProcChain *chain, const char *target)
+                           const ProcChain *chain, const char *target,
+                           const char *cmdline)
 {
+    char current_cmd[129] = "";
+    int cmd_state = 0; /* 0 = not computed, 1 = computed, -1 = failed */
+
     if (!target || target[0] == '\0')
         return 0;
 
@@ -575,14 +602,29 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
                 }
             }
         }
-        if (ok)
-            return 1;
+        if (!ok)
+            continue;
+
+        if (cmd_state == 0)
+        {
+            if (!cmdline || cmdline[0] == '\0' ||
+                sha512_string(cmdline, current_cmd) != 0)
+                cmd_state = -1;
+            else
+                cmd_state = 1;
+        }
+        if (cmd_state < 0)
+            return 0; /* cannot verify the invocation — fail closed */
+        if (strcmp(e->cmdline_sha512, current_cmd) != 0)
+            continue;
+        return 1;
     }
     return 0;
 }
 
 static void dyn_allow_add(const char *binary, const char *bin_sha512,
-                          const ProcChain *chain, const char *target)
+                          const ProcChain *chain, const char *target,
+                          const char *cmdline_sha512)
 {
     /* Fail closed at creation: a permanent grant is only recorded when the
      * binary's SHA-512 was actually computed.  Without it the entry would
@@ -592,6 +634,17 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
         log_msg(LOG_WARNING,
                 "refusing permanent allow for %s: binary SHA-512 unavailable; "
                 "granting one-time access only (re-prompt will occur)",
+                binary);
+        return;
+    }
+
+    /* Likewise the exact invocation must be pinned; without it the entry
+     * would cover every command of that binary. */
+    if (!cmdline_sha512 || cmdline_sha512[0] == '\0')
+    {
+        log_msg(LOG_WARNING,
+                "refusing permanent allow for %s: command line could not be "
+                "fingerprinted; granting one-time access only",
                 binary);
         return;
     }
@@ -611,6 +664,8 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
     snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
     if (target)
         snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
+             cmdline_sha512);
     e->chain_depth = chain->depth;
     for (int i = 0; i < chain->depth; i++)
     {
@@ -631,9 +686,9 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
 }
 
 /*
- * dyn_deny_match: returns 1 if the (binary, bin_sha512, chain, target)
- * tuple matches a stored "Always Deny" entry, 0 otherwise.  Like
- * dyn_allow_match, entries are scoped to the exact file.
+ * dyn_deny_match: returns 1 if the (binary, bin_sha512, chain, target,
+ * command line) tuple matches a stored "Always Deny" entry, 0 otherwise.
+ * Like dyn_allow_match, entries are scoped to the exact file and command.
  *
  * Matching rules (fail-open for denial safety):
  *   - Target path must match exactly.
@@ -647,10 +702,16 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
  *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
  *     they must be equal; if stored has one but current is missing, skip
  *     (preserve allow — we cannot verify the ancestor).
+ *   - The command-line fingerprint must match; if it cannot be computed
+ *     the entry is skipped and the user is re-prompted.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
-                          const ProcChain *chain, const char *target)
+                          const ProcChain *chain, const char *target,
+                          const char *cmdline)
 {
+    char current_cmd[129] = "";
+    int cmd_state = 0; /* 0 = not computed, 1 = computed, -1 = failed */
+
     if (!target || target[0] == '\0')
         return 0;
 
@@ -697,15 +758,44 @@ static int dyn_deny_match(const char *binary, const char *bin_sha512,
                 }
             }
         }
-        if (ok)
-            return 1;
+        if (!ok)
+            continue;
+
+        /* An entry that cannot pin the command must not deny anything. */
+        if (e->cmdline_sha512[0] == '\0')
+            continue;
+        if (cmd_state == 0)
+        {
+            if (!cmdline || cmdline[0] == '\0' ||
+                sha512_string(cmdline, current_cmd) != 0)
+                cmd_state = -1;
+            else
+                cmd_state = 1;
+        }
+        if (cmd_state < 0)
+            continue; /* cannot verify the invocation: re-prompt */
+        if (strcmp(e->cmdline_sha512, current_cmd) != 0)
+            continue;
+        return 1;
     }
     return 0;
 }
 
 static void dyn_deny_add(const char *binary, const char *bin_sha512,
-                         const ProcChain *chain, const char *target)
+                         const ProcChain *chain, const char *target,
+                         const char *cmdline_sha512)
 {
+    /* Without a command fingerprint the entry could never match; refuse
+     * to create a misleading permanent denial. */
+    if (!cmdline_sha512 || cmdline_sha512[0] == '\0')
+    {
+        log_msg(LOG_WARNING,
+                "refusing permanent deny for %s: command line could not be "
+                "fingerprinted; denying this attempt only",
+                binary);
+        return;
+    }
+
     if (g_dyn_deny_count >= DYN_MAX)
     {
         log_msg(LOG_WARNING, "dynamic denylist full (%d); dropping oldest entry",
@@ -721,6 +811,8 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
     snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
     if (target)
         snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
+             cmdline_sha512);
     e->chain_depth = chain->depth;
     for (int i = 0; i < chain->depth; i++)
     {
@@ -1322,6 +1414,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     dev_t ev_dev = 0;
     ino_t ev_ino = 0;
     char bin_sha512[129] = "";
+    char cmdline_sha512[129] = "";
     pid_t sid = 0;
     unsigned long long sid_start = 0;
     ProcChain chain;
@@ -1465,7 +1558,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     }
 
     /* dynamic denylist check (runtime "Deny Always") */
-    if (dyn_deny_match(binary, bin_sha512, &chain, target))
+    if (dyn_deny_match(binary, bin_sha512, &chain, target, cmdline))
     {
         log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
                 binary, (int)pid, target);
@@ -1496,7 +1589,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     }
 
     /* dynamic allowlist check (runtime "Allow Always") */
-    if (dyn_allow_match(binary, bin_sha512, &chain, target))
+    if (dyn_allow_match(binary, bin_sha512, &chain, target, cmdline))
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
         cache_insert(pid, binary, target, user_ttl);
@@ -1553,7 +1646,23 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
         }
         else /* NOTIFY_ALLOW_ALWAYS */
         {
-            dyn_allow_add(binary, bin_sha512, &chain, target);
+            if (cmdline[0] != '\0' &&
+                sha512_string(cmdline, cmdline_sha512) == 0)
+            {
+                dyn_allow_add(binary, bin_sha512, &chain, target,
+                              cmdline_sha512);
+            }
+            else
+            {
+                /* Without the exact invocation the persistent entry would
+                 * cover every command of this binary; degrade to a
+                 * one-time cached grant instead. */
+                log_msg(LOG_WARNING,
+                        "cannot fingerprint the command line for %s; "
+                        "degrading Allow Always to Allow Once",
+                        binary);
+                cache_insert(pid, binary, target, user_ttl);
+            }
         }
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
@@ -1578,7 +1687,18 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     }
     else if (decision == NOTIFY_DENY_ALWAYS)
     {
-        dyn_deny_add(binary, bin_sha512, &chain, target);
+        if (cmdline[0] != '\0' &&
+            sha512_string(cmdline, cmdline_sha512) == 0)
+        {
+            dyn_deny_add(binary, bin_sha512, &chain, target, cmdline_sha512);
+        }
+        else
+        {
+            log_msg(LOG_WARNING,
+                    "cannot fingerprint the command line for %s; "
+                    "denying this attempt only",
+                    binary);
+        }
         recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
         fanotify_respond(fan_fd, ev, FAN_DENY);
     }
@@ -1950,7 +2070,7 @@ int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries)
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 {
     load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count,
-                  "always-allow", 1, 1);
+                  "always-allow", 1, 1, 1);
 }
 
 int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
@@ -1963,5 +2083,25 @@ int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 {
     load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries, count,
-                  "always-deny", 0, 1);
+                  "always-deny", 0, 1, 1);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Test seams (see fanotify.h)                                       */
+/* ------------------------------------------------------------------ */
+
+int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
+                                  const char *target, const char *cmdline)
+{
+    ProcChain chain;
+    memset(&chain, 0, sizeof(chain));
+    return dyn_allow_match(binary, bin_sha512, &chain, target, cmdline);
+}
+
+int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
+                                 const char *target, const char *cmdline)
+{
+    ProcChain chain;
+    memset(&chain, 0, sizeof(chain));
+    return dyn_deny_match(binary, bin_sha512, &chain, target, cmdline);
 }

@@ -26,7 +26,7 @@ DEPS    := $(OBJS:.o=.d)
 CLISRCS := $(SRCDIR)/cli.c
 CLIOBJS := $(CLISRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
-TESTS   := test_cache test_config test_utils test_persist test_session test_fanotify
+TESTS   := test_cache test_config test_utils test_persist test_session test_sha512 test_fanotify
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
 all: $(OBJDIR)/$(TARGET) $(OBJDIR)/$(CLITGT)
@@ -60,6 +60,10 @@ $(OBJDIR)/test_utils: $(OBJDIR)/utils.o $(TSTDIR)/test_utils.c
 $(OBJDIR)/test_session: $(OBJDIR)/session.o $(TSTDIR)/test_session.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(TSTDIR)/test_session.c $(OBJDIR)/session.o -o $@
+
+$(OBJDIR)/test_sha512: $(OBJDIR)/sha512.o $(OBJDIR)/utils.o $(TSTDIR)/test_sha512.c
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(TSTDIR)/test_sha512.c $(OBJDIR)/sha512.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/test_persist: $(OBJDIR)/persist.o $(OBJDIR)/utils.o $(TSTDIR)/test_persist.c
 	@mkdir -p $(OBJDIR)

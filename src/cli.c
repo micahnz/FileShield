@@ -115,11 +115,12 @@ static void print_list(const char *label, const char *filepath)
         return;
     }
 
-    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %s\n",
-           "ID", "Binary", "SHA-512", "Depth", "Created", "Target", "Call chain");
-    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %s\n",
+    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %-17s %s\n",
+           "ID", "Binary", "SHA-512", "Depth", "Created", "Target", "Command", "Call chain");
+    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %-17s %s\n",
            "---", "------------------", "------------------",
-           "-----", "--------", "-----------------------------", "--------------------");
+           "-----", "--------", "-----------------------------",
+           "-----------------", "--------------------");
 
     for (int i = 0; i < count; i++)
     {
@@ -127,6 +128,11 @@ static void print_list(const char *label, const char *filepath)
         /* Truncate binary path to 20 chars for the column. */
         const char *bin = e->binary;
         size_t bin_len = strlen(bin);
+        /* sha_finger() uses a static buffer: copy the command fingerprint
+         * before the binary fingerprint is rendered in the same printf. */
+        char cmd_finger[17];
+        snprintf(cmd_finger, sizeof(cmd_finger), "%s",
+                 sha_finger(e->cmdline_sha512));
         /* Truncate target path to 30 chars for the column. */
         const char *targ = e->target_path;
         char targ_display[31];
@@ -149,15 +155,17 @@ static void print_list(const char *label, const char *filepath)
         if (bin_len > 19)
         {
             const char *bin_display = bin + bin_len - 19;
-            printf(" %-2d ~%-19s %-18s %-8d %-10s %-30s ",
+            printf(" %-2d ~%-19s %-18s %-8d %-10s %-30s %-17s ",
                    i, bin_display, sha_finger(e->binary_sha512),
-                   e->chain_depth, fmt_date(e->created_at), targ_display);
+                   e->chain_depth, fmt_date(e->created_at), targ_display,
+                   cmd_finger);
         }
         else
         {
-            printf(" %-2d %-20s %-18s %-8d %-10s %-30s ",
+            printf(" %-2d %-20s %-18s %-8d %-10s %-30s %-17s ",
                    i, bin, sha_finger(e->binary_sha512),
-                   e->chain_depth, fmt_date(e->created_at), targ_display);
+                   e->chain_depth, fmt_date(e->created_at), targ_display,
+                   cmd_finger);
         }
         print_chain(e);
         printf("\n");
