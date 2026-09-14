@@ -11,6 +11,15 @@ void fanotify_loop(int fd);
 int fanotify_respond(int fd, const struct fanotify_event_metadata *ev, unsigned int response);
 
 /*
+ * Event mask used for file and directory marks.  Directory-entry events
+ * (FAN_CREATE, FAN_DELETE, FAN_MOVED_FROM, FAN_MOVED_TO, FAN_ATTRIB,
+ * FAN_DELETE_SELF) require a group initialized with FAN_REPORT_FID and
+ * make fanotify_mark() fail with EINVAL on this fd-based group, so they
+ * must never be added here.  Exposed for the unprivileged regression test.
+ */
+unsigned int fanotify_mark_mask(void);
+
+/*
  * Clear mount marks and inode table before a config reload.
  */
 void fanotify_clear_marks(int fd);

@@ -1,5 +1,10 @@
 /*
- * test_fanotify: bounded event queue + fail-closed saturation handling.
+ * test_fanotify: mark mask, bounded event queue + fail-closed saturation
+ * handling.
+ *
+ * Part 0 (runs unprivileged): the mark mask must be free of FID-requiring
+ * directory-entry events.  Regression guard for EINVAL on every directory
+ * mark when FAN_CREATE/FAN_MOVED_TO were added to this fd-based group.
  *
  * Part 1 (runs unprivileged): the deferred-event boundary.  A pipe stands
  * in for the fanotify group fd — fanotify_respond() only writes a
@@ -9,7 +14,11 @@
  *
  * Part 2 (needs CAP_SYS_ADMIN; skips otherwise): a real kernel fanotify
  * group created WITHOUT FAN_UNLIMITED_QUEUE must report FAN_Q_OVERFLOW
- * once the bounded queue saturates.
+ * once the bounded queue saturates.  This uses notification events only:
+ * permission-event saturation cannot be exercised without deliberately
+ * blocking a listener, and note that a *bounded* permission queue is
+ * fail-open (the kernel drops the event and allows the access), which is
+ * why the daemon itself uses FAN_UNLIMITED_QUEUE.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +48,25 @@ static int failures = 0;
         failures++; \
     } \
 } while(0)
+
+/*
+ * Part 0: the mark mask must not contain FID-requiring directory-entry
+ * events.  Adding FAN_CREATE/FAN_MOVED_TO to a group initialized without
+ * FAN_REPORT_FID makes fanotify_mark() fail with EINVAL, which breaks
+ * every directory mark (fanotify_mark(2), ERRORS).
+ */
+static void test_mark_mask_rejects_fid_events(void) {
+    const unsigned int mask = fanotify_mark_mask();
+    const unsigned int fid_only =
+        FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO |
+        FAN_ATTRIB | FAN_DELETE_SELF;
+
+    ASSERT((mask & FAN_OPEN_PERM) != 0, "mark mask includes FAN_OPEN_PERM");
+    ASSERT((mask & FAN_EVENT_ON_CHILD) != 0,
+           "mark mask includes FAN_EVENT_ON_CHILD");
+    ASSERT((mask & fid_only) == 0,
+           "mark mask contains no FID-requiring dirent events");
+}
 
 /*
  * Part 1: fill the deferred queue to capacity, verify a full queue
@@ -248,6 +276,7 @@ cleanup:
 
 int main(void) {
     printf("=== test_fanotify ===\n");
+    test_mark_mask_rejects_fid_events();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
     if (failures) {

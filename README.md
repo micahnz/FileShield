@@ -239,7 +239,7 @@ cat /var/lib/fileshield/runtime-allowlist.json | jq .
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
 - **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on, and does not report `mmap(2)` accesses. Bind-mount aliases of protected paths, or a process that already holds an open descriptor, are outside the threat model.
-- **Hard links and symlinks**: Protected paths are canonicalized at load time (so a symlinked `~/.ssh` is still matched), and files created or moved into a protected tree are tracked by inode. Access through a hard link outside the watched directories is detected and prompts; this is best-effort for files that never appeared under a protected path.
+- **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode (opening one through a hard link outside the watched directories still prompts). Files created after startup are matched by their canonical path; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
 
@@ -296,7 +296,7 @@ sudo systemctl stop fileshield
 sudo ./build/fileshield --foreground --config fileshield.conf
 ```
 
-All `syslog` messages are mirrored to `stderr`. Combine with `strace` for deep inspection:
+When stderr is attached to a terminal, `syslog` messages are also printed there (under systemd they appear once in the journal). Combine with `strace` for deep inspection:
 
 ```bash
 sudo strace -e trace=fanotify_init,fanotify_mark,read,write \

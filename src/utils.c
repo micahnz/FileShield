@@ -61,7 +61,10 @@ void log_msg(int priority, const char *fmt, ...)
     vsyslog(priority, fmt, a1);
     va_end(a1);
 
-    if (g_foreground)
+    /* Mirror to stderr only when it is attached to a terminal.  The unit
+     * runs with --foreground, and systemd/journald captures stderr too, so
+     * an unconditional mirror would duplicate every syslog message. */
+    if (g_foreground && isatty(STDERR_FILENO))
     {
         vfprintf(stderr, fmt, a2);
         fputc('\n', stderr);

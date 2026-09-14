@@ -892,15 +892,21 @@ static void mark_table_remove(const char *path)
     }
 }
 
-/* File marks only get open events; directory marks also report creation
- * of children so newly created files can be added to the inode table. */
-static unsigned int mark_mask_for_path(const char *path)
+/*
+ * Event mask used for file and directory marks.
+ *
+ * Directory-entry events (FAN_CREATE, FAN_DELETE, FAN_MOVED_FROM,
+ * FAN_MOVED_TO, FAN_ATTRIB, FAN_DELETE_SELF) are deliberately absent:
+ * they require a group initialized with FAN_REPORT_FID, and adding them
+ * to this fd-based group makes fanotify_mark() fail with EINVAL
+ * (fanotify_mark(2): "The group was initialized without FAN_REPORT_FID
+ * but one or more event types specified in the mask require it").
+ * Post-start files are therefore matched by canonical path; FID-based
+ * create tracking is a planned follow-up.
+ */
+unsigned int fanotify_mark_mask(void)
 {
-    unsigned int mask = FAN_OPEN_PERM | FAN_EVENT_ON_CHILD;
-    struct stat st;
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-        mask |= FAN_CREATE | FAN_MOVED_TO;
-    return mask;
+    return FAN_OPEN_PERM | FAN_EVENT_ON_CHILD;
 }
 
 /* ------------------------------------------------------------------ */
@@ -910,27 +916,29 @@ static unsigned int mark_mask_for_path(const char *path)
 int fanotify_setup(void)
 {
     /*
-     * The event queue is intentionally bounded (no FAN_UNLIMITED_QUEUE).
-     * Under saturation the kernel fails closed: a permission event that
-     * cannot be queued is denied outright, so protection holds even when
-     * the daemon cannot keep up.  The loss of notification events is
-     * reported via FAN_Q_OVERFLOW, which the event loop answers by
-     * denying every deferred permission event (see fanotify_flush_pending).
+     * FAN_UNLIMITED_QUEUE is required for fail-closed semantics.  With a
+     * bounded queue, fsnotify_insert_event() reports "queue overflown",
+     * fanotify_handle_event() drops the permission event and returns 0,
+     * and the filesystem operation proceeds without a listener decision
+     * (see fs/notify/fanotify/fanotify.c).  Only an event-allocation
+     * failure denies.  Event volume is kept down by the mount-mark fast
+     * path and the bounded pending queue; FAN_Q_OVERFLOW is still handled
+     * fail-closed if it ever appears.
      */
-    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT,
+    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE,
                            O_RDONLY | O_LARGEFILE);
     if (fd < 0)
     {
         log_msg(LOG_ERR, "fanotify_init: %s", strerror(errno));
         return -1;
     }
-    log_msg(LOG_INFO, "fanotify fd %d created (bounded event queue)", fd);
+    log_msg(LOG_INFO, "fanotify fd %d created", fd);
     return fd;
 }
 
 int fanotify_add_mark(int fd, const char *path)
 {
-    unsigned int mask = mark_mask_for_path(path);
+    unsigned int mask = fanotify_mark_mask();
 
     if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, path) < 0)
     {
@@ -996,7 +1004,7 @@ int fanotify_add_mark(int fd, const char *path)
 int fanotify_remove_mark(int fd, const char *path)
 {
     MarkEntry *e = mark_find(path);
-    unsigned int mask = e ? e->mask : mark_mask_for_path(path);
+    unsigned int mask = e ? e->mask : fanotify_mark_mask();
 
     if (fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, path) < 0)
     {
@@ -1031,6 +1039,10 @@ static void auto_mark_created_path(int fan_fd, const char *path)
  * Notification events (FAN_CREATE / FAN_MOVED_TO) are not permission
  * events: no response is written, but the event fd must be closed and the
  * created object's inode is recorded so hard links to it stay protected.
+ *
+ * The current fd-based group cannot produce these events (they require
+ * FAN_REPORT_FID and would make fanotify_mark() fail EINVAL); the branch
+ * is kept so a future FID-enabled group still gets inode tracking.
  */
 static void handle_notification_event(int fan_fd,
                                       const struct fanotify_event_metadata *ev)
