@@ -10,7 +10,7 @@
 
 - **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
 - **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed (zenity is not supported).
-- **Scoped decisions**: *Allow Once* is file-scoped with a `user_ttl`; *Allow Session* lasts until you close the terminal; *Allow Always* is a per-file persistent rule bound to the binary hash and call chain. Matching deny scopes exist too.
+- **Scoped decisions**: *Allow Once* is file-scoped with a `user_ttl`; *Allow Session* lasts until you close the terminal; *Allow Always* is a persistent per-file rule bound to the binary hash, call chain and exact command line. Matching deny scopes exist too.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
 
 ---
@@ -157,6 +157,22 @@ Add entries only for tools you have audited and trust at that exact path:
 > **Why not pre-allowlist common SRE tools?**  
 > A supply-chain attack that replaces `/usr/local/bin/aws` would get unconditional access to `~/.aws/credentials` forever. An empty default forces a conscious opt-in decision per binary.
 
+> Config `[allowlist]` entries are binary-wide: they grant that binary access to *every* protected path, with no target-file or command-line scoping. Use the interactive *Always Allow* entries for per-file, per-command grants.
+
+### Settings
+
+```ini
+[settings]
+# How long an "Allow Once" decision is cached for the same process and file
+# (seconds). Config [allowlist] entries have their own per-entry TTL.
+user_ttl = 300
+
+# Cap for "Allow Session" / "Deny Session" decisions (seconds).
+# 0 = the decision lives exactly as long as the shell session (session leader);
+# a positive value additionally expires it after that many seconds.
+session_ttl = 0
+```
+
 ### Example Workflow
 
 When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/user/.ssh/id_rsa`:
@@ -192,7 +208,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 3. **Deny** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
 4. **Allow Once** → `FAN_ALLOW` — access is granted and cached for this process and this exact file for `user_ttl` seconds.
 5. **Allow Session** → `FAN_ALLOW` — any process of that binary in this shell session may read that one file until the terminal closes (or `session_ttl` elapses, whichever comes first).
-6. **Allow Always** → `FAN_ALLOW` — a persistent, file-scoped runtime allowlist entry is created (see below).
+6. **Allow Always** → `FAN_ALLOW` — a persistent, file- and command-scoped runtime allowlist entry is created (see below).
 
 ### Decision Scopes
 
@@ -211,7 +227,7 @@ Denials are always checked before grants, so a session or permanent denial can n
 
 ### Always Allow — runtime dynamic allowlist (persistent)
 
-Clicking **Always Allow** stores a fingerprinted entry in the daemon's in-memory allowlist **and persists it to disk** for reuse after daemon restart or reboot:
+Clicking **Always Allow** stores a fingerprinted, file- and command-scoped entry in the daemon's in-memory allowlist **and persists it to disk** for reuse after daemon restart or reboot:
 
 | Attribute checked on every future match | Why |
 | --- | --- |
@@ -242,7 +258,23 @@ A future `curl` call from `zsh` instead of `bash` will prompt again because the 
 
 - **Automatically loaded** when the daemon starts (on reboot, after systemctl restart, etc.)
 - **Immediately saved** when you click "Always Allow" / "Deny Always" (no manual action needed)
-- **Fail-secure**: if a state file is corrupted or unreadable, the daemon starts with an empty list and reprompts; entries without a target file are dropped
+- **Fail-secure**: if a state file is corrupted or unreadable, the daemon starts with an empty list and reprompts; entries missing a target file or a recorded command line are dropped
+
+Each entry records the binary path and SHA-512, the target file, the exact command line (stored verbatim) together with its SHA-512 fingerprint, the ancestor call chain, and a creation timestamp:
+
+```json
+{
+  "binary": "/usr/bin/kubectl",
+  "binary_sha512": "a3f1…",
+  "target_path": "/home/user/.kube/config",
+  "cmdline": "kubectl config view --minify",
+  "cmdline_sha512": "0123…",
+  "chain_depth": 1,
+  "chain_comm[0]": "zsh",
+  "chain_sha512[0]": "7c82…",
+  "created_at": 1700000000
+}
+```
 
 To remove a single file-scoped entry (or every file for a binary+sha pair when `TARGET` is omitted):
 
@@ -260,7 +292,7 @@ sudo rm /var/lib/fileshield/runtime-denylist.json
 sudo systemctl restart fileshield
 ```
 
-To view the current persisted entries (`fileshield-cli list` shows the stored command line for each entry):
+To view the current persisted entries (`fileshield-cli list` columns: ID, Binary, Target, Command, Call chain, SHA-512):
 
 ```bash
 cat /var/lib/fileshield/runtime-allowlist.json | jq .
@@ -268,6 +300,8 @@ cat /var/lib/fileshield/runtime-denylist.json | jq .
 ```
 
 ---
+
+## How It Works
 
 1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT, O_RDONLY | O_LARGEFILE)`.
 2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
@@ -289,6 +323,7 @@ cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode (opening one through a hard link outside the watched directories still prompts). Files created after startup are matched by their canonical path; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
+- **Command-line matching**: permanent *Always* entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use *Allow Session* or *Allow Once* for those, or remove the entry with `fileshield-cli remove`.
 
 ---
 
@@ -328,8 +363,8 @@ The daemon logs at the following levels:
 
 | Level | Events |
 | ------- | -------- |
-| `INFO` | Start/stop, config load, fanotify marks added/removed, reload |
-| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable |
+| `INFO` | Start/stop, config load, fanotify marks added/removed, reload, runtime allow/deny hits and additions |
+| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable |
 | `ERR` | `fanotify_init` failure, config parse error, fork/exec failure |
 
 ---
@@ -363,14 +398,14 @@ This builds with `-O0 -g -fsanitize=address,undefined` and prints any memory err
 
 ## Running Tests
 
-Unit tests cover the cache, config parser, session decisions, JSON state files, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
+Unit tests cover the cache, config parser, session decisions, JSON state files, SHA-512 digests, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
 
 ```bash
 # Build and run all tests
 make test
 
 # Build tests without running
-make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_utils
+make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_utils build/test_fanotify
 
 # Run a single test binary directly
 ./build/test_cache
@@ -379,6 +414,7 @@ make build/test_cache build/test_config build/test_session build/test_persist bu
 ./build/test_persist
 ./build/test_sha512
 ./build/test_utils
+./build/test_fanotify
 ```
 
 A passing run prints `PASS` for each suite; failures print the failing assertion and exit non-zero.
