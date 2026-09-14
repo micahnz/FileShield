@@ -4,10 +4,12 @@
 #include <sys/types.h>
 
 /* Return values for notify_ask(). */
-#define NOTIFY_ALLOW_ONCE 0   /* grant access for the current TTL only    */
-#define NOTIFY_DENY 1         /* block access                             */
-#define NOTIFY_ALLOW_ALWAYS 2 /* add to runtime dynamic allowlist         */
-#define NOTIFY_DENY_ALWAYS 3  /* add to runtime dynamic denylist          */
+#define NOTIFY_ALLOW_ONCE 0    /* cache this file for the process (user_ttl) */
+#define NOTIFY_DENY 1          /* block this attempt only                     */
+#define NOTIFY_ALLOW_ALWAYS 2  /* persistent runtime allowlist entry          */
+#define NOTIFY_DENY_ALWAYS 3   /* persistent runtime denylist entry           */
+#define NOTIFY_ALLOW_SESSION 4 /* allow this file until the session ends      */
+#define NOTIFY_DENY_SESSION 5  /* deny this file until the session ends       */
 
 /*
  * Store the fanotify fd so notify_ask() can pump pending events while the
