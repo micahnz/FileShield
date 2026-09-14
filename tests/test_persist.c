@@ -61,6 +61,7 @@ static int test_persist_roundtrip(void)
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     snprintf(in[0].target_path, sizeof(in[0].target_path), "/home/user/.ssh/id_rsa");
+    snprintf(in[0].cmdline, sizeof(in[0].cmdline), "git status --short");
     snprintf(in[0].cmdline_sha512, sizeof(in[0].cmdline_sha512),
              "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
              "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
@@ -97,6 +98,7 @@ static int test_persist_roundtrip(void)
     ASSERT(strcmp(out[0].binary, "/usr/bin/git") == 0, "entry0 binary");
     ASSERT(strcmp(out[0].binary_sha512, in[0].binary_sha512) == 0, "entry0 sha512");
     ASSERT(strcmp(out[0].target_path, "/home/user/.ssh/id_rsa") == 0, "entry0 target_path");
+    ASSERT(strcmp(out[0].cmdline, "git status --short") == 0, "entry0 cmdline");
     ASSERT(strcmp(out[0].cmdline_sha512, in[0].cmdline_sha512) == 0,
            "entry0 cmdline_sha512");
     ASSERT(out[0].chain_depth == 2, "entry0 chain_depth");
@@ -260,10 +262,8 @@ static int test_persist_chain_depths(void)
 
 /* ------------------------------------------------------------------ */
 /*  test: JSON special characters are escaped and restored            */
-/*  Note: sscanf %[^\"] cannot parse escaped quotes inside values;    */
-/*  this is acceptable because Linux paths and proc comm names never  */
-/*  contain '"'. Only backslash (unusual but valid in paths) is       */
-/*  tested here.                                                       */
+/*  Values are decoded escape-aware, so quotes and backslashes round-  */
+/*  trip even though a naive %[^"] scan would stop at the first quote. */
 /* ------------------------------------------------------------------ */
 
 static int test_persist_json_escaping(void)
@@ -277,6 +277,10 @@ static int test_persist_json_escaping(void)
 
     /* A backslash in a binary path: unusual but valid on Linux. */
     snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/my\\tool");
+    /* A command line with escaped quotes and a backslash, as produced
+     * by `sh -c "..."` invocations. */
+    snprintf(in[0].cmdline, sizeof(in[0].cmdline),
+             "sh -c \"echo \\\"hi\\\" > /tmp/x\"");
     in[0].chain_depth = 1;
     snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "normalproc");
 
@@ -287,6 +291,8 @@ static int test_persist_json_escaping(void)
     ASSERT(n == 1, "persist_load escaped chars returns 1");
     ASSERT(strcmp(out[0].binary, "/usr/bin/my\\tool") == 0,
            "binary backslash roundtrip");
+    ASSERT(strcmp(out[0].cmdline, "sh -c \"echo \\\"hi\\\" > /tmp/x\"") == 0,
+           "cmdline quotes and backslash roundtrip");
     ASSERT(strcmp(out[0].chain_comm[0], "normalproc") == 0,
            "chain_comm normal name roundtrip");
 

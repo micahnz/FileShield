@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <getopt.h>
 #include <errno.h>
 #include <limits.h>
@@ -48,37 +47,88 @@ static const char *sha_finger(const char *sha512)
 }
 
 /*
- * Format the call chain as "comm1 -> comm2 -> comm3" (skipping empty).
+ * Render the call chain as "comm1 -> comm2 -> comm3" (skipping empty)
+ * into out.
  */
-static void print_chain(const PersistEntry *e)
+static void format_chain(const PersistEntry *e, char *out, size_t outsz)
 {
+    size_t used = 0;
     int printed = 0;
+
+    if (outsz == 0)
+        return;
+    out[0] = '\0';
+
     for (int i = 0; i < e->chain_depth && i < PERSIST_CHAIN_MAX; i++)
     {
-        if (e->chain_comm[i][0])
-        {
-            if (printed) printf(" -> ");
-            printf("%s", e->chain_comm[i]);
-            printed = 1;
-        }
+        if (!e->chain_comm[i][0])
+            continue;
+        int n = snprintf(out + used, outsz - used, "%s%s",
+                         printed ? " -> " : "", e->chain_comm[i]);
+        if (n < 0 || (size_t)n >= outsz - used)
+            break;
+        used += (size_t)n;
+        printed = 1;
     }
     if (!printed)
-        printf("(none)");
+        snprintf(out, outsz, "(none)");
 }
 
 /*
- * Format a time_t as "YYYY-MM-DD" into a static buffer.
+ * Render a table cell: control characters become '?', the text is capped
+ * at max_len characters with a trailing "...".  The state file keeps the
+ * full value.
  */
-static const char *fmt_date(time_t t)
+static void format_cell(const char *in, char *out, size_t outsz,
+                        size_t max_len)
 {
-    static char buf[16];
-    if (t == 0)
-        return "N/A";
-    struct tm tm_buf;
-    if (!localtime_r(&t, &tm_buf))
-        return "N/A";
-    strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_buf);
-    return buf;
+    size_t j = 0;
+
+    if (outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!in)
+        return;
+
+    for (size_t i = 0; in[i] != '\0' && j < max_len && j + 4 < outsz; i++)
+    {
+        unsigned char c = (unsigned char)in[i];
+        out[j++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    if (in[j] != '\0')
+    {
+        out[j++] = '.';
+        out[j++] = '.';
+        out[j++] = '.';
+    }
+    out[j] = '\0';
+}
+
+/*
+ * Render a path cell: like format_cell(), but long paths keep their tail
+ * (usually the file name) behind a "~" marker so the column stays useful.
+ */
+static void format_path_cell(const char *in, char *out, size_t outsz,
+                             size_t max_len)
+{
+    size_t len;
+    char tail[128];
+
+    if (outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!in || in[0] == '\0' || max_len == 0)
+        return;
+
+    len = strlen(in);
+    if (len <= max_len)
+    {
+        format_cell(in, out, outsz, max_len);
+        return;
+    }
+
+    snprintf(tail, sizeof(tail), "~%s", in + len - (max_len - 1));
+    format_cell(tail, out, outsz, max_len);
 }
 
 /*
@@ -115,60 +165,43 @@ static void print_list(const char *label, const char *filepath)
         return;
     }
 
-    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %-17s %s\n",
-           "ID", "Binary", "SHA-512", "Depth", "Created", "Target", "Command", "Call chain");
-    printf(" %-3s %-20s %-18s %-8s %-10s %-30s %-17s %s\n",
-           "---", "------------------", "------------------",
-           "-----", "--------", "-----------------------------",
-           "-----------------", "--------------------");
+    printf(" %-3s %-20s %-30s %-43s %-24s %s\n",
+           "ID", "Binary", "Target", "Command", "Call chain", "SHA-512");
+    printf(" %-3s %-20s %-30s %-43s %-24s %s\n",
+           "---", "------------------", "-----------------------------",
+           "-------------------------------------------",
+           "------------------------", "------------------");
 
     for (int i = 0; i < count; i++)
     {
         const PersistEntry *e = &entries[i];
-        /* Truncate binary path to 20 chars for the column. */
         const char *bin = e->binary;
         size_t bin_len = strlen(bin);
-        /* sha_finger() uses a static buffer: copy the command fingerprint
-         * before the binary fingerprint is rendered in the same printf. */
-        char cmd_finger[17];
-        snprintf(cmd_finger, sizeof(cmd_finger), "%s",
-                 sha_finger(e->cmdline_sha512));
-        /* Truncate target path to 30 chars for the column. */
-        const char *targ = e->target_path;
-        char targ_display[31];
-        if (targ[0] == '\0')
-            snprintf(targ_display, sizeof(targ_display), "(any)");
-        else if (strlen(targ) > 29)
-        {
-            memcpy(targ_display, "~", 1);
-            memcpy(targ_display + 1, targ + strlen(targ) - 29, 29);
-            targ_display[30] = '\0';
-        }
-        else
-        {
-            size_t tlen = strlen(targ);
-            if (tlen >= sizeof(targ_display))
-                tlen = sizeof(targ_display) - 1;
-            memcpy(targ_display, targ, tlen);
-            targ_display[tlen] = '\0';
-        }
+        char target[64];
+        char command[64];
+        char chain[1024];
+        char chain_display[64];
+
+        format_path_cell(e->target_path[0] ? e->target_path : "(any)", target,
+                         sizeof(target), 30);
+        format_cell(e->cmdline[0] ? e->cmdline : "(none)", command,
+                    sizeof(command), 40);
+        format_chain(e, chain, sizeof(chain));
+        format_cell(chain, chain_display, sizeof(chain_display), 24);
+
         if (bin_len > 19)
         {
             const char *bin_display = bin + bin_len - 19;
-            printf(" %-2d ~%-19s %-18s %-8d %-10s %-30s %-17s ",
-                   i, bin_display, sha_finger(e->binary_sha512),
-                   e->chain_depth, fmt_date(e->created_at), targ_display,
-                   cmd_finger);
+            printf(" %-2d ~%-19s %-30s %-43s %-24s %s\n",
+                   i, bin_display, target, command, chain_display,
+                   sha_finger(e->binary_sha512));
         }
         else
         {
-            printf(" %-2d %-20s %-18s %-8d %-10s %-30s %-17s ",
-                   i, bin, sha_finger(e->binary_sha512),
-                   e->chain_depth, fmt_date(e->created_at), targ_display,
-                   cmd_finger);
+            printf(" %-2d %-20s %-30s %-43s %-24s %s\n",
+                   i, bin, target, command, chain_display,
+                   sha_finger(e->binary_sha512));
         }
-        print_chain(e);
-        printf("\n");
     }
     printf("\n");
     free(entries);

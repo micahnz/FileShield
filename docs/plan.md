@@ -173,12 +173,12 @@ timeout, unexpected exit code) returns `NOTIFY_DENY` (fail closed).
 |----------|-----------|----------|-----------|
 | Allow Once | PID + binary + target file | `user_ttl` (default 300s) | memory |
 | Allow/Deny Session | SID + leader start + binary (+SHA-512) + target | `session_ttl` (0 = shell lifetime) | memory |
-| Allow/Deny Always | binary SHA-512 + call chain + target file + command-line fingerprint | until removed | JSON state files |
+| Allow/Deny Always | binary SHA-512 + call chain + target file + command line (stored verbatim, matched by SHA-512) | until removed | JSON state files |
 
 Lookup order (a denial always wins): config allowlist (binary-wide) → session
 deny → permanent deny → file cache → session allow → permanent allow →
 dialog rate limit → prompt.  Persisted entries without a `target_path` or a
-command-line fingerprint are dropped at load (fail closed).
+recorded command line are dropped at load (fail closed).
 
 ## Build & Test
 

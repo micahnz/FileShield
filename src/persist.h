@@ -6,6 +6,7 @@
 
 #define PERSIST_MAX_ENTRIES 256
 #define PERSIST_CHAIN_MAX 3
+#define PERSIST_CMDLINE_MAX 512 /* matches the /proc/<pid>/cmdline read buffer */
 #define PERSIST_STATE_DIR "/var/lib/fileshield"
 #define PERSIST_STATE_FILE PERSIST_STATE_DIR "/runtime-allowlist.json"
 #define PERSIST_DENY_STATE_FILE PERSIST_STATE_DIR "/runtime-denylist.json"
@@ -19,7 +20,8 @@ typedef struct
     char binary[PATH_MAX];
     char binary_sha512[129];
     char target_path[PATH_MAX];
-    char cmdline_sha512[129]; /* fingerprint of the exact command line */
+    char cmdline[PERSIST_CMDLINE_MAX]; /* raw command line (audit/display)  */
+    char cmdline_sha512[129];          /* matching key for the command line */
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;

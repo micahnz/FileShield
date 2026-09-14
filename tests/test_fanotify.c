@@ -89,16 +89,16 @@ static void test_missing_path_is_skipped(void) {
 
 /*
  * Part 1b: persisted allow/deny entries are file- and command-scoped.
- * An entry without a target_path or without a command-line fingerprint
- * (legacy or hand-edited state file) must be dropped at load so it cannot
- * act as a wildcard grant or a blanket denial.
+ * An entry without a target_path, without the raw command line, or
+ * without its digest (legacy or hand-edited state file) must be dropped
+ * at load so it cannot act as a wildcard grant or a blanket denial.
  */
 static void test_empty_target_entries_dropped(void) {
     const char *sha =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    PersistEntry entries[3];
+    PersistEntry entries[4];
     memset(entries, 0, sizeof(entries));
 
     /* Valid file- and command-scoped allow entry. */
@@ -106,29 +106,43 @@ static void test_empty_target_entries_dropped(void) {
     snprintf(entries[0].binary_sha512, sizeof(entries[0].binary_sha512), "%s", sha);
     snprintf(entries[0].target_path, sizeof(entries[0].target_path),
              "/home/u/.kube/config");
+    snprintf(entries[0].cmdline, sizeof(entries[0].cmdline),
+             "kubectl config view --minify");
     snprintf(entries[0].cmdline_sha512, sizeof(entries[0].cmdline_sha512),
              "%s", sha);
 
     /* Legacy wildcard entry: no target recorded. */
     snprintf(entries[1].binary, sizeof(entries[1].binary), "/usr/bin/ssh");
     snprintf(entries[1].binary_sha512, sizeof(entries[1].binary_sha512), "%s", sha);
+    snprintf(entries[1].cmdline, sizeof(entries[1].cmdline), "ssh-add -l");
     snprintf(entries[1].cmdline_sha512, sizeof(entries[1].cmdline_sha512),
              "%s", sha);
 
-    /* Entry without a command fingerprint: would cover every invocation. */
+    /* Digest only: the command line cannot be shown. */
     snprintf(entries[2].binary, sizeof(entries[2].binary), "/usr/bin/aws");
     snprintf(entries[2].binary_sha512, sizeof(entries[2].binary_sha512), "%s", sha);
     snprintf(entries[2].target_path, sizeof(entries[2].target_path),
              "/home/u/.aws/credentials");
+    snprintf(entries[2].cmdline_sha512, sizeof(entries[2].cmdline_sha512),
+             "%s", sha);
 
-    fanotify_load_dyn_allowlist(entries, 3);
+    /* Raw command only: cannot be matched. */
+    snprintf(entries[3].binary, sizeof(entries[3].binary), "/usr/bin/gh");
+    snprintf(entries[3].binary_sha512, sizeof(entries[3].binary_sha512), "%s", sha);
+    snprintf(entries[3].target_path, sizeof(entries[3].target_path),
+             "/home/u/.config/gh/hosts.yml");
+    snprintf(entries[3].cmdline, sizeof(entries[3].cmdline), "gh auth status");
+
+    fanotify_load_dyn_allowlist(entries, 4);
 
     PersistEntry out[4];
     memset(out, 0, sizeof(out));
     int n = fanotify_get_dyn_allowlist(out, 4);
-    ASSERT(n == 1, "entries missing target or command fingerprint are dropped");
+    ASSERT(n == 1, "entries with incomplete command records are dropped");
     ASSERT(strcmp(out[0].target_path, "/home/u/.kube/config") == 0,
            "remaining allow entry keeps its target");
+    ASSERT(strcmp(out[0].cmdline, "kubectl config view --minify") == 0,
+           "remaining allow entry keeps its raw command line");
     ASSERT(strcmp(out[0].cmdline_sha512, sha) == 0,
            "remaining allow entry keeps its command fingerprint");
 
@@ -175,6 +189,7 @@ static void test_cmdline_scoping(void) {
     snprintf(e[0].binary_sha512, sizeof(e[0].binary_sha512), "%s", sha);
     snprintf(e[0].target_path, sizeof(e[0].target_path),
              "/home/u/.kube/config");
+    snprintf(e[0].cmdline, sizeof(e[0].cmdline), "kubectl get pods");
     snprintf(e[0].cmdline_sha512, sizeof(e[0].cmdline_sha512), "%s",
              cmd_pods);
 

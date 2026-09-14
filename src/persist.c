@@ -130,82 +130,131 @@ static int json_escape_string(const char *src, char *dst, size_t dst_size)
     return (int)written;
 }
 
-static int json_unescape_string(char *str)
+/* Bounded string copy with NUL termination. */
+static void copy_field(char *dst, size_t dstsz, const char *src)
 {
-    char *src = str;
-    char *dst = str;
+    size_t len;
 
-    if (!str)
-        return -1;
+    if (!dst || dstsz == 0)
+        return;
+    len = strlen(src);
+    if (len >= dstsz)
+        len = dstsz - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
 
-    while (*src)
+/*
+ * Extract a JSON string key/value pair from a single line of the form
+ *   "key": "value",
+ * Unescapes the value into out (bounded, always NUL-terminated) and
+ * returns 1 when a string pair was found, writing the key into key_out.
+ *
+ * A plain %[^"] sscanf scan cannot handle escaped quotes, which command
+ * lines contain routinely (`sh -c "..."`), so the value is decoded
+ * escape-aware instead.  Returns 0 for numeric fields or malformed input.
+ */
+static int json_extract_string(const char *line, char *key_out, size_t keysz,
+                               char *out, size_t outsz)
+{
+    char found_key[256];
+    const char *p;
+    size_t j = 0;
+
+    if (!out || outsz == 0)
+        return 0;
+    out[0] = '\0';
+
+    if (sscanf(line, " \"%255[^\"]\"", found_key) != 1)
+        return 0;
+
+    p = strchr(line, ':');
+    if (!p)
+        return 0;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '"')
+        return 0; /* numeric or non-string value */
+    p++;
+
+    while (*p != '\0' && *p != '"')
     {
-        if (*src == '\\' && *(src + 1))
-        {
-            src++;
-            switch (*src)
-            {
-            case '"':
-                *dst++ = '"';
-                break;
-            case '\\':
-                *dst++ = '\\';
-                break;
-            case '/':
-                *dst++ = '/';
-                break;
-            case 'b':
-                *dst++ = '\b';
-                break;
-            case 'f':
-                *dst++ = '\f';
-                break;
-            case 'n':
-                *dst++ = '\n';
-                break;
-            case 'r':
-                *dst++ = '\r';
-                break;
-            case 't':
-                *dst++ = '\t';
-                break;
-            case 'u':
-                if (src[1] && src[2] && src[3] && src[4])
-                {
-                    unsigned int code;
-                    if (sscanf(src + 1, "%4x", &code) == 1)
-                    {
-                        if (code < 0x80)
-                            *dst++ = (char)code;
-                        else if (code < 0x800)
-                        {
-                            *dst++ = (char)(0xC0 | (code >> 6));
-                            *dst++ = (char)(0x80 | (code & 0x3F));
-                        }
-                        else
-                        {
-                            *dst++ = (char)(0xE0 | (code >> 12));
-                            *dst++ = (char)(0x80 | ((code >> 6) & 0x3F));
-                            *dst++ = (char)(0x80 | (code & 0x3F));
-                        }
-                        src += 4;
-                        break;
-                    }
-                }
-                return -1;
-            default:
-                return -1;
-            }
-            src++;
-        }
-        else
-        {
-            *dst++ = *src++;
-        }
-    }
+        unsigned char c = (unsigned char)*p;
 
-    *dst = '\0';
-    return 0;
+        if (c == '\\')
+        {
+            p++;
+            if (*p == '\0')
+                return 0; /* malformed trailing escape */
+            switch (*p)
+            {
+            case '"': c = '"'; break;
+            case '\\': c = '\\'; break;
+            case '/': c = '/'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'u':
+            {
+                unsigned int code = 0;
+                if (sscanf(p + 1, "%4x", &code) != 1)
+                    return 0;
+                p += 4;
+                if (code < 0x80)
+                {
+                    c = (unsigned char)code;
+                }
+                else
+                {
+                    /* Encode the code point back to UTF-8. */
+                    unsigned char utf8[3];
+                    int n;
+                    if (code < 0x800)
+                    {
+                        utf8[0] = (unsigned char)(0xC0 | (code >> 6));
+                        utf8[1] = (unsigned char)(0x80 | (code & 0x3F));
+                        n = 2;
+                    }
+                    else
+                    {
+                        utf8[0] = (unsigned char)(0xE0 | (code >> 12));
+                        utf8[1] = (unsigned char)(0x80 | ((code >> 6) & 0x3F));
+                        utf8[2] = (unsigned char)(0x80 | (code & 0x3F));
+                        n = 3;
+                    }
+                    if (j + (size_t)n >= outsz)
+                        return 0; /* value does not fit */
+                    for (int k = 0; k < n; k++)
+                        out[j++] = (char)utf8[k];
+                    p++;
+                    continue;
+                }
+                break;
+            }
+            default:
+                return 0; /* unknown escape sequence */
+            }
+        }
+        else if (c < 0x20)
+        {
+            return 0; /* raw control character inside a JSON string */
+        }
+
+        if (j + 1 >= outsz)
+            return 0; /* value does not fit */
+        out[j++] = (char)c;
+        p++;
+    }
+    if (*p != '"')
+        return 0; /* unterminated value */
+
+    out[j] = '\0';
+    if (key_out && keysz > 0)
+        snprintf(key_out, keysz, "%s", found_key);
+    return 1;
 }
 
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
@@ -295,43 +344,36 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         if (state != S_IN_ENTRY || !current)
             continue;
 
-        /* Parse key-value pairs with field-width limits.
-         * Patterns intentionally omit the trailing comma so they match
-         * both "value",  and  "value"  (last field before closing brace). */
-        char key_buf[256], val_buf[1024];
-        if (sscanf(p, " \"%255[^\"]\": \"%1023[^\"]\"", key_buf, val_buf) == 2)
+        /* Parse key-value pairs.  String values are decoded escape-aware
+         * (command lines routinely contain quotes); numeric fields fall
+         * through to sscanf.  Patterns intentionally omit the trailing
+         * comma so they match both "value", and "value". */
+        char key_buf[256], val_buf[4096];
+        if (json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
+                                sizeof(val_buf)))
         {
-            if (json_unescape_string(val_buf) < 0)
-            {
-                log_msg(LOG_WARNING, "persist_load: unescape failed for \"%s\"", key_buf);
-                continue;
-            }
+            int idx;
             if (strcmp(key_buf, "binary") == 0)
-                snprintf(current->binary, PATH_MAX, "%s", val_buf);
+                copy_field(current->binary, sizeof(current->binary), val_buf);
             else if (strcmp(key_buf, "binary_sha512") == 0)
-            {
-                size_t len = strlen(val_buf);
-                if (len >= sizeof(current->binary_sha512))
-                    len = sizeof(current->binary_sha512) - 1;
-                memcpy(current->binary_sha512, val_buf, len);
-                current->binary_sha512[len] = '\0';
-            }
+                copy_field(current->binary_sha512,
+                           sizeof(current->binary_sha512), val_buf);
             else if (strcmp(key_buf, "target_path") == 0)
-            {
-                size_t len = strlen(val_buf);
-                if (len >= sizeof(current->target_path))
-                    len = sizeof(current->target_path) - 1;
-                memcpy(current->target_path, val_buf, len);
-                current->target_path[len] = '\0';
-            }
+                copy_field(current->target_path,
+                           sizeof(current->target_path), val_buf);
+            else if (strcmp(key_buf, "cmdline") == 0)
+                copy_field(current->cmdline, sizeof(current->cmdline), val_buf);
             else if (strcmp(key_buf, "cmdline_sha512") == 0)
-            {
-                size_t len = strlen(val_buf);
-                if (len >= sizeof(current->cmdline_sha512))
-                    len = sizeof(current->cmdline_sha512) - 1;
-                memcpy(current->cmdline_sha512, val_buf, len);
-                current->cmdline_sha512[len] = '\0';
-            }
+                copy_field(current->cmdline_sha512,
+                           sizeof(current->cmdline_sha512), val_buf);
+            else if (sscanf(key_buf, "chain_comm[%d]", &idx) == 1 &&
+                     idx >= 0 && idx < PERSIST_CHAIN_MAX)
+                copy_field(current->chain_comm[idx],
+                           sizeof(current->chain_comm[idx]), val_buf);
+            else if (sscanf(key_buf, "chain_sha512[%d]", &idx) == 1 &&
+                     idx >= 0 && idx < PERSIST_CHAIN_MAX)
+                copy_field(current->chain_sha512[idx],
+                           sizeof(current->chain_sha512[idx]), val_buf);
         }
         else
         {
@@ -360,42 +402,6 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 current->created_at = (time_t)created_tmp;
             }
         }
-
-        int idx;
-        /* Omit trailing comma in patterns — matches both "value", and "value". */
-        if (sscanf(p, " \"chain_comm[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
-        {
-            if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
-            {
-                if (json_unescape_string(val_buf) == 0)
-                {
-                    size_t len = strlen(val_buf);
-                    if (len >= sizeof(current->chain_comm[idx]))
-                        len = sizeof(current->chain_comm[idx]) - 1;
-                    memcpy(current->chain_comm[idx], val_buf, len);
-                    current->chain_comm[idx][len] = '\0';
-                }
-                else
-                    log_msg(LOG_WARNING, "persist_load: unescape failed for chain_comm[%d]", idx);
-            }
-        }
-        else if (sscanf(p, " \"chain_sha512[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
-        {
-            if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
-            {
-                if (json_unescape_string(val_buf) == 0)
-                {
-                    size_t len = strlen(val_buf);
-                    if (len >= sizeof(current->chain_sha512[idx]))
-                        len = sizeof(current->chain_sha512[idx]) - 1;
-                    memcpy(current->chain_sha512[idx], val_buf, len);
-                    current->chain_sha512[idx][len] = '\0';
-                }
-                else
-                    log_msg(LOG_WARNING, "persist_load: unescape failed for chain_sha512[%d]",
-                            idx);
-            }
-        }
     }
 
     fclose(fp);
@@ -408,7 +414,7 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     FILE *fp;
     int i, j;
     char tmp_file[PATH_MAX];
-    char escaped[1024];
+    char escaped[4096];
 
     if (!entries || count < 0 || count > PERSIST_MAX_ENTRIES)
         return -1;
@@ -477,6 +483,11 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
             fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"target_path\": \"\",\n");
+
+        if (json_escape_string(e->cmdline, escaped, sizeof(escaped)) > 0)
+            fprintf(fp, "      \"cmdline\": \"%s\",\n", escaped);
+        else
+            fprintf(fp, "      \"cmdline\": \"\",\n");
 
         if (json_escape_string(e->cmdline_sha512, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"cmdline_sha512\": \"%s\",\n", escaped);

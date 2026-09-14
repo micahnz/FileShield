@@ -271,8 +271,9 @@ typedef struct
 {
     char binary[PATH_MAX];
     char binary_sha512[129];
-    char target_path[PATH_MAX];  /* exact file this entry applies to     */
-    char cmdline_sha512[129];    /* fingerprint of the approved command  */
+    char target_path[PATH_MAX];              /* exact file this entry applies to */
+    char cmdline[PERSIST_CMDLINE_MAX];       /* raw command line (audit/display) */
+    char cmdline_sha512[129];                /* command-line matching key        */
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;
@@ -387,6 +388,8 @@ static void persist_dyn_list(const char *filepath, const DynEntry *entries,
         dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
         memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
         dst->target_path[sizeof(dst->target_path) - 1] = '\0';
+        memcpy(dst->cmdline, src->cmdline, sizeof(src->cmdline));
+        dst->cmdline[sizeof(dst->cmdline) - 1] = '\0';
         memcpy(dst->cmdline_sha512, src->cmdline_sha512,
                sizeof(src->cmdline_sha512));
         dst->cmdline_sha512[sizeof(dst->cmdline_sha512) - 1] = '\0';
@@ -421,6 +424,8 @@ static int dyn_to_persist(const DynEntry *entries, int count,
         dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
         memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
         dst->target_path[sizeof(dst->target_path) - 1] = '\0';
+        memcpy(dst->cmdline, src->cmdline, sizeof(src->cmdline));
+        dst->cmdline[sizeof(dst->cmdline) - 1] = '\0';
         memcpy(dst->cmdline_sha512, src->cmdline_sha512,
                sizeof(src->cmdline_sha512));
         dst->cmdline_sha512[sizeof(dst->cmdline_sha512) - 1] = '\0';
@@ -444,14 +449,15 @@ static int dyn_to_persist(const DynEntry *entries, int count,
  * When require_target_path is set, entries without a target path are
  * dropped (fail closed): file-scoped matching cannot honour a wildcard
  * grant from an old or hand-edited state file.
- * When require_cmdline_sha512 is set, entries without a command-line
- * fingerprint are dropped too: an entry that cannot pin the exact
- * invocation would silently cover every command of that binary.
+ * When require_cmdline is set, entries without a raw command line or
+ * without its matching digest are dropped too: an entry that cannot pin
+ * the exact invocation would silently cover every command of that binary,
+ * and one that cannot show the invocation is not auditable.
  */
 static void load_dyn_list(DynEntry *list, int *list_count,
                           const PersistEntry *entries, int count,
                           const char *name, int require_binary_sha512,
-                          int require_target_path, int require_cmdline_sha512)
+                          int require_target_path, int require_cmdline)
 {
     /* Always replace the in-memory list so a CLI "clear" (file removed)
      * or a corrupt/unreadable state file cannot leave stale grants or
@@ -474,6 +480,7 @@ static void load_dyn_list(DynEntry *list, int *list_count,
         snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
         snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
         snprintf(dst->target_path, sizeof(dst->target_path), "%s", src->target_path);
+        snprintf(dst->cmdline, sizeof(dst->cmdline), "%s", src->cmdline);
         snprintf(dst->cmdline_sha512, sizeof(dst->cmdline_sha512), "%s", src->cmdline_sha512);
         int depth = src->chain_depth;
         if (depth < 0)
@@ -502,11 +509,12 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                     name, dst->binary);
             continue;
         }
-        if (require_cmdline_sha512 && dst->cmdline_sha512[0] == '\0')
+        if (require_cmdline &&
+            (dst->cmdline[0] == '\0' || dst->cmdline_sha512[0] == '\0'))
         {
             log_msg(LOG_WARNING,
-                    "dropping %s entry \"%s\": no command-line fingerprint "
-                    "recorded (fail closed)",
+                    "dropping %s entry \"%s\": incomplete command-line record "
+                    "(fail closed)",
                     name, dst->binary);
             continue;
         }
@@ -624,7 +632,7 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
 
 static void dyn_allow_add(const char *binary, const char *bin_sha512,
                           const ProcChain *chain, const char *target,
-                          const char *cmdline_sha512)
+                          const char *cmdline, const char *cmdline_sha512)
 {
     /* Fail closed at creation: a permanent grant is only recorded when the
      * binary's SHA-512 was actually computed.  Without it the entry would
@@ -638,13 +646,15 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
         return;
     }
 
-    /* Likewise the exact invocation must be pinned; without it the entry
-     * would cover every command of that binary. */
-    if (!cmdline_sha512 || cmdline_sha512[0] == '\0')
+    /* Likewise the exact invocation must be pinned and recorded; without
+     * it the entry would cover every command of that binary, and an entry
+     * nobody can identify is not usable for review. */
+    if (!cmdline || cmdline[0] == '\0' ||
+        !cmdline_sha512 || cmdline_sha512[0] == '\0')
     {
         log_msg(LOG_WARNING,
                 "refusing permanent allow for %s: command line could not be "
-                "fingerprinted; granting one-time access only",
+                "recorded and fingerprinted; granting one-time access only",
                 binary);
         return;
     }
@@ -664,6 +674,7 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
     snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
     if (target)
         snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
     snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
              cmdline_sha512);
     e->chain_depth = chain->depth;
@@ -783,15 +794,16 @@ static int dyn_deny_match(const char *binary, const char *bin_sha512,
 
 static void dyn_deny_add(const char *binary, const char *bin_sha512,
                          const ProcChain *chain, const char *target,
-                         const char *cmdline_sha512)
+                         const char *cmdline, const char *cmdline_sha512)
 {
-    /* Without a command fingerprint the entry could never match; refuse
+    /* Without the exact invocation the entry could never match; refuse
      * to create a misleading permanent denial. */
-    if (!cmdline_sha512 || cmdline_sha512[0] == '\0')
+    if (!cmdline || cmdline[0] == '\0' ||
+        !cmdline_sha512 || cmdline_sha512[0] == '\0')
     {
         log_msg(LOG_WARNING,
                 "refusing permanent deny for %s: command line could not be "
-                "fingerprinted; denying this attempt only",
+                "recorded and fingerprinted; denying this attempt only",
                 binary);
         return;
     }
@@ -811,6 +823,7 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
     snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
     if (target)
         snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
     snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
              cmdline_sha512);
     e->chain_depth = chain->depth;
@@ -1650,7 +1663,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
                 sha512_string(cmdline, cmdline_sha512) == 0)
             {
                 dyn_allow_add(binary, bin_sha512, &chain, target,
-                              cmdline_sha512);
+                              cmdline, cmdline_sha512);
             }
             else
             {
@@ -1690,7 +1703,8 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
         if (cmdline[0] != '\0' &&
             sha512_string(cmdline, cmdline_sha512) == 0)
         {
-            dyn_deny_add(binary, bin_sha512, &chain, target, cmdline_sha512);
+            dyn_deny_add(binary, bin_sha512, &chain, target,
+                         cmdline, cmdline_sha512);
         }
         else
         {
