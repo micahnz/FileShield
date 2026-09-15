@@ -189,6 +189,11 @@ user_ttl = 300
 # 0 = the decision lives exactly as long as the shell session (session leader);
 # a positive value additionally expires it after that many seconds.
 session_ttl = 0
+
+# Log the per-event debug details ([event]/[dedup]/[pump] plumbing) in
+# addition to the one-line-per-access INFO record.  Off by default; the
+# daemon's -d/--debug flag enables the same thing for a single run.
+debug = no
 ```
 
 ### Example Workflow
@@ -348,6 +353,25 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 
 FileShield writes all events to the system journal via `syslog(3)` under the `LOG_DAEMON` facility and the identifier `fileshield`.
 
+### Log verbosity
+
+By default FileShield logs **one line per access**: a rule hit logs which
+list allowed/denied it (first access per TTL window — repeats inside the
+window are silent), and a dialog access logs the prompt plus a
+human-readable choice:
+
+```text
+dynamic allowlist hit: /usr/bin/md5sum (pid 108385) -> /home/micah/.kube/config
+[dialog] asking user: pid=108783 binary=/usr/bin/cat target=/home/micah/.kube/config comm=cat
+[dialog] user chose Allow Once for /usr/bin/cat (pid 108783) -> /home/micah/.kube/config
+```
+
+The per-event plumbing (`[event]`, `[dedup]`, `[pump]`, display-env
+forwarding) is `LOG_DEBUG` and is suppressed by default. Enable it for
+troubleshooting either with `debug = yes` in `[settings]` or with the
+daemon's `-d/--debug` flag (also available via `--foreground` runs); both
+survive a `SIGHUP` config reload for the settings key.
+
 ### Follow live events
 
 ```bash
@@ -380,7 +404,8 @@ The daemon logs at the following levels:
 
 | Level     | Events                                                                                                                   |
 | --------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, runtime allow/deny hits and additions                     |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)     |
+| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug` |
 | `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable |
 | `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                           |
 

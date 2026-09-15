@@ -21,4 +21,7 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                const char *comm_parent, const char *exe,
                const char *cmdline, const char *path, uid_t user_uid);
 
+/* Human-readable name of a NOTIFY_* decision code ("Allow Once"). */
+const char *notify_decision_name(int decision);
+
 #endif

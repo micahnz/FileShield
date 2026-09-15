@@ -398,7 +398,6 @@ static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
         log_msg(LOG_ERR, "fork failed for kdialog: %m");
         return -1;
     }
-    log_msg(LOG_DEBUG, "[dialog] forked kdialog child pid=%d", (int)pid);
 
     if (pid == 0)
     {
@@ -420,6 +419,11 @@ static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
               (char *)NULL);
         _exit(127);
     }
+
+    /* Parent-only: the child never reaches here (it execs or exits), so
+     * logging before the branch would double-log and stamp the journal
+     * with a second, confusing fileshield[pid]. */
+    log_msg(LOG_DEBUG, "[dialog] forked kdialog child pid=%d", (int)pid);
 
     log_msg(LOG_DEBUG, "[dialog] parent waiting for kdialog (pid=%d)", (int)pid);
     int child_exited = 0;
@@ -493,6 +497,27 @@ static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
     if (ec == 2)
         return 2; /* Cancel / window close / Escape */
     return -1;
+}
+
+const char *notify_decision_name(int decision)
+{
+    switch (decision)
+    {
+    case NOTIFY_ALLOW_ONCE:
+        return "Allow Once";
+    case NOTIFY_ALLOW_SESSION:
+        return "Allow Session";
+    case NOTIFY_ALLOW_ALWAYS:
+        return "Allow Always";
+    case NOTIFY_DENY_SESSION:
+        return "Deny Session";
+    case NOTIFY_DENY_ALWAYS:
+        return "Deny Always";
+    case NOTIFY_DENY:
+        return "Deny";
+    default:
+        return "Unknown";
+    }
 }
 
 int notify_ask(const char *comm, pid_t pid, pid_t ppid,

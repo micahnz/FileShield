@@ -38,6 +38,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "Usage: %s [OPTIONS]\n", prog);
     fprintf(stderr, "  -f, --foreground    Run in foreground (do not daemonize)\n");
     fprintf(stderr, "  -c, --config PATH   Config file path (default: %s)\n", DEFAULT_CONFIG);
+    fprintf(stderr, "  -d, --debug         Log per-event debug details\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
 
@@ -83,11 +84,12 @@ int main(int argc, char *argv[])
     static struct option long_opts[] = {
         {"foreground", no_argument, 0, 'f'},
         {"config", required_argument, 0, 'c'},
+        {"debug", no_argument, 0, 'd'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "fc:h", long_opts, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "fc:dh", long_opts, NULL)) != -1)
     {
         switch (opt)
         {
@@ -96,6 +98,9 @@ int main(int argc, char *argv[])
             break;
         case 'c':
             config_path = optarg;
+            break;
+        case 'd':
+            log_set_debug(1);
             break;
         case 'h':
             print_usage(argv[0]);

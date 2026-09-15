@@ -9,6 +9,15 @@ char *proc_exe_path(pid_t pid);
 void log_msg(int priority, const char *fmt, ...);
 
 /*
+ * log_set_debug: enable or disable LOG_DEBUG emission.  Disabled by
+ * default so the per-event firehose ([event]/[dedup]/[pump]) stays out
+ * of the journal; troubleshooting turns it on with [settings] debug or
+ * --debug.  The gate sits at log_msg() entry so a disabled LOG_DEBUG
+ * call costs one branch, not a vsyslog format+send.
+ */
+void log_set_debug(int enabled);
+
+/*
  * proc_stat_session: read /proc/<pid>/stat once and extract the POSIX
  * session id (field 6) and the process start time (field 22, clock ticks
  * since boot).  Either out pointer may be NULL.  Returns 0 on success,

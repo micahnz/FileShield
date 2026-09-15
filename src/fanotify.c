@@ -1768,8 +1768,9 @@ static void event_ask_user(EventCtx *c)
     int decision = notify_ask(c->comm, c->ev->pid, c->ppid, c->pcomm,
                               c->binary, c->cmdline, c->target,
                               proc_uid(c->ev->pid));
-    log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
-            decision, (int)c->ev->pid, c->binary);
+    log_msg(LOG_INFO, "[dialog] user chose %s for %s (pid %d) -> %s",
+            notify_decision_name(decision), c->binary, (int)c->ev->pid,
+            c->target);
 
     unsigned int response = FAN_DENY;
     if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_SESSION ||

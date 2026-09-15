@@ -372,6 +372,20 @@ int config_load(const char *path, Config *cfg)
                 else
                     log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
             }
+            else if (strcmp(key, "debug") == 0)
+            {
+                /* Enables the per-event LOG_DEBUG firehose at runtime. */
+                if (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 ||
+                    strcmp(val, "1") == 0)
+                    log_set_debug(1);
+                else if (strcmp(val, "no") == 0 || strcmp(val, "false") == 0 ||
+                         strcmp(val, "0") == 0)
+                    log_set_debug(0);
+                else
+                    log_msg(LOG_ERR,
+                            "config_load: invalid debug value (yes|no): %s",
+                            val);
+            }
         }
         else if (section == 4)
         {

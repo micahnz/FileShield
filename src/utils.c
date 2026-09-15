@@ -14,6 +14,13 @@
 
 int g_foreground = 0;
 
+static int g_log_debug = 0;
+
+void log_set_debug(int enabled)
+{
+    g_log_debug = enabled ? 1 : 0;
+}
+
 char *proc_exe_path(pid_t pid)
 {
     char linkpath[64];
@@ -34,6 +41,11 @@ char *proc_exe_path(pid_t pid)
 void log_msg(int priority, const char *fmt, ...)
 {
     va_list a1, a2;
+
+    /* Debug firehose gate: per-event plumbing stays out of the journal
+     * unless the operator explicitly asked for it. */
+    if (priority == LOG_DEBUG && !g_log_debug)
+        return;
 
     va_start(a1, fmt);
     va_copy(a2, a1);
