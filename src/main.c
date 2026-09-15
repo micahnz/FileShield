@@ -297,6 +297,12 @@ int main(int argc, char *argv[])
                             g_fatal = 1;
                         }
                     }
+                    /* Republish the old config defensively: g_config must
+                     * never point at new_cfg after it is freed below.
+                     * config_load() no longer publishes, but keep this
+                     * explicit so a future refactor cannot reintroduce
+                     * the use-after-free. */
+                    g_config = cfg;
                     free(new_cfg);
                     if (g_fatal)
                         break;

@@ -454,6 +454,41 @@ static void test_scoped_missing_target(void)
     free(path);
 }
 
+/*
+ * config_load() must not publish the parsed Config through g_config: the
+ * caller decides whether the config is accepted.  main.c frees a config
+ * whose reload was rejected, so publishing inside config_load() would
+ * leave g_config dangling (use-after-free on the next event).
+ */
+static void test_config_load_does_not_publish_global(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/config_publish_test\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for publish test");
+
+    /* static: Config is several MB (fixed PATH_MAX arrays); a second
+     * stack copy alongside `cfg` overflows the default 8 MB stack. */
+    static Config sentinel;
+    Config *saved = g_config;
+    g_config = &sentinel;
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load publish test success");
+    ASSERT(g_config == &sentinel,
+           "config_load must not publish the parsed config through g_config");
+
+    g_config = saved;
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -472,6 +507,7 @@ int main(void)
     test_denylist_parse();
     test_target_trailing_slash();
     test_scoped_missing_target();
+    test_config_load_does_not_publish_global();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

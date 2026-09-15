@@ -225,6 +225,36 @@ static void silence_stderr(void)
  * requesting process stays suspended.
  */
 #define REAP_DEADLINE_S 2
+#define REAP_KILL_TRIES 50 /* 50 x 10 ms = 500 ms budget after SIGKILL */
+
+/*
+ * SIGKILL the helper and reap it without ever blocking the event loop.
+ * A helper wedged in an uninterruptible syscall (e.g. sha512sum reading a
+ * FUSE-backed /proc/<pid>/exe) stays in D state until that syscall
+ * returns, so waitpid() can block indefinitely.  Blocking here would
+ * stall the single-threaded daemon and, with it, every open on every
+ * mount-marked filesystem while those processes stay kernel-suspended.
+ * The caller treats a missing digest as a hashing failure (fail closed);
+ * an orphaned zombie is a bounded cost, not a correctness risk.
+ */
+static void kill_helper_bounded(pid_t pid)
+{
+    if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+        log_msg(LOG_WARNING, "sha512: kill helper pid %d: %s", (int)pid,
+                strerror(errno));
+
+    for (int i = 0; i < REAP_KILL_TRIES; i++)
+    {
+        pid_t w = waitpid(pid, NULL, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR))
+            return; /* reaped, or gone/not our child */
+        usleep(10000); /* 10 ms tick */
+    }
+
+    log_msg(LOG_WARNING,
+            "sha512: helper pid %d survived SIGKILL for %d ms; abandoning",
+            (int)pid, REAP_KILL_TRIES * 10);
+}
 
 static int reap_helper(pid_t pid, int *status_out)
 {
@@ -245,9 +275,7 @@ static int reap_helper(pid_t pid, int *status_out)
 
     log_msg(LOG_WARNING, "sha512: helper did not exit in %ds; killing",
             REAP_DEADLINE_S);
-    kill(pid, SIGKILL);
-    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
-        ;
+    kill_helper_bounded(pid);
     return -1;
 }
 
@@ -285,9 +313,7 @@ static int collect_digest(int fd, pid_t pid, char hex_out[129])
     if (total < 128)
     {
         log_msg(LOG_ERR, "sha512: timed out or short read");
-        kill(pid, SIGKILL);
-        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
-            ;
+        kill_helper_bounded(pid);
         return -1;
     }
 

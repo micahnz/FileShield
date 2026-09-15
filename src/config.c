@@ -400,7 +400,13 @@ int config_load(const char *path, Config *cfg)
     }
 
     fclose(fp);
-    g_config = cfg;
+    /*
+     * Deliberately do NOT publish cfg through g_config here.  The caller
+     * decides whether the parsed config is accepted; publishing during
+     * the parse is what once left g_config dangling after a rejected
+     * reload free()d the new config.  main.c sets g_config only after the
+     * config is accepted and its marks are installed.
+     */
     return 0;
 }
 

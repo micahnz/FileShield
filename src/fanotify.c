@@ -1851,13 +1851,26 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
     while (1)
     {
-        /* Non-blocking read: set O_NONBLOCK transiently. */
+        /* Non-blocking read: set O_NONBLOCK transiently.  If the flag
+         * cannot be set, stop pumping instead of risking a blocking read
+         * that would let the dialog child (and the user's opens behind it)
+         * stall until the dialog times out: notify.c re-enters the pump
+         * whenever poll(2) reports the group fd readable. */
         int flags = fcntl(fan_fd, F_GETFL, 0);
         if (flags < 0)
             break;
-        fcntl(fan_fd, F_SETFL, flags | O_NONBLOCK);
+        if (fcntl(fan_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        {
+            log_msg(LOG_WARNING,
+                    "[pump] cannot set non-blocking mode: %s; "
+                    "deferring to the main loop",
+                    strerror(errno));
+            break;
+        }
         ssize_t n = read(fan_fd, buf, sizeof(buf));
-        fcntl(fan_fd, F_SETFL, flags); /* restore */
+        if (fcntl(fan_fd, F_SETFL, flags) < 0)
+            log_msg(LOG_WARNING, "[pump] cannot restore blocking mode: %s",
+                    strerror(errno));
 
         if (n <= 0)
             break;
