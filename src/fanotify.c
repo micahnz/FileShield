@@ -262,7 +262,6 @@ typedef struct
 {
     pid_t pid[PERSIST_CHAIN_MAX];
     char comm[PERSIST_CHAIN_MAX][256];
-    char exe[PERSIST_CHAIN_MAX][PATH_MAX];
     char sha512[PERSIST_CHAIN_MAX][129]; /* lowercase hex SHA-512 of each ancestor exe */
     int depth;                           /* how many ancestors were captured            */
 } ProcChain;
@@ -281,7 +280,6 @@ static void build_proc_chain(pid_t start_pid, ProcChain *c)
         char *exe = proc_exe_path(p);
         if (exe)
         {
-            snprintf(c->exe[i], sizeof(c->exe[i]), "%s", exe);
             /* Hash via /proc/<pid>/exe so containerised binaries
              * (Podman/Docker) are reachable even if their path doesn't
              * exist on the host.  Never open a protected path to hash it:
@@ -1040,21 +1038,6 @@ static void mark_table_add(const char *path, unsigned int mask)
     g_mark_count++;
 }
 
-static void mark_table_remove(const char *path)
-{
-    for (int i = 0; i < g_mark_count; i++)
-    {
-        if (strcmp(g_marks[i].path, path) == 0)
-        {
-            free(g_marks[i].path);
-            memmove(&g_marks[i], &g_marks[i + 1],
-                    sizeof(MarkEntry) * (size_t)(g_mark_count - i - 1));
-            g_mark_count--;
-            return;
-        }
-    }
-}
-
 /*
  * Event mask used for file and directory marks.
  *
@@ -1206,21 +1189,6 @@ int fanotify_add_mark(int fd, const char *path)
 int fanotify_any_mark_active(void)
 {
     return g_mark_count > 0 || g_mount_count > 0;
-}
-
-int fanotify_remove_mark(int fd, const char *path)
-{
-    MarkEntry *e = mark_find(path);
-    unsigned int mask = e ? e->mask : fanotify_mark_mask();
-
-    if (fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, path) < 0)
-    {
-        log_msg(LOG_ERR, "fanotify_mark REMOVE %s: %s", path, strerror(errno));
-        return -1;
-    }
-    mark_table_remove(path);
-    log_msg(LOG_INFO, "fanotify mark removed: %s", path);
-    return 0;
 }
 
 /*
@@ -1375,12 +1343,6 @@ int fanotify_defer_event(const struct fanotify_event_metadata *ev)
     g_pending[g_pending_count].meta = *ev;
     g_pending_count++;
     return 0;
-}
-
-/* Current number of deferred permission events awaiting a decision. */
-int fanotify_pending_count(void)
-{
-    return g_pending_count;
 }
 
 /* Real uid of the requesting process, or (uid_t)-1 when unknown. */

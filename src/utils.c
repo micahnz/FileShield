@@ -30,28 +30,6 @@ char *proc_exe_path(pid_t pid)
     return strdup(buf);
 }
 
-char *expand_home(const char *path)
-{
-    if (path[0] == '~' && (path[1] == '/' || path[1] == '\0'))
-    {
-        const char *home = getenv("HOME");
-        if (!home)
-            return strdup(path);
-
-        if (path[1] == '\0')
-            return strdup(home);
-
-        const char *rest = path + 1;
-        size_t len = strlen(home) + strlen(rest) + 1;
-        char *out = malloc(len);
-        if (!out)
-            return NULL;
-        snprintf(out, len, "%s%s", home, rest);
-        return out;
-    }
-    return strdup(path);
-}
-
 void log_msg(int priority, const char *fmt, ...)
 {
     va_list a1, a2;

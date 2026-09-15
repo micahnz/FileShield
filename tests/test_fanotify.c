@@ -264,8 +264,6 @@ static void test_defer_flush_contract(void) {
     }
 
     ASSERT(filled > 0, "deferred queue accepted events");
-    ASSERT(fanotify_pending_count() == filled,
-           "pending count matches deferred events");
 
     struct fanotify_event_metadata probe;
     memset(&probe, 0, sizeof(probe));
@@ -275,14 +273,29 @@ static void test_defer_flush_contract(void) {
     probe.fd = -1; /* FAN_NOFD */
     probe.pid = (int)getpid();
     ASSERT(fanotify_defer_event(&probe) == -1,
-           "defer into a full queue fails closed");
+            "defer into a full queue fails closed");
 
     /* Fail-closed flush: deny + close every deferred event. */
     fanotify_flush_pending(resp_pipe[1]);
-    ASSERT(fanotify_pending_count() == 0, "queue empty after flush");
+
+    /* Observable empty-queue check without a count helper: after the
+     * flush, a fresh event must be accepted again, and the follow-up
+     * fail-closed flush denies it exactly like the first batch. */
+    int re_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(re_fd >= 0, "open re-defer event fd");
+    struct fanotify_event_metadata re_ev;
+    memset(&re_ev, 0, sizeof(re_ev));
+    re_ev.event_len = sizeof(re_ev);
+    re_ev.vers = FANOTIFY_METADATA_VERSION;
+    re_ev.mask = FAN_OPEN_PERM;
+    re_ev.fd = re_fd;
+    re_ev.pid = (int)getpid();
+    ASSERT(fanotify_defer_event(&re_ev) == 0,
+            "queue accepts events again after flush");
+    fanotify_flush_pending(resp_pipe[1]);
 
     /* Exactly one fanotify_response per deferred event must arrive. */
-    size_t want = (size_t)filled * sizeof(struct fanotify_response);
+    size_t want = (size_t)(filled + 1) * sizeof(struct fanotify_response);
     char *buf = malloc(want);
     ASSERT(buf != NULL, "alloc response buffer");
     size_t got = 0;
@@ -306,12 +319,17 @@ static void test_defer_flush_contract(void) {
         ASSERT(r->response == FAN_DENY, "flush response is FAN_DENY");
         ASSERT(r->fd == event_fds[i],
                "flush response targets the deferred fd");
-        ASSERT(r->response == FAN_DENY, "flush response is FAN_DENY");
-        ASSERT(r->fd == event_fds[i],
-               "flush response targets the deferred fd");
         ASSERT(fcntl(event_fds[i], F_GETFD) == -1 && errno == EBADF,
                "deferred fd was closed by flush");
     }
+
+    /* The re-deferred event is the last response and is also closed. */
+    const struct fanotify_response *last =
+        (const struct fanotify_response *)(buf + (size_t)filled * sizeof(*last));
+    ASSERT(last->response == FAN_DENY, "flush response is FAN_DENY");
+    ASSERT(last->fd == re_fd, "flush response targets the re-deferred fd");
+    ASSERT(fcntl(re_fd, F_GETFD) == -1 && errno == EBADF,
+           "re-deferred fd was closed by flush");
 
     free(buf);
     close(resp_pipe[0]);

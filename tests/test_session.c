@@ -155,12 +155,10 @@ static void test_ttl_expiry(void)
     session_allow_add(sid, start, bin, hash, target, 1);
     ASSERT(session_allow_match(sid, bin, hash, target) == 1,
            "match before TTL expiry");
-    ASSERT(session_allow_count() == 1, "live entry counted");
 
     sleep(2);
     ASSERT(session_allow_match(sid, bin, hash, target) == 0,
            "match after TTL expiry");
-    ASSERT(session_allow_count() == 0, "expired entry not counted");
 
     stop_leader(leader);
 }
@@ -187,7 +185,6 @@ static void test_dead_leader(void)
     ASSERT(session_allow_match(sid, "/usr/bin/gh", "eeeeeeeeeeeeeeee",
                                "/home/u/.config/gh/hosts.yml") == 0,
            "dead leader does not match");
-    ASSERT(session_allow_count() == 0, "dead leader not counted");
 }
 
 static void test_deny(void)
@@ -225,11 +222,18 @@ static void test_deny(void)
     stop_leader(leader);
 }
 
-static void test_clear_and_counts(void)
+/*
+ * Observable state checks without count helpers: clear empties the
+ * lists (matches fail), adds make them match again, and a live entry
+ * survives an expiry sweep because nothing expires it.
+ */
+static void test_clear_and_entries(void)
 {
     session_clear();
-    ASSERT(session_allow_count() == 0 && session_deny_count() == 0,
-           "cleared lists are empty");
+    ASSERT(session_allow_match((pid_t)1, "/bin/a", "", "/tmp/a") == 0,
+           "no match after clear (allow)");
+    ASSERT(session_deny_match((pid_t)1, "/bin/b", "", "/tmp/b") == 0,
+           "no match after clear (deny)");
 
     pid_t leader = spawn_leader();
     pid_t sid = 0;
@@ -240,16 +244,16 @@ static void test_clear_and_counts(void)
 
     session_allow_add(sid, start, "/bin/a", "", "/tmp/a", 0);
     session_deny_add(sid, start, "/bin/b", "", "/tmp/b", 0);
-    ASSERT(session_allow_count() == 1, "one allow entry");
-    ASSERT(session_deny_count() == 1, "one deny entry");
-
-    session_expire();
-    ASSERT(session_allow_count() == 1 && session_deny_count() == 1,
-           "live entries survive expire");
+    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 1,
+           "allow entry present after add");
+    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 1,
+           "deny entry present after add");
 
     session_clear();
-    ASSERT(session_allow_count() == 0 && session_deny_count() == 0,
-           "clear removes everything");
+    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 0,
+           "clear removes allow entries");
+    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 0,
+           "clear removes deny entries");
 
     stop_leader(leader);
 }
@@ -262,7 +266,7 @@ int main(void)
     test_ttl_expiry();
     test_dead_leader();
     test_deny();
-    test_clear_and_counts();
+    test_clear_and_entries();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

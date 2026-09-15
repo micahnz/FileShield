@@ -23,6 +23,5 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
                   int ttl_seconds);
 
 void cache_expire(void);
-int  cache_entry_count(void);
 
 #endif

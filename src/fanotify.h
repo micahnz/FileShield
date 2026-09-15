@@ -57,9 +57,6 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid);
  */
 int fanotify_defer_event(const struct fanotify_event_metadata *ev);
 
-/* Current number of deferred (pending) permission events. */
-int fanotify_pending_count(void);
-
 /*
  * Deny and close every deferred permission event.  Called when the
  * kernel reports FAN_Q_OVERFLOW (saturation) and on config reload and

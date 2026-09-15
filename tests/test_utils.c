@@ -26,32 +26,6 @@ static void test_path_under(void) {
     ASSERT(path_under("", "/") == 0, "empty path not under root");
 }
 
-static void test_expand_home(void) {
-    const char *home = getenv("HOME");
-    char *result;
-
-    result = expand_home("~/foo");
-    ASSERT(result != NULL, "expand ~/foo not null");
-    if (home) {
-        char expected[PATH_MAX];
-        snprintf(expected, sizeof(expected), "%s/foo", home);
-        ASSERT(strcmp(result, expected) == 0, "expand ~/foo matches HOME/foo");
-    }
-    free(result);
-
-    result = expand_home("~");
-    ASSERT(result != NULL, "expand bare ~ not null");
-    if (home) {
-        ASSERT(strcmp(result, home) == 0, "expand bare ~ matches HOME");
-    }
-    free(result);
-
-    result = expand_home("/usr/bin/ssh");
-    ASSERT(result != NULL, "absolute path unchanged");
-    ASSERT(strcmp(result, "/usr/bin/ssh") == 0, "absolute path returns same");
-    free(result);
-}
-
 static void test_proc_exe(void) {
     char *exe = proc_exe_path(getpid());
     ASSERT(exe != NULL, "proc_exe_path returns non-NULL for own pid");
@@ -67,7 +41,6 @@ static void test_proc_exe(void) {
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
-    test_expand_home();
     test_proc_exe();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);

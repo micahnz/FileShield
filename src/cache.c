@@ -202,23 +202,3 @@ void cache_expire(void)
             cache[i].pid = 0;
     }
 }
-
-int cache_entry_count(void)
-{
-    time_t now;
-    int count = 0;
-    int i;
-
-    if (!cache_initialized)
-        cache_init();
-
-    now = time(NULL);
-
-    for (i = 0; i < CACHE_MAX_ENTRIES; i++)
-    {
-        if (cache[i].pid != 0 && cache[i].expiry_time >= now)
-            count++;
-    }
-
-    return count;
-}

@@ -6,7 +6,6 @@
 extern int g_foreground;
 
 char *proc_exe_path(pid_t pid);
-char *expand_home(const char *path);
 void log_msg(int priority, const char *fmt, ...);
 
 /*

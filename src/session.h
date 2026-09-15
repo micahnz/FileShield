@@ -37,22 +37,16 @@ void session_deny_add(pid_t sid, unsigned long long leader_start,
 /*
  * Match a session-scoped entry.  Returns 1 on match, 0 otherwise.
  * If the entry recorded a binary SHA-512 and the caller cannot provide
- * one, the entry does not match (fail closed: re-prompt).
+ * one, the entry does not match (fail closed: re-prompt).  A match also
+ * lazily drops entries whose leader exited, whose start time changed, or
+ * whose TTL expired.
  */
 int session_allow_match(pid_t sid, const char *binary, const char *bin_sha512,
                         const char *target);
 int session_deny_match(pid_t sid, const char *binary, const char *bin_sha512,
                        const char *target);
 
-/* Drop entries whose leader exited, whose start time changed, or whose
- * TTL expired. */
-void session_expire(void);
-
 /* Remove every entry (tests / shutdown). */
 void session_clear(void);
-
-/* Number of currently valid entries (tests). */
-int session_allow_count(void);
-int session_deny_count(void);
 
 #endif

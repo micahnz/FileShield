@@ -252,57 +252,10 @@ void session_deny_add(pid_t sid, unsigned long long leader_start,
              target, ttl_seconds);
 }
 
-static int list_count(SessionEntry *list, int count)
-{
-    time_t now = time(NULL);
-    int n = 0;
-
-    for (int i = 0; i < count; i++)
-    {
-        SessionEntry *e = &list[i];
-        if (!e->used)
-            continue;
-        if (entry_expired(e, now) || !leader_alive(e->sid, e->leader_start))
-            continue;
-        n++;
-    }
-    return n;
-}
-
-void session_expire(void)
-{
-    time_t now = time(NULL);
-
-    for (int i = 0; i < g_allow_count; i++)
-    {
-        SessionEntry *e = &g_allow[i];
-        if (e->used &&
-            (entry_expired(e, now) || !leader_alive(e->sid, e->leader_start)))
-            e->used = 0;
-    }
-    for (int i = 0; i < g_deny_count; i++)
-    {
-        SessionEntry *e = &g_deny[i];
-        if (e->used &&
-            (entry_expired(e, now) || !leader_alive(e->sid, e->leader_start)))
-            e->used = 0;
-    }
-}
-
 void session_clear(void)
 {
     memset(g_allow, 0, sizeof(g_allow));
     memset(g_deny, 0, sizeof(g_deny));
     g_allow_count = 0;
     g_deny_count = 0;
-}
-
-int session_allow_count(void)
-{
-    return list_count(g_allow, g_allow_count);
-}
-
-int session_deny_count(void)
-{
-    return list_count(g_deny, g_deny_count);
 }

@@ -64,19 +64,13 @@ static void test_overwrite(void) {
     int ttl = cache_lookup(200, "/bin/a", "/tmp/a");
     ASSERT(ttl > 0 && ttl <= 120, "overwrite refreshes ttl");
 
-    /* A different target is a distinct entry, not an overwrite. */
-    int before = cache_entry_count();
+    /* A different target is a distinct entry, not an overwrite: both
+     * lookups must stay valid side by side. */
     cache_insert(200, "/bin/a", "/tmp/b", 60);
-    ASSERT(cache_entry_count() == before + 1,
-           "different target is a new cache entry");
-}
-
-static void test_count(void) {
-    int before = cache_entry_count();
-    cache_insert(300, "/bin/x", "/tmp/x", 60);
-    ASSERT(cache_entry_count() == before + 1, "count after insert");
-    cache_insert(300, "/bin/x", "/tmp/x", 60);
-    ASSERT(cache_entry_count() == before + 1, "count unchanged on overwrite");
+    ASSERT(cache_lookup(200, "/bin/a", "/tmp/b") > 0,
+           "different target inserts a new cache entry");
+    ASSERT(cache_lookup(200, "/bin/a", "/tmp/a") > 0,
+           "original target entry survives alongside the new one");
 }
 
 static void test_null_binary(void) {
@@ -109,7 +103,6 @@ int main(void) {
     test_wildcard();
     test_ttl_expiry();
     test_overwrite();
-    test_count();
     test_null_binary();
     test_pid_starttime();
     test_ttl_clamp();
