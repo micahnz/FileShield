@@ -401,6 +401,42 @@ static int test_persist_truncated(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: over-cap truncation                                           */
+/*  A state file with more entries than the caller's cap loads exactly  */
+/*  cap entries instead of crashing or miscounting.                     */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_over_cap(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "overcap.json");
+    unlink(path);
+
+    PersistEntry in[4];
+    memset(in, 0, sizeof(in));
+    for (int i = 0; i < 4; i++)
+    {
+        snprintf(in[i].binary, sizeof(in[i].binary), "/usr/bin/bin%d", i);
+        snprintf(in[i].binary_sha512, sizeof(in[i].binary_sha512),
+                 "sha%d", i);
+    }
+    ASSERT(persist_save(path, in, 4) == 0, "persist_save 4 entries");
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc over-cap output");
+
+    int n = persist_load(path, out, 2);
+    ASSERT(n == 2, "load with cap 2 returns exactly 2 entries");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/bin0") == 0, "first entry kept");
+    ASSERT(strcmp(out[1].binary, "/usr/bin/bin1") == 0, "second entry kept");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("over-cap truncation");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  test: persist_delete                                               */
 /* ------------------------------------------------------------------ */
 
@@ -447,6 +483,7 @@ int main(void)
     failed |= test_persist_json_escaping();
     failed |= test_persist_malformed_depth();
     failed |= test_persist_truncated();
+    failed |= test_persist_over_cap();
     failed |= test_persist_delete();
 
     rmdir(g_test_dir);

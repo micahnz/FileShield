@@ -29,6 +29,41 @@ static void silence_stderr(void)
 }
 
 /*
+ * Reap the helper with a deadline.  Returns 0 and fills *status_out when
+ * the child exited in time, -1 when it had to be killed after stalling.
+ * A helper that wrote a digest but never exits is unconfirmable: the
+ * caller treats the reap failure as a hashing failure (fail closed), so
+ * a stuck child can never hold the event loop hostage while the
+ * requesting process stays suspended.
+ */
+#define REAP_DEADLINE_S 2
+
+static int reap_helper(pid_t pid, int *status_out)
+{
+    time_t deadline = time(NULL) + REAP_DEADLINE_S;
+
+    for (;;)
+    {
+        int status = 0;
+        pid_t w = waitpid(pid, status_out ? status_out : &status, WNOHANG);
+        if (w == pid)
+            return 0;
+        if (w < 0 && errno != EINTR)
+            return -1;
+        if (time(NULL) >= deadline)
+            break;
+        usleep(10000); /* 10 ms tick */
+    }
+
+    log_msg(LOG_WARNING, "sha512: helper did not exit in %ds; killing",
+            REAP_DEADLINE_S);
+    kill(pid, SIGKILL);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
+    return -1;
+}
+
+/*
  * Read sha512sum's stdout until EOF (or the buffer is full), enforce the
  * deadline, reap the child and validate the digest.  Output format:
  * "<128-hex-digits>  <filename>\n"; only the first 128 bytes are used.
@@ -69,12 +104,8 @@ static int collect_digest(int fd, pid_t pid, char hex_out[129])
     }
 
     int status = 0;
-    int w;
-    while ((w = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
-        ;
-    if (w < 0)
+    if (reap_helper(pid, &status) < 0)
         return -1;
-
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
         return -1;
 

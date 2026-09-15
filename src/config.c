@@ -225,6 +225,9 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
 
 int config_load(const char *path, Config *cfg)
 {
+    if (!path)
+        return -1;
+
     FILE *fp = fopen(path, "r");
     if (!fp)
     {

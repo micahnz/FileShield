@@ -66,15 +66,14 @@ static void daemonize(void)
     }
     if (pid > 0)
         exit(EXIT_SUCCESS);
-    if (!freopen("/dev/null", "r", stdin))
-    {
-    }
-    if (!freopen("/dev/null", "w", stdout))
-    {
-    }
-    if (!freopen("/dev/null", "w", stderr))
-    {
-    }
+    /* Redirect stdio into the void.  Failures are deliberately ignored:
+     * the daemon writes nothing to stdio (all output goes to syslog), a
+     * closed descriptor is still safer than a leaked terminal fd, and
+     * aborting daemonization over a redirect failure would leave marks
+     * uninstalled. */
+    (void)!freopen("/dev/null", "r", stdin);
+    (void)!freopen("/dev/null", "w", stdout);
+    (void)!freopen("/dev/null", "w", stderr);
 }
 
 int main(int argc, char *argv[])

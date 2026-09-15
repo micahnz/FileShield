@@ -263,6 +263,7 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     char line[4096];
     PersistEntry *current = NULL;
     int count = 0;
+    int warned_truncated = 0;
 
     enum
     {
@@ -286,7 +287,9 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         return -1;
     }
 
-    while (fgets(line, sizeof(line), fp) && count < max_entries)
+    /* Scan to EOF even past the entry cap so truncation is detected and
+     * reported instead of silently dropping grants. */
+    while (fgets(line, sizeof(line), fp))
     {
         char *p = line;
 
@@ -306,8 +309,24 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry start: opening brace inside the entries array. */
         if (state == S_IN_ENTRIES && *p == '{')
         {
-            current = &out_entries[count];
-            memset(current, 0, sizeof(*current));
+            if (count >= max_entries)
+            {
+                /* Make truncation at the caller's cap visible: silently
+                 * ignoring entries would hide grants from review. */
+                if (!warned_truncated)
+                {
+                    log_msg(LOG_WARNING,
+                            "persist_load: %s holds more than %d entries; "
+                            "truncating", filepath, max_entries);
+                    warned_truncated = 1;
+                }
+                current = NULL; /* parse the object but store nothing */
+            }
+            else
+            {
+                current = &out_entries[count];
+                memset(current, 0, sizeof(*current));
+            }
             state = S_IN_ENTRY;
             continue;
         }
@@ -315,18 +334,21 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry end: closing brace.  Sanitise and finalise. */
         if (state == S_IN_ENTRY && *p == '}')
         {
-            /* Defense in depth: never index arrays with an out-of-range
-             * depth, even if a previous validation step was bypassed. */
-            if (current->chain_depth < 0)
-                current->chain_depth = 0;
-            if (current->chain_depth > PERSIST_CHAIN_MAX)
-                current->chain_depth = PERSIST_CHAIN_MAX;
-            for (int k = current->chain_depth; k < PERSIST_CHAIN_MAX; k++)
+            if (current)
             {
-                current->chain_comm[k][0] = '\0';
-                current->chain_sha512[k][0] = '\0';
+                /* Defense in depth: never index arrays with an out-of-range
+                 * depth, even if a previous validation step was bypassed. */
+                if (current->chain_depth < 0)
+                    current->chain_depth = 0;
+                if (current->chain_depth > PERSIST_CHAIN_MAX)
+                    current->chain_depth = PERSIST_CHAIN_MAX;
+                for (int k = current->chain_depth; k < PERSIST_CHAIN_MAX; k++)
+                {
+                    current->chain_comm[k][0] = '\0';
+                    current->chain_sha512[k][0] = '\0';
+                }
+                count++;
             }
-            count++;
             current = NULL;
             state = S_IN_ENTRIES;
             continue;
