@@ -136,7 +136,7 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
         *eq = '\0';
         tgt_raw = trim(eq + 1);
     }
-    char *b = trim(left);
+    const char *b = trim(left);
     if (!b || b[0] == '\0')
     {
         log_msg(LOG_ERR, "config_load: malformed rule line: %s", line);
@@ -334,7 +334,7 @@ int config_load(const char *path, Config *cfg)
             if (!eq)
                 continue;
             *eq = '\0';
-            char *key = trim(s);
+            const char *key = trim(s);
             char *val = trim(eq + 1);
             if (strcmp(key, "user_ttl") == 0)
             {

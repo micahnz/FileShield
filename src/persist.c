@@ -61,14 +61,13 @@ static int ensure_state_dir(const char *dirpath)
 static int json_escape_string(const char *src, char *dst, size_t dst_size)
 {
     size_t written = 0;
-    unsigned char c;
 
     if (!src || !dst || dst_size < 1)
         return -1;
 
     for (; *src; src++)
     {
-        c = (unsigned char)*src;
+        unsigned char c = (unsigned char)*src;
 
         if (written + 2 >= dst_size)
             return -1;

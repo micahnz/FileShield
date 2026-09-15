@@ -9,6 +9,18 @@ char *proc_exe_path(pid_t pid);
 void log_msg(int priority, const char *fmt, ...);
 
 /*
+ * proc_stat_session: read /proc/<pid>/stat once and extract the POSIX
+ * session id (field 6) and the process start time (field 22, clock ticks
+ * since boot).  Either out pointer may be NULL.  Returns 0 on success,
+ * -1 when the process is gone or the stat line cannot be parsed; out
+ * values stay untouched on failure.  Shared by cache.c (PID-reuse
+ * detection) and session.c (session identity) — one parser instead of
+ * two divergent ones.
+ */
+int proc_stat_session(pid_t pid, unsigned long long *sid_out,
+                      unsigned long long *start_out);
+
+/*
  * close_fds_from: close every file descriptor >= 'first' in the calling
  * process.  Used by fork()ed children before exec() so no daemon file
  * descriptors (fanotify group fd, event fds, pipes) leak into helpers.

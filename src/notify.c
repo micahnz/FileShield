@@ -293,7 +293,7 @@ static void setup_display_env(uid_t preferred_uid)
     if (!top)
         return;
 
-    struct dirent *uid_ent;
+    const struct dirent *uid_ent;
     while ((uid_ent = readdir(top)) != NULL)
     {
         if (uid_ent->d_name[0] == '.')

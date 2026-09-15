@@ -37,9 +37,9 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c
 
 -include $(DEPS)
 
-$(OBJDIR)/test_cache: $(OBJDIR)/cache.o $(TSTDIR)/test_cache.c
+$(OBJDIR)/test_cache: $(OBJDIR)/cache.o $(OBJDIR)/utils.o $(TSTDIR)/test_cache.c
 	@mkdir -p $(OBJDIR)
-	$(CC) $(CFLAGS) $(TSTDIR)/test_cache.c $(OBJDIR)/cache.o -o $@
+	$(CC) $(CFLAGS) $(TSTDIR)/test_cache.c $(OBJDIR)/cache.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/test_config: $(OBJDIR)/config.o $(OBJDIR)/utils.o $(TSTDIR)/test_config.c
 	@mkdir -p $(OBJDIR)
@@ -49,9 +49,9 @@ $(OBJDIR)/test_utils: $(OBJDIR)/utils.o $(TSTDIR)/test_utils.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(TSTDIR)/test_utils.c $(OBJDIR)/utils.o -o $@
 
-$(OBJDIR)/test_session: $(OBJDIR)/session.o $(TSTDIR)/test_session.c
+$(OBJDIR)/test_session: $(OBJDIR)/session.o $(OBJDIR)/utils.o $(TSTDIR)/test_session.c
 	@mkdir -p $(OBJDIR)
-	$(CC) $(CFLAGS) $(TSTDIR)/test_session.c $(OBJDIR)/session.o -o $@
+	$(CC) $(CFLAGS) $(TSTDIR)/test_session.c $(OBJDIR)/session.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/test_sha512: $(OBJDIR)/sha512.o $(OBJDIR)/utils.o $(TSTDIR)/test_sha512.c
 	@mkdir -p $(OBJDIR)

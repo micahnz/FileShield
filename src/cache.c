@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "cache.h"
+#include "utils.h"
 
 #define CACHE_MAX_ENTRIES 4096
 
@@ -43,46 +44,9 @@ static void cache_init(void)
  */
 static unsigned long long proc_start_time(pid_t pid)
 {
-    char path[64];
-    char buf[1024];
-    FILE *f;
-    size_t n;
-
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    f = fopen(path, "r");
-    if (!f)
-        return 0;
-    n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (n == 0)
-        return 0;
-    buf[n] = '\0';
-
-    /* The comm field may contain spaces and parentheses: skip past the
-     * last ')' to reach the fixed numeric fields. */
-    char *q = strrchr(buf, ')');
-    if (!q)
-        return 0;
-    q++;
-    while (*q == ' ')
-        q++;
-    if (*q == '\0')
-        return 0;
-    q++; /* skip the single-character state field (field 3) */
-
-    unsigned long long value = 0;
-    /* Read fields 4..22; the last one is starttime. */
-    for (int i = 4; i <= 22; i++)
-    {
-        char *endp;
-        while (*q == ' ')
-            q++;
-        value = strtoull(q, &endp, 10);
-        if (endp == q)
-            return 0;
-        q = endp;
-    }
-    return value;
+    unsigned long long start = 0;
+    (void)proc_stat_session(pid, NULL, &start);
+    return start;
 }
 
 int cache_lookup(pid_t pid, const char *binary, const char *target)

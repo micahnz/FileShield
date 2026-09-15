@@ -31,6 +31,10 @@ extern Config *g_config;
 /* Defined later in this file; declared early for the call-chain hasher. */
 static int is_path_under_protected(const char *path);
 
+/* Defined later; the decision stages respond through this. */
+static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
+                            unsigned int response);
+
 /* ------------------------------------------------------------------ */
 /*  proc helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -221,7 +225,7 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
 
     for (int i = 0; i < g_hash_cache_count; i++)
     {
-        HashCacheEntry *e = &g_hash_cache[i];
+        const HashCacheEntry *e = &g_hash_cache[i];
         if (e->dev == st.st_dev && e->ino == st.st_ino &&
             e->size == st.st_size &&
             e->mtime_sec == st.st_mtim.tv_sec &&
@@ -400,46 +404,6 @@ static int dialog_rate_limited(const char *binary)
 /*  shared persistence helpers for allowlist / denylist               */
 /* ------------------------------------------------------------------ */
 
-/* Copy a DynEntry array to PersistEntry and write to disk. */
-static void persist_dyn_list(const char *filepath, const DynEntry *entries,
-                             int count, const char *name)
-{
-    PersistEntry *buf = calloc(DYN_MAX, sizeof(PersistEntry));
-    if (!buf)
-    {
-        log_msg(LOG_ERR, "out of memory persisting %s", name);
-        return;
-    }
-    for (int i = 0; i < count; i++)
-    {
-        const DynEntry *src = &entries[i];
-        PersistEntry *dst = &buf[i];
-        memcpy(dst->binary, src->binary, sizeof(src->binary));
-        dst->binary[sizeof(dst->binary) - 1] = '\0';
-        memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
-        dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
-        memcpy(dst->target_path, src->target_path, sizeof(src->target_path));
-        dst->target_path[sizeof(dst->target_path) - 1] = '\0';
-        memcpy(dst->cmdline, src->cmdline, sizeof(src->cmdline));
-        dst->cmdline[sizeof(dst->cmdline) - 1] = '\0';
-        memcpy(dst->cmdline_sha512, src->cmdline_sha512,
-               sizeof(src->cmdline_sha512));
-        dst->cmdline_sha512[sizeof(dst->cmdline_sha512) - 1] = '\0';
-        dst->chain_depth = src->chain_depth;
-        for (int j = 0; j < src->chain_depth; j++)
-        {
-            memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
-            dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
-            memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
-            dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
-        }
-        dst->created_at = time(NULL);
-    }
-    if (persist_save(filepath, buf, count) < 0)
-        log_msg(LOG_WARNING, "persist_save failed; %s entry not persisted", name);
-    free(buf);
-}
-
 /* Copy DynEntry entries into a PersistEntry array.  Returns count. */
 static int dyn_to_persist(const DynEntry *entries, int count,
                           PersistEntry *out, int max)
@@ -473,6 +437,27 @@ static int dyn_to_persist(const DynEntry *entries, int count,
     return n;
 }
 
+/* Copy a DynEntry array to PersistEntry, stamp created_at, write to disk. */
+static void persist_dyn_list(const char *filepath, const DynEntry *entries,
+                             int count, const char *name)
+{
+    PersistEntry *buf = calloc(DYN_MAX, sizeof(PersistEntry));
+    if (!buf)
+    {
+        log_msg(LOG_ERR, "out of memory persisting %s", name);
+        return;
+    }
+
+    int n = dyn_to_persist(entries, count, buf, DYN_MAX);
+    time_t now = time(NULL);
+    for (int i = 0; i < n; i++)
+        buf[i].created_at = now;
+
+    if (persist_save(filepath, buf, n) < 0)
+        log_msg(LOG_WARNING, "persist_save failed; %s entry not persisted", name);
+    free(buf);
+}
+
 /*
  * Load PersistEntry entries into a DynEntry array.
  * When require_binary_sha512 is set, entries without a binary SHA-512 are
@@ -491,9 +476,9 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                           const char *name, int require_binary_sha512,
                           int require_target_path, int require_cmdline)
 {
-    /* Always replace the in-memory list so a CLI "clear" (file removed)
-     * or a corrupt/unreadable state file cannot leave stale grants or
-     * denies active in the running daemon. */
+    /* Always replace the in-memory list so a removed state file or a
+     * corrupt/unreadable one cannot leave stale grants or denies active
+     * in the running daemon. */
     memset(list, 0, sizeof(DynEntry) * DYN_MAX);
     *list_count = 0;
 
@@ -594,7 +579,7 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
 
     for (int i = 0; i < g_dyn_allow_count; i++)
     {
-        DynEntry *e = &g_dyn_allow[i];
+        const DynEntry *e = &g_dyn_allow[i];
 
         if (strcmp(e->binary, binary) != 0)
             continue;
@@ -608,14 +593,12 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
         if (e->binary_sha512[0] == '\0')
             continue;
 
-        /* SHA-512 check on the binary itself. */
-        if (e->binary_sha512[0] != '\0')
-        {
-            if (bin_sha512[0] == '\0') /* couldn't hash it now — fail secure */
-                continue;
-            if (strcmp(e->binary_sha512, bin_sha512) != 0)
-                continue;
-        }
+        /* SHA-512 check on the binary itself: the entry always has one
+         * here, so an unusable current hash fails secure. */
+        if (bin_sha512[0] == '\0') /* couldn't hash it now — fail secure */
+            continue;
+        if (strcmp(e->binary_sha512, bin_sha512) != 0)
+            continue;
 
         if (e->chain_depth != chain->depth)
             continue;
@@ -760,7 +743,7 @@ static int dyn_deny_match(const char *binary, const char *bin_sha512,
 
     for (int i = 0; i < g_dyn_deny_count; i++)
     {
-        DynEntry *e = &g_dyn_deny[i];
+        const DynEntry *e = &g_dyn_deny[i];
 
         if (strcmp(e->binary, binary) != 0)
             continue;
@@ -939,7 +922,7 @@ static void inode_walk_dir(const char *dirpath, dev_t dev, int depth)
                 strerror(errno));
         return;
     }
-    struct dirent *ent;
+    const struct dirent *ent;
     while ((ent = readdir(d)) != NULL)
     {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
@@ -963,6 +946,7 @@ static void inode_walk_dir(const char *dirpath, dev_t dev, int depth)
 /*
  * Returns 1 if `path` falls under any currently protected path.
  * Used to distinguish events from directory marks vs. mount marks (hard-link).
+ * Delegates the boundary math to the shared path_under() helper.
  */
 static int is_path_under_protected(const char *path)
 {
@@ -970,15 +954,8 @@ static int is_path_under_protected(const char *path)
         return 0;
     for (int i = 0; i < g_config->protected_count; i++)
     {
-        const char *p = g_config->protected[i].path;
-        size_t plen = strlen(p);
-        if (plen == 0) /* defensive: never index p[plen - 1] */
-            continue;
-        if (strncmp(path, p, plen) == 0)
-        {
-            if (path[plen] == '\0' || path[plen] == '/' || p[plen - 1] == '/')
-                return 1;
-        }
+        if (path_under(path, g_config->protected[i].path))
+            return 1;
     }
     return 0;
 }
@@ -1395,7 +1372,7 @@ static int process_in_dialog_group(pid_t pid, pid_t dialog_pid)
     }
     fclose(f);
 
-    char *p = strrchr(buf, ')');
+    const char *p = strrchr(buf, ')');
     if (!p)
         return 0;
     p++;
@@ -1409,343 +1386,445 @@ static int process_in_dialog_group(pid_t pid, pid_t dialog_pid)
  * Full decision path for a FAN_OPEN_PERM event.  Takes ownership of ev->fd:
  * every path responds and closes the event fd, or (in the pump) defers it.
  */
-static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
+/* ------------------------------------------------------------------ */
+/*  per-event decision context                                         */
+/* ------------------------------------------------------------------ */
+/*
+ * Everything the decision stages need for one FAN_OPEN_PERM event.
+ * Identity fields are gathered once while the requesting process is
+ * kernel-suspended (its /proc entry cannot change under us), then
+ * threaded through the stages in fixed decision order.
+ */
+typedef struct
 {
-    pid_t pid = ev->pid;
-    int fd_num = (int)ev->fd;
-    char *binary = NULL;
-    char *target = NULL;
-    pid_t ppid = 0;
-    char comm[256] = "";
-    char pcomm[256] = "";
-    char cmdline[512] = "";
-    dev_t ev_dev = 0;
-    ino_t ev_ino = 0;
-    char bin_sha512[129] = "";
-    char cmdline_sha512[129] = "";
-    pid_t sid = 0;
-    unsigned long long sid_start = 0;
+    int fan_fd;
+    const struct fanotify_event_metadata *ev;
+    int fd_num;
+    int close_fd; /* 0 only for FAN_NOFD: there is no descriptor to close */
+
+    char *binary; /* /proc/<pid>/exe, malloc'd    */
+    char *target; /* /proc/self/fd/<fd>, malloc'd */
+    dev_t ev_dev;
+    ino_t ev_ino;
+
+    /* Requester identity, gathered after the pre-hash deny checks. */
+    pid_t ppid;
+    char comm[256];
+    char pcomm[256];
+    char cmdline[512];
+    char bin_sha512[129];
+    char cmdline_sha512[129];
     ProcChain chain;
-    int sha_ok = -1;
-    int decision;
+    pid_t sid;
+    unsigned long long sid_start;
+    int have_sid;
+} EventCtx;
 
-    log_msg(LOG_DEBUG, "[event] FAN_OPEN_PERM pid=%d fd=%d", (int)pid, fd_num);
+/*
+ * Every deciding stage funnels through here so the dedup-cache insert
+ * and the kernel response always happen together, in that order.
+ */
+static void ctx_respond(EventCtx *c, unsigned int response)
+{
+    recent_cache_insert(c->ev->pid, c->ev_dev, c->ev_ino, (int)response);
+    fanotify_respond(c->fan_fd, c->ev, response);
+}
 
-    if (fd_num == FAN_NOFD)
+/*
+ * Stage 1: sanity-check the event fd and resolve the target path from
+ * the daemon's fd table.  Returns 1 when the event was decided here
+ * (FAN_NOFD or an unresolvable path — both deny, fail closed).
+ */
+static int event_resolve(EventCtx *c)
+{
+    if (c->fd_num == FAN_NOFD)
     {
-        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying", (int)pid);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        return;
+        log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying",
+                (int)c->ev->pid);
+        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        return 1;
     }
 
-    /* Resolve the target file path from the daemon's fd table.  Done early
-     * so the mount-mark fast-path below can reuse it. */
-    target = resolve_fd_path(fd_num);
-    if (!target)
+    c->target = resolve_fd_path(c->fd_num);
+    if (!c->target)
     {
-        log_msg(LOG_WARNING, "[event] resolve_fd_path failed for pid=%d fd=%d, denying",
-                (int)pid, fd_num);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        return;
+        log_msg(LOG_WARNING,
+                "[event] resolve_fd_path failed for pid=%d fd=%d, denying",
+                (int)c->ev->pid, c->fd_num);
+        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        return 1;
     }
-    log_msg(LOG_DEBUG, "[event] resolved target: pid=%d target=%s", (int)pid, target);
+    log_msg(LOG_DEBUG, "[event] resolved target: pid=%d target=%s",
+            (int)c->ev->pid, c->target);
+    return 0;
+}
 
-    /* Fast-path filter for mount-mark noise. */
+/*
+ * Stage 2: cheap pre-identity checks.
+ *   - Mount-mark fast path: neither the inode nor the path is protected,
+ *     so the event is mount-mark noise and is allowed instantly.
+ *   - Deduplication: directory + mount marks can fire twice for one
+ *     open; the recent-decision cache answers the duplicate instantly.
+ */
+static int event_fastpath(EventCtx *c)
+{
     if (g_mount_count > 0)
     {
-        struct stat fast_st;
-        if (fstat(fd_num, &fast_st) == 0 &&
-            !inode_is_protected(fast_st.st_dev, fast_st.st_ino) &&
-            !is_path_under_protected(target))
+        struct stat st;
+        if (fstat(c->fd_num, &st) == 0 &&
+            !inode_is_protected(st.st_dev, st.st_ino) &&
+            !is_path_under_protected(c->target))
         {
             log_msg(LOG_DEBUG, "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
-                    (int)pid, target);
-            fanotify_respond(fan_fd, ev, FAN_ALLOW);
-            close(fd_num);
-            free(target);
-            return;
+                    (int)c->ev->pid, c->target);
+            fanotify_respond(c->fan_fd, c->ev, FAN_ALLOW);
+            return 1;
         }
     }
 
-    /* Deduplication: directory + mount marks can fire twice for one open. */
+    struct stat st;
+    if (fstat(c->fd_num, &st) == 0)
     {
-        struct stat dedup_st;
-        if (fstat(fd_num, &dedup_st) == 0)
+        c->ev_dev = st.st_dev;
+        c->ev_ino = st.st_ino;
+        int cached = recent_cache_lookup(c->ev->pid, c->ev_dev, c->ev_ino);
+        if (cached != -1)
         {
-            ev_dev = dedup_st.st_dev;
-            ev_ino = dedup_st.st_ino;
-            int cached = recent_cache_lookup(pid, ev_dev, ev_ino);
-            if (cached != -1)
-            {
-                log_msg(LOG_DEBUG,
-                        "[dedup] reusing cached decision=%s for pid=%d target=%s",
-                        cached == (int)FAN_ALLOW ? "ALLOW" : "DENY", (int)pid, target);
-                fanotify_respond(fan_fd, ev, (unsigned int)cached);
-                close(fd_num);
-                free(target);
-                return;
-            }
+            log_msg(LOG_DEBUG,
+                    "[dedup] reusing cached decision=%s for pid=%d target=%s",
+                    cached == (int)FAN_ALLOW ? "ALLOW" : "DENY",
+                    (int)c->ev->pid, c->target);
+            fanotify_respond(c->fan_fd, c->ev, (unsigned int)cached);
+            return 1;
         }
     }
+    return 0;
+}
 
-    binary = proc_exe_path(pid);
-    if (!binary)
+/*
+ * Stage 3: requester identity that needs no hashing, plus the config
+ * denylist.  Returns 1 when the event was decided (unresolvable binary
+ * or a config denylist hit — both deny, fail closed).
+ */
+static int event_load_binary(EventCtx *c)
+{
+    c->binary = proc_exe_path(c->ev->pid);
+    if (!c->binary)
     {
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        free(target);
-        return;
+        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        return 1;
     }
 
     /* Hard-link bypass detection: a path outside every protected prefix
      * means the event came from the mount mark, i.e. a hard link. */
-    if (!is_path_under_protected(target))
+    if (!is_path_under_protected(c->target))
     {
         log_msg(LOG_WARNING,
                 "hard-link bypass attempt: %s (pid %d) opened "
                 "protected inode via unprotected path \"%s\"",
-                binary, (int)pid, target);
+                c->binary, (int)c->ev->pid, c->target);
     }
 
     /* Config denylist: a static admin denial always wins over every
      * grant.  Checked before hashing so denied binaries never pay for
      * binary/ancestor SHA-512 computation. */
-    if (denylist_match(binary, target))
+    if (denylist_match(c->binary, c->target))
     {
         log_msg(LOG_INFO, "config denylist hit: %s (pid %d) -> %s",
-                binary, (int)pid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        goto cleanup;
+                c->binary, (int)c->ev->pid, c->target);
+        ctx_respond(c, FAN_DENY);
+        return 1;
     }
+    return 0;
+}
 
-    read_comm(pid, comm, sizeof(comm));
-    ppid = get_ppid(pid);
-    if (ppid > 0)
-        read_comm(ppid, pcomm, sizeof(pcomm));
-    read_cmdline(pid, cmdline, sizeof(cmdline));
+/*
+ * Stage 4: gather everything the session/runtime checks match on.
+ * Hashing and chain building happen while the target process is
+ * kernel-suspended so its /proc entry is still valid.  Hashing a path
+ * that is itself protected would make the daemon intercept its own
+ * helper, so it is skipped and the path+chain decision stands alone.
+ */
+static void event_gather_identity(EventCtx *c)
+{
+    pid_t pid = c->ev->pid;
 
-    /* Hash the binary and build the call chain while the target process is
-     * kernel-suspended so its /proc entry is still valid.  Hashing a path
-     * that is itself protected would make the daemon intercept its own
-     * helper, so skip it and let the path+chain decision stand alone. */
-    if (!is_path_under_protected(binary))
-        sha_ok = cached_sha512_proc_exe(pid, bin_sha512);
-    build_proc_chain(pid, &chain);
+    read_comm(pid, c->comm, sizeof(c->comm));
+    c->ppid = get_ppid(pid);
+    if (c->ppid > 0)
+        read_comm(c->ppid, c->pcomm, sizeof(c->pcomm));
+    read_cmdline(pid, c->cmdline, sizeof(c->cmdline));
 
+    int sha_ok = -1;
+    if (!is_path_under_protected(c->binary))
+        sha_ok = cached_sha512_proc_exe(pid, c->bin_sha512);
     if (sha_ok < 0)
         log_msg(LOG_WARNING, "SHA-512 unavailable for %s (pid %d); "
                              "\"Always Allow\" will not persist for this "
                              "decision (access will be re-prompted)",
-                binary, (int)pid);
+                c->binary, (int)pid);
+
+    build_proc_chain(pid, &c->chain);
 
     /* Session identity, best effort.  Without it session-scoped decisions
      * cannot be matched or recorded (they degrade to one-time decisions). */
-    int have_sid = session_id_of(pid, &sid, &sid_start) == 0;
-    if (!have_sid)
+    c->have_sid = session_id_of(pid, &c->sid, &c->sid_start) == 0;
+    if (!c->have_sid)
         log_msg(LOG_WARNING,
                 "cannot determine session for pid=%d; session decisions "
                 "unavailable for %s",
-                (int)pid, binary);
+                (int)pid, c->binary);
+}
 
-    /*
-     * Decision order (a denial always wins over a grant):
-     *   config deny -> session deny -> permanent deny -> file cache
-     *   -> session allow -> permanent allow -> config allow
-     *   -> rate limit -> dialog
-     * The config allowlist is checked after the runtime grants because
-     * every deny must be evaluated first, which requires the binary and
-     * call-chain hashes computed above.
-     */
-
-    /* session denylist (runtime "Deny Session") */
-    if (have_sid && session_deny_match(sid, binary, bin_sha512, target))
+/*
+ * Stage 5: denials that require the binary/call-chain hashes, in order:
+ * session denylist (runtime "Deny Session"), then dynamic denylist
+ * (runtime "Deny Always").  Returns 1 when the event was denied.
+ */
+static int event_runtime_denied(EventCtx *c)
+{
+    if (c->have_sid &&
+        session_deny_match(c->sid, c->binary, c->bin_sha512, c->target))
     {
         log_msg(LOG_INFO, "session denylist hit: %s (pid %d, sid %d) -> %s",
-                binary, (int)pid, (int)sid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        goto cleanup;
+                c->binary, (int)c->ev->pid, (int)c->sid, c->target);
+        ctx_respond(c, FAN_DENY);
+        return 1;
     }
 
-    /* dynamic denylist check (runtime "Deny Always") */
-    if (dyn_deny_match(binary, bin_sha512, &chain, target, cmdline))
+    if (dyn_deny_match(c->binary, c->bin_sha512, &c->chain, c->target,
+                       c->cmdline))
     {
         log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
-                binary, (int)pid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        goto cleanup;
+                c->binary, (int)c->ev->pid, c->target);
+        ctx_respond(c, FAN_DENY);
+        return 1;
     }
+    return 0;
+}
 
-    /* file cache check ("Allow Once", config/dynamic allow fast paths) */
-    if (cache_lookup(pid, binary, target) > 0)
+/*
+ * Stage 6: grants, in order: file cache ("Allow Once" and fast paths),
+ * session allowlist, dynamic allowlist ("Allow Always"), config
+ * allowlist.  The config allowlist is last: a denial always wins, and
+ * the deny checks above needed the hashes gathered in stage 4.
+ * Returns 1 when the event was allowed.
+ */
+static int event_runtime_allowed(EventCtx *c)
+{
+    if (cache_lookup(c->ev->pid, c->binary, c->target) > 0)
     {
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
-        close(fd_num);
-        goto cleanup;
+        ctx_respond(c, FAN_ALLOW);
+        return 1;
     }
 
-    /* session allowlist (runtime "Allow Session") */
-    if (have_sid && session_allow_match(sid, binary, bin_sha512, target))
+    if (c->have_sid &&
+        session_allow_match(c->sid, c->binary, c->bin_sha512, c->target))
     {
         log_msg(LOG_INFO, "session allowlist hit: %s (pid %d, sid %d) -> %s",
-                binary, (int)pid, (int)sid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
-        close(fd_num);
-        goto cleanup;
+                c->binary, (int)c->ev->pid, (int)c->sid, c->target);
+        ctx_respond(c, FAN_ALLOW);
+        return 1;
     }
 
-    /* dynamic allowlist check (runtime "Allow Always") */
-    if (dyn_allow_match(binary, bin_sha512, &chain, target, cmdline))
+    if (dyn_allow_match(c->binary, c->bin_sha512, &c->chain, c->target,
+                        c->cmdline))
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-        cache_insert(pid, binary, target, user_ttl);
+        cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
-                binary, (int)pid, target);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
-        close(fd_num);
-        goto cleanup;
+                c->binary, (int)c->ev->pid, c->target);
+        ctx_respond(c, FAN_ALLOW);
+        return 1;
     }
 
     /* Config allowlist: an explicit admin opt-in, scoped to a target
-     * file/folder or global for a bare entry.  Checked after every deny
-     * (a denial always wins) and after the runtime grants; the hashes
-     * the deny checks needed were computed above. */
+     * file/folder or global for a bare entry.  A global rule inserts a
+     * wildcard cache entry (grant == NULL). */
     {
         const char *grant = NULL;
-        if (allowlist_match(binary, target, &grant))
+        if (allowlist_match(c->binary, c->target, &grant))
         {
             int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-            cache_insert(pid, binary, grant, user_ttl);
+            cache_insert(c->ev->pid, c->binary, grant, user_ttl);
             log_msg(LOG_INFO, "config allowlist hit: %s (pid %d) -> %s",
-                    binary, (int)pid, target);
-            recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-            fanotify_respond(fan_fd, ev, FAN_ALLOW);
-            close(fd_num);
-            goto cleanup;
+                    c->binary, (int)c->ev->pid, c->target);
+            ctx_respond(c, FAN_ALLOW);
+            return 1;
         }
     }
+    return 0;
+}
 
-    /* Rate-limit dialog floods from rapidly re-exec'ing processes. */
-    if (dialog_rate_limited(binary))
+/*
+ * Record an allow decision the user made in the dialog.  Returns the
+ * fanotify response (always FAN_ALLOW; session decisions degrade to a
+ * one-time cache grant when the session is unknown).
+ */
+static unsigned int record_allow_decision(EventCtx *c, int decision)
+{
+    int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+    int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+
+    if (decision == NOTIFY_ALLOW_ONCE)
     {
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-        close(fd_num);
-        goto cleanup;
+        cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
     }
-
-    /* ask user consent */
-    log_msg(LOG_INFO, "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
-            (int)pid, binary, target, comm);
-    decision = notify_ask(comm, pid, ppid, pcomm, binary, cmdline, target,
-                          proc_uid(pid));
-    log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
-            decision, (int)pid, binary);
-
-    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_SESSION ||
-        decision == NOTIFY_ALLOW_ALWAYS)
+    else if (decision == NOTIFY_ALLOW_SESSION)
     {
-        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-        int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
-
-        if (decision == NOTIFY_ALLOW_ONCE)
+        if (c->have_sid)
         {
-            cache_insert(pid, binary, target, user_ttl);
+            session_allow_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
+                              c->target, session_ttl);
         }
-        else if (decision == NOTIFY_ALLOW_SESSION)
+        else
         {
-            if (have_sid)
-            {
-                session_allow_add(sid, sid_start, binary, bin_sha512, target,
-                                  session_ttl);
-            }
-            else
-            {
-                log_msg(LOG_WARNING,
-                        "session unavailable; degrading Allow Session to "
-                        "Allow Once for %s",
-                        binary);
-                cache_insert(pid, binary, target, user_ttl);
-            }
+            log_msg(LOG_WARNING,
+                    "session unavailable; degrading Allow Session to "
+                    "Allow Once for %s",
+                    c->binary);
+            cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         }
-        else /* NOTIFY_ALLOW_ALWAYS */
-        {
-            if (cmdline[0] != '\0' &&
-                sha512_string(cmdline, cmdline_sha512) == 0)
-            {
-                dyn_allow_add(binary, bin_sha512, &chain, target,
-                              cmdline, cmdline_sha512);
-            }
-            else
-            {
-                /* Without the exact invocation the persistent entry would
-                 * cover every command of this binary; degrade to a
-                 * one-time cached grant instead. */
-                log_msg(LOG_WARNING,
-                        "cannot fingerprint the command line for %s; "
-                        "degrading Allow Always to Allow Once",
-                        binary);
-                cache_insert(pid, binary, target, user_ttl);
-            }
-        }
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
     }
-    else if (decision == NOTIFY_DENY_SESSION)
+    else /* NOTIFY_ALLOW_ALWAYS */
+    {
+        if (c->cmdline[0] != '\0' &&
+            sha512_string(c->cmdline, c->cmdline_sha512) == 0)
+        {
+            dyn_allow_add(c->binary, c->bin_sha512, &c->chain, c->target,
+                          c->cmdline, c->cmdline_sha512);
+        }
+        else
+        {
+            /* Without the exact invocation the persistent entry would
+             * cover every command of this binary; degrade to a
+             * one-time cached grant instead. */
+            log_msg(LOG_WARNING,
+                    "cannot fingerprint the command line for %s; "
+                    "degrading Allow Always to Allow Once",
+                    c->binary);
+            cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
+        }
+    }
+    return FAN_ALLOW;
+}
+
+/*
+ * Record a deny decision from the dialog.  Deny Session degrades to a
+ * one-time deny when the session is unknown; Deny Always degrades to a
+ * one-time deny when the command line cannot be fingerprinted.
+ */
+static unsigned int record_deny_decision(EventCtx *c, int decision)
+{
+    if (decision == NOTIFY_DENY_SESSION)
     {
         int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
 
-        if (have_sid)
+        if (c->have_sid)
         {
-            session_deny_add(sid, sid_start, binary, bin_sha512, target,
-                             session_ttl);
+            session_deny_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
+                             c->target, session_ttl);
         }
         else
         {
             log_msg(LOG_WARNING,
                     "session unavailable; denying %s for this attempt only",
-                    binary);
+                    c->binary);
         }
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
     }
-    else if (decision == NOTIFY_DENY_ALWAYS)
+    else /* NOTIFY_DENY_ALWAYS */
     {
-        if (cmdline[0] != '\0' &&
-            sha512_string(cmdline, cmdline_sha512) == 0)
+        if (c->cmdline[0] != '\0' &&
+            sha512_string(c->cmdline, c->cmdline_sha512) == 0)
         {
-            dyn_deny_add(binary, bin_sha512, &chain, target,
-                         cmdline, cmdline_sha512);
+            dyn_deny_add(c->binary, c->bin_sha512, &c->chain, c->target,
+                         c->cmdline, c->cmdline_sha512);
         }
         else
         {
             log_msg(LOG_WARNING,
                     "cannot fingerprint the command line for %s; "
                     "denying this attempt only",
-                    binary);
+                    c->binary);
         }
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
     }
-    else
-    {
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
-        fanotify_respond(fan_fd, ev, FAN_DENY);
-    }
-    close(fd_num);
+    return FAN_DENY;
+}
 
-cleanup:
-    free(binary);
-    free(target);
+/*
+ * Stage 7: no rule matched — rate-limit the dialog flood risk, then ask
+ * the user and record their decision.
+ */
+static void event_ask_user(EventCtx *c)
+{
+    if (dialog_rate_limited(c->binary))
+    {
+        ctx_respond(c, FAN_DENY);
+        return;
+    }
+
+    log_msg(LOG_INFO, "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
+            (int)c->ev->pid, c->binary, c->target, c->comm);
+    int decision = notify_ask(c->comm, c->ev->pid, c->ppid, c->pcomm,
+                              c->binary, c->cmdline, c->target,
+                              proc_uid(c->ev->pid));
+    log_msg(LOG_INFO, "[dialog] user decision=%d for pid=%d binary=%s",
+            decision, (int)c->ev->pid, c->binary);
+
+    unsigned int response = FAN_DENY;
+    if (decision == NOTIFY_ALLOW_ONCE || decision == NOTIFY_ALLOW_SESSION ||
+        decision == NOTIFY_ALLOW_ALWAYS)
+        response = record_allow_decision(c, decision);
+    else if (decision == NOTIFY_DENY_SESSION || decision == NOTIFY_DENY_ALWAYS)
+        response = record_deny_decision(c, decision);
+
+    ctx_respond(c, response);
+}
+
+/*
+ * Full decision path for a FAN_OPEN_PERM event.  Takes ownership of ev->fd:
+ * every path responds and closes the event fd (except FAN_NOFD), or (in
+ * the pump) defers it.
+ *
+ * The stages below are pure structure: each one was a block inside this
+ * function, and every respond/close/cache side effect happens in the
+ * same order.  The decision order is (a denial always wins over a grant):
+ *   config deny -> session deny -> permanent deny -> file cache
+ *   -> session allow -> permanent allow -> config allow
+ *   -> rate limit -> dialog
+ * The config allowlist sits after the runtime grants because every deny
+ * must be evaluated first, which requires the hashes from stage 4.
+ */
+static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
+{
+    EventCtx c;
+    memset(&c, 0, sizeof(c));
+    c.fan_fd = fan_fd;
+    c.ev = ev;
+    c.fd_num = (int)ev->fd;
+    c.close_fd = (c.fd_num != FAN_NOFD);
+
+    log_msg(LOG_DEBUG, "[event] FAN_OPEN_PERM pid=%d fd=%d",
+            (int)ev->pid, c.fd_num);
+
+    if (event_resolve(&c))
+        goto out;
+    if (event_fastpath(&c))
+        goto out;
+    if (event_load_binary(&c))
+        goto out;
+    event_gather_identity(&c);
+    if (event_runtime_denied(&c))
+        goto out;
+    if (event_runtime_allowed(&c))
+        goto out;
+    event_ask_user(&c);
+
+out:
+    if (c.close_fd)
+        close(c.fd_num);
+    free(c.binary);
+    free(c.target);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1768,7 +1847,6 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
     int responded = 0;
-    ssize_t n;
 
     while (1)
     {
@@ -1777,7 +1855,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         if (flags < 0)
             break;
         fcntl(fan_fd, F_SETFL, flags | O_NONBLOCK);
-        n = read(fan_fd, buf, sizeof(buf));
+        ssize_t n = read(fan_fd, buf, sizeof(buf));
         fcntl(fan_fd, F_SETFL, flags); /* restore */
 
         if (n <= 0)
@@ -1933,8 +2011,8 @@ void fanotify_clear_marks(int fd)
     log_msg(LOG_INFO, "marks and inode table cleared");
 }
 
-int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
-                     unsigned int response)
+static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
+                            unsigned int response)
 {
     struct fanotify_response resp;
 
@@ -1992,7 +2070,6 @@ void fanotify_loop(int fd)
     char buf[BUF_SIZE]
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
     const struct fanotify_event_metadata *ev;
-    ssize_t n;
     int event_cnt = 0;
     time_t last_expire = time(NULL);
 
@@ -2006,7 +2083,7 @@ void fanotify_loop(int fd)
                 break;
         }
 
-        n = read(fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0)
         {
             if (errno == EINTR)

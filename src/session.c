@@ -1,4 +1,5 @@
 #include "session.h"
+#include "utils.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -33,60 +34,20 @@ static int g_allow_count = 0;
 static int g_deny_count = 0;
 
 /*
- * Read the POSIX session id and process start time for pid from
- * /proc/<pid>/stat (fields 6 and 22).  Returns 0 on success, -1 when the
- * process is gone or the stat format is unexpected.
+ * Resolve the POSIX session id and the session leader's start time for
+ * pid.  Thin wrapper over the shared /proc/<pid>/stat parser; returns 0
+ * on success, -1 when the process is gone.
  */
 static int read_proc_session(pid_t pid, pid_t *sid_out,
                              unsigned long long *start_out)
 {
-    char path[64];
-    char buf[1024];
-    FILE *f;
-    size_t n;
-
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    f = fopen(path, "r");
-    if (!f)
-        return -1;
-    n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (n == 0)
-        return -1;
-    buf[n] = '\0';
-
-    /* comm may contain spaces and parentheses: skip past the last ')'. */
-    char *q = strrchr(buf, ')');
-    if (!q || q[1] == '\0')
-        return -1;
-    q++;
-    while (*q == ' ')
-        q++;
-    if (*q == '\0')
-        return -1;
-    q++; /* skip the single-character state field (field 3) */
-
-    /* Fixed numeric fields begin at field 4 (ppid).  Collect 4..22 so the
-     * session id (field 6) and start time (field 22) are both available. */
-    unsigned long long session = 0;
+    unsigned long long sid = 0;
     unsigned long long start = 0;
-    for (int i = 0; i <= 18; i++)
-    {
-        while (*q == ' ')
-            q++;
-        char *endp;
-        unsigned long long v = strtoull(q, &endp, 10);
-        if (endp == q)
-            return -1;
-        if (i == 2) /* field 6: session id    */
-            session = v;
-        if (i == 18) /* field 22: start time  */
-            start = v;
-        q = endp;
-    }
 
+    if (proc_stat_session(pid, &sid, start_out ? &start : NULL) != 0)
+        return -1;
     if (sid_out)
-        *sid_out = (pid_t)session;
+        *sid_out = (pid_t)sid;
     if (start_out)
         *start_out = start;
     return 0;

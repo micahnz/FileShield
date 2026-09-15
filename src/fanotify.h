@@ -14,9 +14,7 @@ int fanotify_setup(void);
  */
 int fanotify_add_mark(int fd, const char *path);
 
-int fanotify_remove_mark(int fd, const char *path);
 void fanotify_loop(int fd);
-int fanotify_respond(int fd, const struct fanotify_event_metadata *ev, unsigned int response);
 
 /* Non-zero when at least one file/directory or mount mark is active. */
 int fanotify_any_mark_active(void);
