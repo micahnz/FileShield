@@ -33,8 +33,8 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
         │
         ▼
   fileshield daemon
-  ├─ config allowlist / session deny / runtime deny
-  ├─ allow-once cache / session allow / runtime allow
+  ├─ config denylist / session deny / runtime deny
+  ├─ allow-once cache / session allow / runtime allow / config allowlist
   └─ no match → two-stage kdialog popup
         │
         ├─ Allow Once ───────────▶ FAN_ALLOW (cached for user_ttl)
@@ -93,7 +93,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted *Always Allow* / *Always Deny* lists are reloaded from disk at the same time, so `fileshield-cli` changes take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted *Always Allow* / *Always Deny* lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
 
 ### Default Protected Paths
 
@@ -144,28 +144,45 @@ Paths listed in `[protected_paths]` that do not exist yet are skipped at startup
 
 ### Allowlist
 
-The `[allowlist]` section is **empty by default**. Pre-allowlisting a binary by path is risky: if that binary is replaced, wrapped, or symlinked by a compromised package, it inherits silent access to every protected resource without any popup.
+The `[allowlist]` section is **empty by default**. Pre-allowlisting a binary by path is risky: if that binary is replaced, wrapped, or symlinked by a compromised package, it inherits access without any popup.
 
 Add entries only for tools you have audited and trust at that exact path:
 
 ```ini
 [allowlist]
-# Format: /absolute/path/to/binary = ttl_seconds
-# /usr/bin/ssh       = 3600
-# /usr/bin/gpg       = 3600
+# Format: /absolute/path/to/binary = /path/to/target/file
+# /usr/bin/ssh       = ~/.ssh/known_hosts
+# /usr/bin/gpg       = ~/.gnupg/
 ```
+
+- A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. Matching is *equal or under*: `/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it; a bare file target covers exactly that file.
+- A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access *every* protected path. This is the most dangerous form — use it sparingly.
+- A binary may appear on **multiple lines** with different targets when it needs exceptions for more than one file or folder.
+- `~` in binary and target paths expands for every user's home, the same way `[protected_paths]` do.
+- Rules no longer carry a per-entry TTL: repeated opens refresh the file cache for `user_ttl` seconds (see [Settings](#settings)).
 
 > **Why not pre-allowlist common SRE tools?**  
 > A supply-chain attack that replaces `/usr/local/bin/aws` would get unconditional access to `~/.aws/credentials` forever. An empty default forces a conscious opt-in decision per binary.
 
-> Config `[allowlist]` entries are binary-wide: they grant that binary access to *every* protected path, with no target-file or command-line scoping. Use the interactive *Always Allow* entries for per-file, per-command grants.
+### Denylist
+
+`[denylist]` uses the same format as `[allowlist]` but denies access:
+
+```ini
+[denylist]
+# Format: /absolute/path/to/binary = /path/to/target/file
+# /usr/bin/curl       = ~/.netrc
+# /usr/bin/nc
+```
+
+A scoped entry denies the binary that one file or folder; a bare binary line is a global deny covering every protected path; the same binary may appear on multiple lines. **Denials are always evaluated first**: a config denylist hit produces `FAN_DENY` (the open fails with `EPERM`) before any allowlist, cache, or session rule is consulted, and no dialog is shown.
 
 ### Settings
 
 ```ini
 [settings]
 # How long an "Allow Once" decision is cached for the same process and file
-# (seconds). Config [allowlist] entries have their own per-entry TTL.
+# (seconds).  Config allowlist hits also refresh the cache with this TTL.
 user_ttl = 300
 
 # Cap for "Allow Session" / "Deny Session" decisions (seconds).
@@ -222,7 +239,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | Deny Always | same key shape as Allow Always | until removed | `runtime-denylist.json` |
 | Deny | — | this attempt only | no |
 
-Denials are always checked before grants, so a session or permanent denial can never be bypassed by a cached *Allow Once*. The config `[allowlist]` is the only binary-wide grant and is checked first (admin opt-in).
+Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached *Allow Once*. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog.
 
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
@@ -277,27 +294,26 @@ Each entry records the binary path and SHA-512, the target file, the exact comma
 }
 ```
 
-To remove a single file-scoped entry (or every file for a binary+sha pair when `TARGET` is omitted):
+To remove a single file-scoped entry, edit the state file directly (root-only, JSON array): delete the matching object with `jq`, or simply remove the file to clear the whole list.
 
 ```bash
-sudo fileshield-cli remove allow /usr/bin/kubectl <sha512> /home/user/.kube/config
-sudo fileshield-cli remove allow /usr/bin/kubectl <sha512>   # all targets
+# Remove every entry for one binary from the allowlist
+sudo jq '.entries |= map(select(.binary != "/usr/bin/kubectl"))' \
+    /var/lib/fileshield/runtime-allowlist.json > /tmp/ra.json \
+    && sudo mv /tmp/ra.json /var/lib/fileshield/runtime-allowlist.json
+
+# Clear all persisted entries
+sudo rm /var/lib/fileshield/runtime-allowlist.json
+sudo rm /var/lib/fileshield/runtime-denylist.json
+
 sudo systemctl reload fileshield
 ```
 
-To clear all persisted entries:
+To view the current persisted entries:
 
 ```bash
-sudo rm /var/lib/fileshield/runtime-allowlist.json
-sudo rm /var/lib/fileshield/runtime-denylist.json
-sudo systemctl restart fileshield
-```
-
-To view the current persisted entries (`fileshield-cli list` columns: ID, Binary, Target, Command, Call chain, SHA-512):
-
-```bash
-cat /var/lib/fileshield/runtime-allowlist.json | jq .
-cat /var/lib/fileshield/runtime-denylist.json | jq .
+sudo cat /var/lib/fileshield/runtime-allowlist.json | jq .
+sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 ```
 
 ---
@@ -324,7 +340,7 @@ cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode (opening one through a hard link outside the watched directories still prompts). Files created after startup are matched by their canonical path; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
-- **Command-line matching**: permanent *Always* entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use *Allow Session* or *Allow Once* for those, or remove the entry with `fileshield-cli remove`.
+- **Command-line matching**: permanent *Always* entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use *Allow Session* or *Allow Once* for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
 
 ---
 
