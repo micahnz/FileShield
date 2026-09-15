@@ -22,7 +22,7 @@
 #include "utils.h"
 
 /*
- * Fanotify fd stored here so run_kdialog_3choice() can pump pending events
+ * Fanotify fd stored here so run_kdialog() can pump pending events
  * while waiting for the dialog child (prevents mount-mark deadlock).
  */
 static int g_fan_fd = -1;
@@ -455,20 +455,25 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
 }
 
 /*
- * run_kdialog_3choice: display a kdialog --yesnocancel prompt with custom
- * button labels and return the chosen button:
- *   0 = yes, 1 = no, 2 = cancel/window close, -1 = failure/timeout.
+ * run_kdialog: show a kdialog --yesnocancel prompt with custom button
+ * labels and return 0 = yes, 1 = no, 2 = cancel/window close,
+ * -1 = failure/timeout.
  *
  * kdialog is wrapped in timeout(1) so a hung compositor cannot block the
  * event loop forever.  While waiting, pending fanotify events are pumped:
  * kdialog opens its own config files, which can generate FAN_OPEN_PERM
  * events on mount-marked filesystems and would otherwise deadlock the
  * helper behind the daemon's blocked event.
+ *
+ * kdialog returns 1 both for a deliberate No click and for some runtime
+ * errors.  The stage-2 scope dialogs map No to the permanent "Always"
+ * choice by explicit UX decision (documented trade-off in the README);
+ * timeouts, exec failures and Cancel/window close always deny.
  */
-static int run_kdialog_3choice(const DisplaySession *session,
-                               const DialogEnvSetting *env, int env_count,
-                               const char *text, const char *yes_label,
-                               const char *no_label, const char *cancel_label)
+static int run_kdialog(const DisplaySession *session,
+                       const DialogEnvSetting *env, int env_count,
+                       const char *text, const char *yes_label,
+                       const char *no_label, const char *cancel_label)
 {
     pid_t pid = fork();
     if (pid < 0)
@@ -566,7 +571,6 @@ static int run_kdialog_3choice(const DisplaySession *session,
         return -1;
 
     int ec = WEXITSTATUS(status);
-
     if (ec == 124) /* coreutils timeout(1) */
     {
         log_msg(LOG_WARNING, "[dialog] kdialog timed out (30s)");
@@ -575,7 +579,7 @@ static int run_kdialog_3choice(const DisplaySession *session,
     if (ec == 0)
         return 0; /* Yes */
     if (ec == 1)
-        return 1; /* No */
+        return 1; /* No click, or a runtime error: see the comment above */
     if (ec == 2)
         return 2; /* Cancel / window close / Escape */
     return -1;
@@ -603,54 +607,102 @@ const char *notify_decision_name(int decision)
 }
 
 /*
- * Stage 2 after "Allow": pick the grant scope.  Returns a NOTIFY_* code;
- * a Cancel click (or any dialog failure) denies this attempt.
+ * Sanitized, bounded copies of the requester fields, safe to place in a
+ * dialog: control characters cannot forge extra lines.
+ */
+typedef struct
+{
+    char comm[64];
+    char pcomm[64];
+    char cmd[256];
+    char exe[512];
+    char path[512];
+} PromptText;
+
+/*
+ * Stage 2 after "Allow": pick the grant scope.  Returns a NOTIFY_* code.
+ *
+ * Button mapping (as specified): Yes = Allow Session, No = Allow Always,
+ * Cancel = deny this attempt.  kdialog returns 1 both for a deliberate No
+ * and for some runtime errors, so a dialog that fails with exit 1 can
+ * create a permanent rule; timeouts (124), exec failures (127) and
+ * Cancel/window close (2) all deny, and the trade-off is documented in
+ * the README.  "Allow Session" matches the POSIX session + this binary
+ * (+ its SHA-512) + this exact file, so the body spells that out rather
+ * than implying the file is unlocked for everyone.
  */
 static int ask_grant_scope(const DisplaySession *session,
                            const DialogEnvSetting *env, int env_count,
-                           const char *path_s)
+                           const PromptText *t, pid_t pid, int session_ttl)
 {
-    char msg[1024];
+    char body[2048];
+    char session_bullet[160];
 
-    snprintf(msg, sizeof(msg),
+    if (session_ttl > 0)
+        snprintf(session_bullet, sizeof(session_bullet),
+                 "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this binary and file "
+                 "for up to %d seconds", session_ttl);
+    else
+        snprintf(session_bullet, sizeof(session_bullet),
+                 "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this binary and file "
+                 "until this session ends");
+
+    snprintf(body, sizeof(body),
              "Allow access to:\n"
              "%s\n\n"
-             "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this file until this session closes\n"
-             "\xe2\x80\xa2 Allow Always  \xe2\x80\x94 this file permanently\n"
-             "                  (re-prompts if the binary changes)\n"
-             "\xe2\x80\xa2 Cancel        \xe2\x80\x94 deny this time",
-             path_s);
+             "Requested by: %s (PID %d)\n"
+             "Binary:   %s\n"
+             "Command:  %s\n\n"
+             "%s\n"
+             "\xe2\x80\xa2 Allow Always \xe2\x80\x94 this file, this command and "
+             "its call chain, permanently\n"
+             "\xe2\x80\xa2 Deny         \xe2\x80\x94 deny this time",
+             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet);
 
-    int r = run_kdialog_3choice(session, env, env_count, msg,
-                                "Allow Session", "Allow Always", "Cancel");
+    int r = run_kdialog(session, env, env_count, body,
+                            "Allow Session", "Allow Always", "Deny");
     if (r == 0)
         return NOTIFY_ALLOW_SESSION;
     if (r == 1)
         return NOTIFY_ALLOW_ALWAYS;
-    return NOTIFY_DENY;
+    return NOTIFY_DENY; /* Cancel, window close or failure */
 }
 
 /*
  * Stage 2 after an explicit "Deny": pick the deny scope.  Returns a
- * NOTIFY_* code; anything but a clean choice denies this attempt.
+ * NOTIFY_* code; Yes = Deny Session, No = Deny Always, Cancel = deny
+ * once.  Denial is always the safe direction, so any failure denies.
  */
 static int ask_deny_scope(const DisplaySession *session,
                           const DialogEnvSetting *env, int env_count,
-                          const char *path_s)
+                          const PromptText *t, pid_t pid, int session_ttl)
 {
-    char msg[1024];
+    char body[2048];
+    char session_bullet[160];
 
-    snprintf(msg, sizeof(msg),
+    if (session_ttl > 0)
+        snprintf(session_bullet, sizeof(session_bullet),
+                 "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this binary and file "
+                 "for up to %d seconds", session_ttl);
+    else
+        snprintf(session_bullet, sizeof(session_bullet),
+                 "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this binary and file "
+                 "until this session ends");
+
+    snprintf(body, sizeof(body),
              "Deny access to:\n"
              "%s\n\n"
-             "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this file until this session closes\n"
-             "\xe2\x80\xa2 Deny Always  \xe2\x80\x94 this file permanently\n"
-             "                 (runtime-denylist.json)\n"
-             "\xe2\x80\xa2 Deny         \xe2\x80\x94 this time only",
-             path_s);
+             "Requested by: %s (PID %d)\n"
+             "Binary:   %s\n"
+             "Command:  %s\n\n"
+             "%s\n"
+             "\xe2\x80\xa2 Deny Always \xe2\x80\x94 this file, this command and "
+             "its call chain, permanently\n"
+             "\xe2\x80\xa2 Deny Once   \xe2\x80\x94 block this attempt",
+             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet);
 
-    int r = run_kdialog_3choice(session, env, env_count, msg,
-                                "Deny Session", "Deny Always", "Deny");
+    int r = run_kdialog(session, env, env_count, body,
+                            "Deny Session", "Deny Always", "Deny Once");
     if (r == 0)
         return NOTIFY_DENY_SESSION;
     if (r == 1)
@@ -658,52 +710,66 @@ static int ask_deny_scope(const DisplaySession *session,
     return NOTIFY_DENY;
 }
 
-int notify_ask(const char *comm, pid_t pid, pid_t ppid,
-               const char *comm_parent, const char *exe,
-               const char *cmdline, const char *path, uid_t user_uid)
+int notify_ask(const NotifyRequest *req)
 {
     /* Return values: NOTIFY_ALLOW_ONCE, NOTIFY_DENY,
      *                NOTIFY_ALLOW_SESSION, NOTIFY_DENY_SESSION,
      *                NOTIFY_ALLOW_ALWAYS, NOTIFY_DENY_ALWAYS. */
+    if (!req)
+        return NOTIFY_DENY;
+
+    PromptText t;
     char msg[2048];
-    char comm_s[64];
-    char pcomm_s[64];
-    char cmd_s[256];
-    char exe_s[512];
-    char path_s[512];
+    char once_bullet[160];
 
     /* Attacker-controlled strings (file names, comm, cmdline) are
      * sanitized so control characters cannot forge dialog content. */
-    sanitize_text(comm, comm_s, sizeof(comm_s));
-    sanitize_text(comm_parent, pcomm_s, sizeof(pcomm_s));
-    sanitize_text(exe ? exe : "(unknown)", exe_s, sizeof(exe_s));
-    sanitize_text(path, path_s, sizeof(path_s));
-    sanitize_text(cmdline && cmdline[0] != '\0' ? cmdline : "(unknown)",
-                  cmd_s, sizeof(cmd_s));
+    sanitize_text(req->comm, t.comm, sizeof(t.comm));
+    sanitize_text(req->comm_parent, t.pcomm, sizeof(t.pcomm));
+    sanitize_text(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
+                  t.exe, sizeof(t.exe));
+    sanitize_text(req->path, t.path, sizeof(t.path));
+    sanitize_text(req->cmdline && req->cmdline[0] != '\0' ? req->cmdline
+                                                          : "(unknown)",
+                  t.cmd, sizeof(t.cmd));
 
-    if (exe && strlen(exe) >= sizeof(exe_s) - 1)
-        memcpy(exe_s + sizeof(exe_s) - 4, "...", 4);
-    if (path && strlen(path) >= sizeof(path_s) - 1)
-        memcpy(path_s + sizeof(path_s) - 4, "...", 4);
-    if (cmdline && strlen(cmdline) >= sizeof(cmd_s) - 1)
-        memcpy(cmd_s + sizeof(cmd_s) - 4, "...", 4);
+    if (req->exe && strlen(req->exe) >= sizeof(t.exe) - 1)
+        memcpy(t.exe + sizeof(t.exe) - 4, "...", 4);
+    if (req->path && strlen(req->path) >= sizeof(t.path) - 1)
+        memcpy(t.path + sizeof(t.path) - 4, "...", 4);
+    if (req->cmdline && strlen(req->cmdline) >= sizeof(t.cmd) - 1)
+        memcpy(t.cmd + sizeof(t.cmd) - 4, "...", 4);
 
+    /* "Allow once" is keyed by PID + binary + file for user_ttl. */
+    if (req->user_ttl > 0)
+        snprintf(once_bullet, sizeof(once_bullet),
+                 "\xe2\x80\xa2 Allow Once \xe2\x80\x94 this file for %d seconds "
+                 "(this process)", req->user_ttl);
+    else
+        snprintf(once_bullet, sizeof(once_bullet),
+                 "\xe2\x80\xa2 Allow Once \xe2\x80\x94 this file (this process)");
+
+    /* Stage 1: everything known about the requester and the access, plus
+     * what each button does.  No grant is bound to a non-Yes outcome:
+     * "Allow..." only opens the scope dialog, and a failed dialog denies. */
     snprintf(msg, sizeof(msg),
              "Process %s (PID %d, parent: %s (PID %d)) wants to read:\n"
              "%s\n\n"
              "Binary:   %s\n"
              "Command:  %s\n\n"
-             "\xe2\x80\xa2 Allow Once \xe2\x80\x94 this file, for the configured user_ttl\n"
-             "\xe2\x80\xa2 Allow      \xe2\x80\x94 choose session or permanent access\n"
-             "\xe2\x80\xa2 Deny       \xe2\x80\x94 choose a session or permanent block",
-             comm_s, (int)pid, pcomm_s, (int)ppid,
-             path_s, exe_s, cmd_s);
+             "%s\n"
+             "\xe2\x80\xa2 Allow      \xe2\x80\x94 choose session or permanent "
+             "access\n"
+             "\xe2\x80\xa2 Deny       \xe2\x80\x94 choose this time, session or "
+             "permanent",
+             t.comm, (int)req->pid, t.pcomm, (int)req->ppid,
+             t.path, t.exe, t.cmd, once_bullet);
 
     /* Auto-detect the active graphical session if env vars are not set.
      * The daemon itself is never modified: the session is applied by the
      * dialog child, per prompt. */
     DisplaySession session;
-    int have_session = detect_display_session(user_uid, &session);
+    int have_session = detect_display_session(req->user_uid, &session);
     log_msg(LOG_DEBUG,
             "[notify_ask] session: uid=%d wayland=%s display=%s",
             (int)session.uid,
@@ -715,36 +781,29 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
     {
         log_msg(LOG_ERR,
                 "no non-root desktop session found; denying access to %s",
-                path_s);
+                t.path);
         return NOTIFY_DENY;
     }
 
     /* Forward the user's theme/font/scale/locale environment so kdialog
      * renders like the rest of their desktop. */
     DialogEnvSetting dialog_env[DIALOG_ENV_MAX];
-    int dialog_env_count = collect_dialog_env(pid, dialog_env, DIALOG_ENV_MAX);
+    int dialog_env_count = collect_dialog_env(req->pid, dialog_env,
+                                              DIALOG_ENV_MAX);
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    /* First dialog: Allow Once / Allow / Deny.  A failure (timeout, exec
-     * error) denies once without a follow-up prompt; only an explicit
-     * Deny click opens the deny-scope dialog. */
-    int r = run_kdialog_3choice(&session, dialog_env, dialog_env_count, msg,
-                                "Allow Once", "Allow", "Deny");
+    int r = run_kdialog(&session, dialog_env, dialog_env_count, msg,
+                            "Allow Once", "Allow\xe2\x80\xa6",
+                            "Deny\xe2\x80\xa6");
     if (r == 0)
         return NOTIFY_ALLOW_ONCE;
-
     if (r == 1)
-    {
-        /* Allow: choose how broad/long the grant should be.  Allow Always
-         * is on the No button per the approved UX; a broken kdialog that
-         * exits 1 without user interaction is a known accepted risk. */
-        return ask_grant_scope(&session, dialog_env, dialog_env_count,
-                               path_s);
-    }
-
+        return ask_grant_scope(&session, dialog_env, dialog_env_count, &t,
+                               req->pid, req->session_ttl);
     if (r == 2)
-        return ask_deny_scope(&session, dialog_env, dialog_env_count, path_s);
+        return ask_deny_scope(&session, dialog_env, dialog_env_count, &t,
+                              req->pid, req->session_ttl);
 
     log_msg(LOG_WARNING, "[dialog] no valid kdialog choice; denying once");
     return NOTIFY_DENY;

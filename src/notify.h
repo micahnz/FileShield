@@ -4,12 +4,32 @@
 #include <sys/types.h>
 
 /* Return values for notify_ask(). */
-#define NOTIFY_ALLOW_ONCE 0    /* cache this file for the process (user_ttl) */
-#define NOTIFY_DENY 1          /* block this attempt only                     */
-#define NOTIFY_ALLOW_ALWAYS 2  /* persistent runtime allowlist entry          */
-#define NOTIFY_DENY_ALWAYS 3   /* persistent runtime denylist entry           */
-#define NOTIFY_ALLOW_SESSION 4 /* allow this file until the session ends      */
-#define NOTIFY_DENY_SESSION 5  /* deny this file until the session ends       */
+#define NOTIFY_ALLOW_ONCE 0    /* cache this file for the process (user_ttl)    */
+#define NOTIFY_DENY 1          /* block this attempt only                       */
+#define NOTIFY_ALLOW_ALWAYS 2  /* persistent runtime allowlist entry            */
+#define NOTIFY_DENY_ALWAYS 3   /* persistent runtime denylist entry             */
+#define NOTIFY_ALLOW_SESSION 4 /* allow this binary+file until the session ends */
+#define NOTIFY_DENY_SESSION 5  /* deny this binary+file until the session ends  */
+
+/*
+ * One prompt: everything the dialogs need to describe the access and to
+ * label the scope choices accurately.  Strings are borrowed from the
+ * caller for the duration of the call; notify_ask() sanitizes and bounds
+ * them before they reach kdialog.
+ */
+typedef struct
+{
+    const char *comm;        /* requester process name                    */
+    pid_t pid;
+    pid_t ppid;
+    const char *comm_parent; /* parent process name                       */
+    const char *exe;         /* binary path; NULL/"" = unknown            */
+    const char *cmdline;     /* display command line; "" = unknown        */
+    const char *path;        /* target file                               */
+    uid_t user_uid;          /* real uid of the requester                 */
+    int user_ttl;            /* "Allow once" TTL in seconds (display only) */
+    int session_ttl;         /* session cap in seconds; 0 = session life   */
+} NotifyRequest;
 
 /*
  * Store the fanotify fd so notify_ask() can pump pending events while the
@@ -17,9 +37,7 @@
  */
 void notify_set_fan_fd(int fd);
 
-int notify_ask(const char *comm, pid_t pid, pid_t ppid,
-               const char *comm_parent, const char *exe,
-               const char *cmdline, const char *path, uid_t user_uid);
+int notify_ask(const NotifyRequest *req);
 
 /* Human-readable name of a NOTIFY_* decision code ("Allow Once"). */
 const char *notify_decision_name(int decision);

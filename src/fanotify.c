@@ -1683,9 +1683,21 @@ static void event_ask_user(EventCtx *c)
 
     log_msg(LOG_INFO, "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
             (int)c->ev->pid, c->binary, c->target, c->comm);
-    int decision = notify_ask(c->comm, c->ev->pid, c->ppid, c->pcomm,
-                              c->binary, c->cmdline, c->target,
-                              proc_uid(c->ev->pid));
+
+    NotifyRequest req;
+    memset(&req, 0, sizeof(req));
+    req.comm = c->comm;
+    req.pid = c->ev->pid;
+    req.ppid = c->ppid;
+    req.comm_parent = c->pcomm;
+    req.exe = c->binary;
+    req.cmdline = c->cmdline;
+    req.path = c->target;
+    req.user_uid = proc_uid(c->ev->pid);
+    req.user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+    req.session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+
+    int decision = notify_ask(&req);
     log_msg(LOG_INFO, "[dialog] user chose %s for %s (pid %d) -> %s",
             notify_decision_name(decision), c->binary, (int)c->ev->pid,
             c->target);

