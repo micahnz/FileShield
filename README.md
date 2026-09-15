@@ -9,8 +9,8 @@
 ## Features
 
 - **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
-- **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed (zenity is not supported); the dialog inherits your session's Qt theme, fonts and scaling.
-- **Scoped decisions**: *Allow Once* is file-scoped with a `user_ttl`; *Allow Session* lasts until you close the terminal; *Allow Always* is a persistent per-file rule bound to the binary hash, call chain and exact command line. Matching deny scopes exist too.
+- **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed; the dialog inherits your session's Qt theme, fonts and scaling.
+- **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ lasts until you close the terminal; _Allow Always_ is a persistent per-file rule bound to the binary hash, call chain and exact command line. Matching deny scopes exist too.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
 
 ---
@@ -93,7 +93,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted *Always Allow* / *Always Deny* lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted _Always Allow_ / _Always Deny_ lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
 
 ### Default Protected Paths
 
@@ -155,8 +155,8 @@ Add entries only for tools you have audited and trust at that exact path:
 # /usr/bin/gpg       = ~/.gnupg/
 ```
 
-- A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. Matching is *equal or under*: `/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it; a bare file target covers exactly that file.
-- A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access *every* protected path. This is the most dangerous form — use it sparingly.
+- A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. Matching is _equal or under_: `/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it; a bare file target covers exactly that file.
+- A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access _every_ protected path. This is the most dangerous form — use it sparingly.
 - A binary may appear on **multiple lines** with different targets when it needs exceptions for more than one file or folder.
 - `~` in binary and target paths expands for every user's home, the same way `[protected_paths]` do.
 - Rules no longer carry a per-entry TTL: repeated opens refresh the file cache for `user_ttl` seconds (see [Settings](#settings)).
@@ -221,7 +221,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
    • Cancel        — deny this time
    ```
 
-   Clicking **Deny** opens the matching deny stage: *Deny Session / Deny Always / Deny*.
+   Clicking **Deny** opens the matching deny stage: _Deny Session / Deny Always / Deny_.
 
 3. **Deny** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
 4. **Allow Once** → `FAN_ALLOW` — access is granted and cached for this process and this exact file for `user_ttl` seconds.
@@ -230,16 +230,16 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 
 ### Decision Scopes
 
-| Choice | Matches on | Lifetime | Persisted |
-| --- | --- | --- | --- |
-| Allow Once | PID + binary + exact file | `user_ttl` seconds | no |
-| Allow Session | POSIX session + binary (+ SHA-512) + exact file | until the shell/session leader exits, capped by `session_ttl` | no |
-| Allow Always | binary SHA-512 + call chain + exact file + exact command line | until removed | `runtime-allowlist.json` |
-| Deny Session | same key shape as Allow Session | same as Allow Session | no |
-| Deny Always | same key shape as Allow Always | until removed | `runtime-denylist.json` |
-| Deny | — | this attempt only | no |
+| Choice        | Matches on                                                    | Lifetime                                                      | Persisted                |
+| ------------- | ------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------ |
+| Allow Once    | PID + binary + exact file                                     | `user_ttl` seconds                                            | no                       |
+| Allow Session | POSIX session + binary (+ SHA-512) + exact file               | until the shell/session leader exits, capped by `session_ttl` | no                       |
+| Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                 | `runtime-allowlist.json` |
+| Deny Session  | same key shape as Allow Session                               | same as Allow Session                                         | no                       |
+| Deny Always   | same key shape as Allow Always                                | until removed                                                 | `runtime-denylist.json`  |
+| Deny          | —                                                             | this attempt only                                             | no                       |
 
-Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached *Allow Once*. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog.
+Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog.
 
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
@@ -247,16 +247,16 @@ Denials are always checked before grants, so a config, session or permanent deni
 
 Clicking **Always Allow** stores a fingerprinted, file- and command-scoped entry in the daemon's in-memory allowlist **and persists it to disk** for reuse after daemon restart or reboot:
 
-| Attribute checked on every future match | Why |
-| --- | --- |
-| Binary path | Basic identity |
-| **SHA-512 of the binary** | Detects on-disk replacement (supply-chain attack) |
-| **Call chain** (up to 3 ancestors) | Prevents a different caller from inheriting the rule |
-| **SHA-512 of each ancestor exe** | Detects replaced parent binaries |
-| **Target file** | Least privilege: approving `kubectl` for `~/.kube/config` does not grant `~/.ssh/id_rsa` |
+| Attribute checked on every future match       | Why                                                                                                                      |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Binary path                                   | Basic identity                                                                                                           |
+| **SHA-512 of the binary**                     | Detects on-disk replacement (supply-chain attack)                                                                        |
+| **Call chain** (up to 3 ancestors)            | Prevents a different caller from inheriting the rule                                                                     |
+| **SHA-512 of each ancestor exe**              | Detects replaced parent binaries                                                                                         |
+| **Target file**                               | Least privilege: approving `kubectl` for `~/.kube/config` does not grant `~/.ssh/id_rsa`                                 |
 | **Command line** (stored, matched by SHA-512) | Only the exact invocation, arguments included, stays silent: `kubectl get pods` does not authorize `kubectl get secrets` |
 
-**Example:** clicking *Always Allow* for the popup shown above records:
+**Example:** clicking _Always Allow_ for the popup shown above records:
 
 ```text
 binary:         /usr/bin/curl     (sha512: a3f1…)
@@ -272,7 +272,7 @@ A future `curl` call from `zsh` instead of `bash` will prompt again because the 
 
 #### Persistence
 
-*Always Allow* and *Always Deny* entries are stored in JSON state files (`/var/lib/fileshield/runtime-allowlist.json` and `/var/lib/fileshield/runtime-denylist.json`) with strict permissions (mode 0600, root-only). The entries are:
+_Always Allow_ and _Always Deny_ entries are stored in JSON state files (`/var/lib/fileshield/runtime-allowlist.json` and `/var/lib/fileshield/runtime-denylist.json`) with strict permissions (mode 0600, root-only). The entries are:
 
 - **Automatically loaded** when the daemon starts (on reboot, after systemctl restart, etc.)
 - **Immediately saved** when you click "Always Allow" / "Deny Always" (no manual action needed)
@@ -340,7 +340,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode (opening one through a hard link outside the watched directories still prompts). Files created after startup are matched by their canonical path; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
-- **Command-line matching**: permanent *Always* entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use *Allow Session* or *Allow Once* for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
+- **Command-line matching**: permanent _Always_ entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use _Allow Session_ or _Allow Once_ for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
 
 ---
 
@@ -378,11 +378,11 @@ journalctl -u fileshield --since "2026-05-26 09:00" --until "2026-05-26 10:00"
 
 The daemon logs at the following levels:
 
-| Level | Events |
-| ------- | -------- |
-| `INFO` | Start/stop, config load, fanotify marks added/removed, reload, runtime allow/deny hits and additions |
+| Level     | Events                                                                                                                   |
+| --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, runtime allow/deny hits and additions                     |
 | `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable |
-| `ERR` | `fanotify_init` failure, config parse error, fork/exec failure |
+| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                           |
 
 ---
 
@@ -448,9 +448,9 @@ Runs `cppcheck` over all sources in `src/` and `tests/`. Requires `cppcheck` to 
 
 ## Troubleshooting
 
-- **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). zenity is not supported; if kdialog is missing or fails, access is denied (fail closed).
+- **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). if kdialog is missing or fails, access is denied (fail closed).
 - **Dialog does not match your theme?** The daemon runs as root with a bare environment, so FileShield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
-- **Dialog behavior on failure**: timeouts, exec failures and unexpected kdialog exit codes deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — this is a documented, accepted trade-off; *Allow Session* remains available and exec failures/timeouts always fail closed.
+- **Dialog behavior on failure**: timeouts, exec failures and unexpected kdialog exit codes deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — this is a documented, accepted trade-off; _Allow Session_ remains available and exec failures/timeouts always fail closed.
 - **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.
