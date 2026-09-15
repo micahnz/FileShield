@@ -1,5 +1,27 @@
 # FileShield
 
+> **Fork notice:** This repository was originally forked from
+> [YoranSys/FileShield](https://github.com/YoranSys/FileShield), but it has
+> diverged significantly and is for all intents and purposes a new project. It
+> uses a different permission model.
+
+## Purpose
+
+FileShield is an additional layer of defense for machines where LLM agents run
+with filesystem access. It watches sensitive files (cloud credentials, SSH
+keys, kubeconfig, API tokens, ...) and asks the operator before a process reads
+one — so an agent accidentally pulling `~/.aws/credentials` into a prompt, an
+upload, or a log is stopped and surfaced instead of going unnoticed.
+
+It is **not a definitive security tool**: I am not a security expert and I
+cannot guarantee that FileShield cannot be bypassed. It is not a substitute for
+sandboxing, least-privilege users, or a secret manager. Its value is as a
+backstop — when other harness or sandbox measures fail, FileShield at least
+notifies the operator that a sensitive file is being read and blocks it until
+explicit approval is given.
+
+## What it does
+
 **FileShield** is a Linux security tool that intercepts and blocks file access to sensitive files (e.g., AWS secrets, SSH keys, kubeconfig) before the read completes, then prompts the user to allow or deny it. It is built on **`fanotify` permission events** — the same kernel mechanism used by Linux antivirus scanners.
 
 > Unlike approaches based on `inotify` or `auditd` alone, FileShield uses `FAN_OPEN_PERM` events which suspend the syscall in the kernel until a decision is made. The file data is never read by the requesting process until you click Allow.
@@ -247,13 +269,13 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 
 ### Decision Scopes
 
-| Choice        | Matches on                                                    | Lifetime                                                      | Persisted                |
-| ------------- | ------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------ |
-| Allow Once    | PID + binary + exact file                                     | `user_ttl` seconds                                            | no                       |
-| Allow Session | POSIX session + binary (+ SHA-512) + exact file               | until the shell/session leader exits, capped by `session_ttl` | no                       |
-| Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                 | `runtime-allowlist.json` |
-| Deny Session  | same key shape as Allow Session                               | same as Allow Session                                         | no                       |
-| Deny Always   | same key shape as Allow Always                                | until removed                                                 | `runtime-denylist.json`  |
+| Choice        | Matches on                                                    | Lifetime                                                          | Persisted                |
+| ------------- | ------------------------------------------------------------- | ----------------------------------------------------------------- | ------------------------ |
+| Allow Once    | PID + binary + exact file                                     | `user_ttl` seconds                                                | no                       |
+| Allow Session | POSIX session + binary (+ SHA-512) + exact file               | until the shell/session leader exits, capped by `session_ttl`     | no                       |
+| Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                     | `runtime-allowlist.json` |
+| Deny Session  | same key shape as Allow Session                               | same as Allow Session                                             | no                       |
+| Deny Always   | same key shape as Allow Always                                | until removed                                                     | `runtime-denylist.json`  |
 | Deny          | —                                                             | this attempt (rapid retries of the same open are denied for ~2 s) | no                       |
 
 Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link.
@@ -386,12 +408,12 @@ survive a `SIGHUP` config reload for the settings key.
 
 The daemon logs at the following levels:
 
-| Level     | Events                                                                                                                   |
-| --------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)     |
+| Level     | Events                                                                                                                                                                            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)                                                             |
 | `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug` |
-| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable, hard-link prompts |
-| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                           |
+| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable, hard-link prompts                                       |
+| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                                                                                    |
 
 ### Follow live events
 
