@@ -108,7 +108,8 @@ static char *resolve_fd_path(int fd_num)
 /*
  * Read /proc/<pid>/cmdline and collapse null separators into spaces.
  * Returns the number of bytes written (excluding the terminating '\0'),
- * or -1 on error.
+ * or -1 on error.  This is the bounded DISPLAY form; matching uses
+ * read_cmdline_fingerprint() over the full raw bytes.
  */
 static int read_cmdline(pid_t pid, char *out, size_t size)
 {
@@ -132,6 +133,61 @@ static int read_cmdline(pid_t pid, char *out, size_t size)
     while (n > 0 && out[n - 1] == ' ')
         out[--n] = '\0';
     return (int)n;
+}
+
+/*
+ * Upper bound for the raw command line consumed by the fingerprint.  The
+ * display form is capped at 512 bytes, but the fingerprint must cover the
+ * full invocation: hashing only a prefix let one approved command cover a
+ * different command that shared that prefix (e.g. a padded argument
+ * followed by a different URL).  64 KB is far beyond any practical
+ * invocation while keeping the read and hash bounded.
+ */
+#define CMDLINE_FP_MAX (64 * 1024)
+
+/*
+ * Fingerprint the FULL raw command line of pid (bounded by
+ * CMDLINE_FP_MAX).  The NUL-separated bytes are hashed as-is, so two
+ * invocations that differ anywhere inside the bound get different
+ * fingerprints.  Returns 0 on success, -1 when the cmdline is unreadable
+ * or empty (callers fail closed).
+ */
+static int read_cmdline_fingerprint(pid_t pid, char hex_out[129])
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+
+    char *buf = malloc(CMDLINE_FP_MAX);
+    if (!buf)
+    {
+        close(fd);
+        return -1;
+    }
+
+    size_t total = 0;
+    while (total < CMDLINE_FP_MAX)
+    {
+        ssize_t n = read(fd, buf + total, CMDLINE_FP_MAX - total);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            total = 0;
+            break;
+        }
+        if (n == 0)
+            break;
+        total += (size_t)n;
+    }
+    close(fd);
+
+    int rc = (total > 0) ? sha512_buf(buf, total, hex_out) : -1;
+    free(buf);
+    return rc;
 }
 
 /*
@@ -563,17 +619,14 @@ static void load_dyn_list(DynEntry *list, int *list_count,
  *   - Call-chain depth must match exactly.
  *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
  *     they must be equal; if stored has one but current is missing, DENY.
- *   - The command-line fingerprint must match.  It is computed lazily,
- *     only after every cheaper key has matched, so unrelated events never
- *     pay for a sha512sum run.
+ *   - The command-line fingerprint (of the full raw cmdline) must match.
+ *     The caller computes it lazily, only after every cheaper key has
+ *     matched, so unrelated events never pay for the hash.
  */
 static int dyn_allow_match(const char *binary, const char *bin_sha512,
                            const ProcChain *chain, const char *target,
-                           const char *cmdline)
+                           const char *cmdline_fp)
 {
-    char current_cmd[129] = "";
-    int cmd_state = 0; /* 0 = not computed, 1 = computed, -1 = failed */
-
     if (!target || target[0] == '\0')
         return 0;
 
@@ -628,17 +681,11 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
         if (!ok)
             continue;
 
-        if (cmd_state == 0)
-        {
-            if (!cmdline || cmdline[0] == '\0' ||
-                sha512_string(cmdline, current_cmd) != 0)
-                cmd_state = -1;
-            else
-                cmd_state = 1;
-        }
-        if (cmd_state < 0)
-            return 0; /* cannot verify the invocation — fail closed */
-        if (strcmp(e->cmdline_sha512, current_cmd) != 0)
+        /* The exact invocation must match.  An unavailable fingerprint
+         * means the invocation cannot be verified — fail closed. */
+        if (!cmdline_fp || cmdline_fp[0] == '\0')
+            return 0;
+        if (strcmp(e->cmdline_sha512, cmdline_fp) != 0)
             continue;
         return 1;
     }
@@ -728,16 +775,14 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
  *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
  *     they must be equal; if stored has one but current is missing, skip
  *     (preserve allow — we cannot verify the ancestor).
- *   - The command-line fingerprint must match; if it cannot be computed
- *     the entry is skipped and the user is re-prompted.
+ *   - The command-line fingerprint (of the full raw cmdline) must match;
+ *     if it cannot be computed the entry is skipped and the user is
+ *     re-prompted.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
                           const ProcChain *chain, const char *target,
-                          const char *cmdline)
+                          const char *cmdline_fp)
 {
-    char current_cmd[129] = "";
-    int cmd_state = 0; /* 0 = not computed, 1 = computed, -1 = failed */
-
     if (!target || target[0] == '\0')
         return 0;
 
@@ -787,20 +832,13 @@ static int dyn_deny_match(const char *binary, const char *bin_sha512,
         if (!ok)
             continue;
 
-        /* An entry that cannot pin the command must not deny anything. */
+        /* An entry that cannot pin the command must not deny anything,
+         * and an unverifiable current invocation is re-prompted. */
         if (e->cmdline_sha512[0] == '\0')
             continue;
-        if (cmd_state == 0)
-        {
-            if (!cmdline || cmdline[0] == '\0' ||
-                sha512_string(cmdline, current_cmd) != 0)
-                cmd_state = -1;
-            else
-                cmd_state = 1;
-        }
-        if (cmd_state < 0)
+        if (!cmdline_fp || cmdline_fp[0] == '\0')
             continue; /* cannot verify the invocation: re-prompt */
-        if (strcmp(e->cmdline_sha512, current_cmd) != 0)
+        if (strcmp(e->cmdline_sha512, cmdline_fp) != 0)
             continue;
         return 1;
     }
@@ -1407,18 +1445,52 @@ typedef struct
     dev_t ev_dev;
     ino_t ev_ino;
 
+    /* Cached prefix verdict: the target path needs it in the fast path,
+     * the hard-link classification and the prompt policy, and the
+     * protected set can hold hundreds of entries. */
+    int path_protected;
+
+    /* Set when a protected inode is opened through a path outside every
+     * protected prefix (hard link / unverifiable path): grants are then
+     * skipped and the user is prompted for this exact path. */
+    int hardlink_event;
+
     /* Requester identity, gathered after the pre-hash deny checks. */
     pid_t ppid;
     char comm[256];
     char pcomm[256];
-    char cmdline[512];
+    char cmdline[512];        /* display form (NUL-collapsed, bounded)     */
     char bin_sha512[129];
-    char cmdline_sha512[129];
+    char cmdline_sha512[129]; /* full raw cmdline, computed lazily          */
+    int cmdline_sha_state;    /* 0 = not computed, 1 = computed, -1 = failed */
     ProcChain chain;
     pid_t sid;
     unsigned long long sid_start;
     int have_sid;
 } EventCtx;
+
+/*
+ * Lazily fingerprint the requester's full command line.  Only the runtime
+ * matchers and permanent-decision recording call it, so cache/session
+ * hits never pay for the /proc read or the hash.  Returns the digest, or
+ * "" when it cannot be computed (callers fail closed).  The requesting
+ * process is kernel-suspended for the whole event, so its /proc entry
+ * stays valid between this read and the decision.
+ */
+static const char *event_cmdline_fp(EventCtx *c)
+{
+    if (c->cmdline_sha_state == 0)
+    {
+        if (read_cmdline_fingerprint(c->ev->pid, c->cmdline_sha512) < 0)
+        {
+            c->cmdline_sha512[0] = '\0';
+            c->cmdline_sha_state = -1;
+        }
+        else
+            c->cmdline_sha_state = 1;
+    }
+    return c->cmdline_sha512;
+}
 
 /*
  * Every deciding stage funnels through here so the dedup-cache insert
@@ -1454,6 +1526,8 @@ static int event_resolve(EventCtx *c)
         fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
         return 1;
     }
+    /* Compute the protected-prefix verdict once; three later stages use it. */
+    c->path_protected = is_path_under_protected(c->target);
     log_msg(LOG_DEBUG, "[event] resolved target: pid=%d target=%s",
             (int)c->ev->pid, c->target);
     return 0;
@@ -1473,7 +1547,7 @@ static int event_fastpath(EventCtx *c)
         struct stat st;
         if (fstat(c->fd_num, &st) == 0 &&
             !inode_is_protected(st.st_dev, st.st_ino) &&
-            !is_path_under_protected(c->target))
+            !c->path_protected)
         {
             log_msg(LOG_DEBUG, "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
                     (int)c->ev->pid, c->target);
@@ -1515,10 +1589,14 @@ static int event_load_binary(EventCtx *c)
         return 1;
     }
 
-    /* Hard-link bypass detection: a path outside every protected prefix
-     * means the event came from the mount mark, i.e. a hard link. */
-    if (!is_path_under_protected(c->target))
+    /* Hard-link bypass attempt: a path outside every protected prefix
+     * means the event came from the mount mark rather than a directory
+     * mark.  Flag it so the grant stages skip every rule and the user is
+     * asked about this exact path; denies below and in the caller still
+     * win, so this only removes silently-inherited grants. */
+    if (!c->path_protected)
     {
+        c->hardlink_event = 1;
         log_msg(LOG_WARNING,
                 "hard-link bypass attempt: %s (pid %d) opened "
                 "protected inode via unprotected path \"%s\"",
@@ -1592,8 +1670,9 @@ static int event_runtime_denied(EventCtx *c)
         return 1;
     }
 
-    if (dyn_deny_match(c->binary, c->bin_sha512, &c->chain, c->target,
-                       c->cmdline))
+    if (g_dyn_deny_count > 0 &&
+        dyn_deny_match(c->binary, c->bin_sha512, &c->chain, c->target,
+                       event_cmdline_fp(c)))
     {
         log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
                 c->binary, (int)c->ev->pid, c->target);
@@ -1612,6 +1691,15 @@ static int event_runtime_denied(EventCtx *c)
  */
 static int event_runtime_allowed(EventCtx *c)
 {
+    /*
+     * A hard-link/unprotected-path event must not be resolved by a rule
+     * scoped to a different path (or by a wildcard grant): force the
+     * prompt so the user decides for this exact path.  Denials were
+     * already evaluated by the caller, so this strips grants only.
+     */
+    if (c->hardlink_event)
+        return 0;
+
     if (cache_lookup(c->ev->pid, c->binary, c->target) > 0)
     {
         ctx_respond(c, FAN_ALLOW);
@@ -1627,8 +1715,9 @@ static int event_runtime_allowed(EventCtx *c)
         return 1;
     }
 
-    if (dyn_allow_match(c->binary, c->bin_sha512, &c->chain, c->target,
-                        c->cmdline))
+    if (g_dyn_allow_count > 0 &&
+        dyn_allow_match(c->binary, c->bin_sha512, &c->chain, c->target,
+                        event_cmdline_fp(c)))
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
         cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
@@ -1688,11 +1777,11 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
     }
     else /* NOTIFY_ALLOW_ALWAYS */
     {
-        if (c->cmdline[0] != '\0' &&
-            sha512_string(c->cmdline, c->cmdline_sha512) == 0)
+        const char *cmdline_fp = event_cmdline_fp(c);
+        if (cmdline_fp[0] != '\0')
         {
             dyn_allow_add(c->binary, c->bin_sha512, &c->chain, c->target,
-                          c->cmdline, c->cmdline_sha512);
+                          c->cmdline, cmdline_fp);
         }
         else
         {
@@ -1734,11 +1823,11 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
     }
     else /* NOTIFY_DENY_ALWAYS */
     {
-        if (c->cmdline[0] != '\0' &&
-            sha512_string(c->cmdline, c->cmdline_sha512) == 0)
+        const char *cmdline_fp = event_cmdline_fp(c);
+        if (cmdline_fp[0] != '\0')
         {
             dyn_deny_add(c->binary, c->bin_sha512, &c->chain, c->target,
-                         c->cmdline, c->cmdline_sha512);
+                         c->cmdline, cmdline_fp);
         }
         else
         {
@@ -2202,17 +2291,22 @@ void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 /* ------------------------------------------------------------------ */
 
 int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
-                                  const char *target, const char *cmdline)
+                                  const char *target, const char *cmdline_fp)
 {
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
-    return dyn_allow_match(binary, bin_sha512, &chain, target, cmdline);
+    return dyn_allow_match(binary, bin_sha512, &chain, target, cmdline_fp);
 }
 
 int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
-                                 const char *target, const char *cmdline)
+                                 const char *target, const char *cmdline_fp)
 {
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
-    return dyn_deny_match(binary, bin_sha512, &chain, target, cmdline);
+    return dyn_deny_match(binary, bin_sha512, &chain, target, cmdline_fp);
+}
+
+int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129])
+{
+    return read_cmdline_fingerprint(pid, hex_out);
 }

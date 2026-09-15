@@ -370,23 +370,9 @@ int sha512_file(const char *path, char hex_out[129])
     return collect_digest(pipefd[0], pid, hex_out);
 }
 
-/*
- * In-process digest for in-memory fingerprints: no fork, validated
- * against sha512sum by test_sha512 (see the in-process SHA-512 comment
- * above for why file hashing keeps the helper).
- */
-int sha512_string(const char *str, char hex_out[129])
+/* Encode a raw 64-byte digest as 128 lower-case hex characters. */
+static void digest_to_hex(const unsigned char digest[64], char hex_out[129])
 {
-    if (!str)
-        return -1;
-
-    Sha512State s;
-    sha512_init(&s);
-    sha512_update(&s, (const unsigned char *)str, strlen(str));
-
-    unsigned char digest[64];
-    sha512_final(&s, digest);
-
     static const char HEX[] = "0123456789abcdef";
     for (int i = 0; i < 64; i++)
     {
@@ -394,7 +380,34 @@ int sha512_string(const char *str, char hex_out[129])
         hex_out[i * 2 + 1] = HEX[digest[i] & 0x0f];
     }
     hex_out[128] = '\0';
+}
+
+/*
+ * In-process digest for in-memory fingerprints: no fork, validated
+ * against sha512sum by test_sha512 (see the in-process SHA-512 comment
+ * above for why file hashing keeps the helper).
+ */
+int sha512_buf(const void *data, size_t len, char hex_out[129])
+{
+    if (!data)
+        return -1;
+
+    Sha512State s;
+    sha512_init(&s);
+    if (len > 0)
+        sha512_update(&s, (const unsigned char *)data, len);
+
+    unsigned char digest[64];
+    sha512_final(&s, digest);
+    digest_to_hex(digest, hex_out);
     return 0;
+}
+
+int sha512_string(const char *str, char hex_out[129])
+{
+    if (!str)
+        return -1;
+    return sha512_buf(str, strlen(str), hex_out);
 }
 
 /*

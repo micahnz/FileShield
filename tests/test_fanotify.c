@@ -30,6 +30,7 @@
 #include <syslog.h>
 #include <sys/fanotify.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../src/fanotify.h"
@@ -49,6 +50,30 @@ static int failures = 0;
         failures++; \
     } \
 } while(0)
+
+/*
+ * Convenience wrappers for the matcher seams: fingerprint the command
+ * line the way an event would, then run the matcher.  The seams take a
+ * precomputed fingerprint so the benchmark can measure matcher cost
+ * without the hash.
+ */
+static int test_match_allow(const char *binary, const char *sha,
+                            const char *target, const char *cmdline)
+{
+    char fp[129];
+    if (!cmdline || sha512_string(cmdline, fp) != 0)
+        return 0;
+    return fanotify_test_dyn_allow_match(binary, sha, target, fp);
+}
+
+static int test_match_deny(const char *binary, const char *sha,
+                           const char *target, const char *cmdline)
+{
+    char fp[129];
+    if (!cmdline || sha512_string(cmdline, fp) != 0)
+        return 0;
+    return fanotify_test_dyn_deny_match(binary, sha, target, fp);
+}
 
 /*
  * Part 0: the mark mask must not contain FID-requiring directory-entry
@@ -141,29 +166,29 @@ static void test_incomplete_entries_grant_nothing(void) {
     fanotify_load_dyn_allowlist(entries, 4);
 
     /* The complete entry loads with every matching key preserved. */
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl config view --minify") == 1,
            "the complete allow entry matches its exact tuple");
 
     /* The incomplete records can never act as wildcard grants. */
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/ssh", sha,
+    ASSERT(test_match_allow("/usr/bin/ssh", sha,
            "/home/u/.ssh/id_rsa", "ssh-add -l") == 0,
            "target-less allow entry grants nothing");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/aws", sha,
+    ASSERT(test_match_allow("/usr/bin/aws", sha,
            "/home/u/.aws/credentials", "aws sts get-caller-identity") == 0,
            "digest-only allow entry grants nothing");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/gh", sha,
+    ASSERT(test_match_allow("/usr/bin/gh", sha,
            "/home/u/.config/gh/hosts.yml", "gh auth status") == 0,
            "cmdline-only allow entry grants nothing");
 
     /* The surviving entry stays pinned to each of its keys. */
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", "deadbeef",
+    ASSERT(test_match_allow("/usr/bin/kubectl", "deadbeef",
            "/home/u/.kube/config", "kubectl config view --minify") == 0,
            "unverifiable binary hash does not match");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.kube/other", "kubectl config view --minify") == 0,
            "different target does not match");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl get secrets") == 0,
            "different command does not match");
 
@@ -178,10 +203,10 @@ static void test_incomplete_entries_grant_nothing(void) {
              "/home/u/.netrc");
 
     fanotify_load_dyn_denylist(dentries, 2);
-    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/curl", "", "/etc/passwd",
+    ASSERT(test_match_deny("/usr/bin/curl", "", "/etc/passwd",
            "curl") == 0,
            "bare deny record denies nothing");
-    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/wget", "", "/home/u/.netrc",
+    ASSERT(test_match_deny("/usr/bin/wget", "", "/home/u/.netrc",
            "wget") == 0,
            "deny record without a command fingerprint denies nothing");
 
@@ -219,29 +244,134 @@ static void test_cmdline_scoping(void) {
              cmd_pods);
 
     fanotify_load_dyn_allowlist(e, 1);
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl get pods") == 1,
            "exact command matches the allow entry");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl get secrets") == 0,
            "different command does not match the allow entry");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_allow("/usr/bin/kubectl", sha,
            "/home/u/.ssh/id_rsa", "kubectl get pods") == 0,
            "different target does not match the allow entry");
-    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", "deadbeef",
+    ASSERT(test_match_allow("/usr/bin/kubectl", "deadbeef",
            "/home/u/.kube/config", "kubectl get pods") == 0,
            "unverifiable binary hash does not match");
     fanotify_load_dyn_allowlist(NULL, 0);
 
     /* The deny side mirrors the same scoping. */
     fanotify_load_dyn_denylist(e, 1);
-    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_deny("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl get pods") == 1,
            "exact command matches the deny entry");
-    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/kubectl", sha,
+    ASSERT(test_match_deny("/usr/bin/kubectl", sha,
            "/home/u/.kube/config", "kubectl get secrets") == 0,
            "different command does not match the deny entry");
     fanotify_load_dyn_denylist(NULL, 0);
+}
+
+/*
+ * Part 1d: the command-line fingerprint covers the FULL raw command line,
+ * not just the 512-byte display form.  Two invocations that share a long
+ * prefix but differ at the end must fingerprint differently (the old
+ * truncated hash let one approved command cover the other), and the
+ * digest must equal SHA-512 over the raw /proc bytes.
+ */
+
+/* Spawn a long-running child whose argv carries one unique marker. */
+static pid_t spawn_marked_child(const char *marker)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0)
+    {
+        /* Own process group so the whole child tree can be killed. */
+        setpgid(0, 0);
+        /* sh keeps the marker in its argv (as $0) while sleep holds it
+         * alive.  The trailing ";" stops sh from exec-replacing itself
+         * with sleep (which would drop the marker from argv). */
+        execl("/bin/sh", "sh", "-c", "sleep 30; :", marker, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int read_raw_cmdline(pid_t pid, char *buf, size_t sz)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, buf, sz - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    return (int)n;
+}
+
+/*
+ * Wait until the child's cmdline really contains the marker: right after
+ * fork() the child still shows the parent's cmdline, which would make two
+ * children look identical.
+ */
+static int wait_for_marker(pid_t pid, const char *marker)
+{
+    char raw[8192];
+    for (int i = 0; i < 200; i++)
+    {
+        int n = read_raw_cmdline(pid, raw, sizeof(raw));
+        if (n > 0 &&
+            memmem(raw, (size_t)n, marker, strlen(marker)) != NULL)
+            return 0;
+        usleep(5000);
+    }
+    return -1;
+}
+
+static void test_cmdline_fingerprint_full(void) {
+    char prefix[600];
+    memset(prefix, 'p', sizeof(prefix) - 1);
+    prefix[sizeof(prefix) - 1] = '\0';
+
+    char arg_a[1024], arg_b[1024];
+    snprintf(arg_a, sizeof(arg_a), "%sAAAA", prefix);
+    snprintf(arg_b, sizeof(arg_b), "%sBBBB", prefix);
+
+    pid_t pid_a = spawn_marked_child(arg_a);
+    pid_t pid_b = spawn_marked_child(arg_b);
+    ASSERT(pid_a > 0 && pid_b > 0, "spawn marked children");
+    if (pid_a <= 0 || pid_b <= 0)
+        return;
+
+    int ready_a = wait_for_marker(pid_a, arg_a);
+    int ready_b = wait_for_marker(pid_b, arg_b);
+    ASSERT(ready_a == 0 && ready_b == 0, "children exec with their markers");
+
+    if (ready_a == 0 && ready_b == 0)
+    {
+        char fp_a[129] = "", fp_b[129] = "";
+        ASSERT(fanotify_test_cmdline_fingerprint(pid_a, fp_a) == 0,
+               "fingerprint child A");
+        ASSERT(fanotify_test_cmdline_fingerprint(pid_b, fp_b) == 0,
+               "fingerprint child B");
+        ASSERT(strcmp(fp_a, fp_b) != 0,
+               "commands sharing a 600-byte prefix fingerprint differently");
+
+        char raw[8192];
+        int n = read_raw_cmdline(pid_a, raw, sizeof(raw));
+        char expected[129];
+        ASSERT(n > 0 && sha512_buf(raw, (size_t)n, expected) == 0,
+               "independent digest of the raw cmdline");
+        ASSERT(n > 0 && strcmp(fp_a, expected) == 0,
+               "fingerprint equals SHA-512 of the raw /proc bytes");
+    }
+
+    kill(-pid_a, SIGKILL); /* negative: kill the child's process group */
+    kill(-pid_b, SIGKILL);
+    waitpid(pid_a, NULL, 0);
+    waitpid(pid_b, NULL, 0);
 }
 
 /*
@@ -474,6 +604,7 @@ int main(void) {
     test_missing_path_is_skipped();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
+    test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
     if (failures) {

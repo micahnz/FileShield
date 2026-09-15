@@ -77,11 +77,20 @@ void fanotify_load_dyn_denylist(const PersistEntry *entries, int count);
  * Test seams: evaluate the loaded runtime lists against a synthetic
  * request with a zero-depth call chain.  Used by test_fanotify to
  * regression-test target and command-line scoping without a kernel
- * permission event.
+ * permission event.  cmdline_fp is the full-cmdline fingerprint exactly
+ * as an event would compute it ("" = unverifiable, which never matches);
+ * tests and the benchmark build it with sha512_string().
  */
 int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
-                                  const char *target, const char *cmdline);
+                                  const char *target, const char *cmdline_fp);
 int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
-                                 const char *target, const char *cmdline);
+                                 const char *target, const char *cmdline_fp);
+
+/*
+ * Test seam: fingerprint a live process's full raw command line the same
+ * way the event pipeline does (NUL-separated bytes, bounded).  Returns 0
+ * on success and fills hex_out, -1 when the cmdline is unreadable/empty.
+ */
+int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129]);
 
 #endif

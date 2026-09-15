@@ -8,8 +8,9 @@
  *   cache_lookup/insert   PID-keyed allow cache (scan + /proc read)
  *   path_under            boundary primitive behind all rule matching
  *   proc_stat_session     /proc/<pid>/stat parse (PID-reuse check)
- *   sha512_string         command-line fingerprints (fork + sha512sum)
+ *   sha512_string         command-line fingerprints (in-process)
  *   dyn matchers          runtime allow/deny entry matching (fanotify.c)
+ *   cmdline fingerprint   /proc/<pid>/cmdline read + hash (fanotify.c)
  *
  * Run an optimization's before/after here; keep the change only if it
  * wins.  Results belong in the commit message and as comments at the
@@ -159,14 +160,18 @@ static void bench_sha512_string(void *arg)
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"       \
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+/* Precomputed fingerprints: the matcher seams take the digest, so these
+ * benches measure matching, not hashing. */
+static char g_bench_cmd_fp[129];
+static char g_bench_cmd2_fp[129];
+
 static void bench_dyn_allow_match_hit(void *arg)
 {
     int iters = *(int *)arg;
 
     for (int i = 0; i < iters; i++)
         fanotify_test_dyn_allow_match("/usr/bin/kubectl", BENCH_SHA,
-                                      "/home/u/.kube/config",
-                                      "kubectl config view --minify");
+                                      "/home/u/.kube/config", g_bench_cmd_fp);
 }
 
 static void bench_dyn_allow_match_miss(void *arg)
@@ -175,7 +180,36 @@ static void bench_dyn_allow_match_miss(void *arg)
 
     for (int i = 0; i < iters; i++)
         fanotify_test_dyn_allow_match("/usr/bin/other", BENCH_SHA,
-                                      "/home/u/.other/file", "other cmd");
+                                      "/home/u/.other/file", BENCH_SHA);
+}
+
+/*
+ * Binary, hash, target and chain all match; only the command differs, so
+ * this measures the fingerprint comparison a near-miss pays.
+ */
+static void bench_dyn_allow_match_cmd_miss(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        fanotify_test_dyn_allow_match("/usr/bin/kubectl", BENCH_SHA,
+                                      "/home/u/.kube/config", g_bench_cmd2_fp);
+}
+
+/*
+ * Production fingerprint cost: read the full /proc/<pid>/cmdline and hash
+ * it.  Computed lazily per event, only when a runtime list can match.
+ * Uses the bench process itself (short cmdline), so the /proc read and
+ * the digest dominate.
+ */
+static void bench_cmdline_fingerprint(void *arg)
+{
+    int iters = *(int *)arg;
+    char fp[129];
+    pid_t self = getpid();
+
+    for (int i = 0; i < iters; i++)
+        fanotify_test_cmdline_fingerprint(self, fp);
 }
 
 /* Load one runtime allow entry so the dyn matchers have work to do. */
@@ -187,7 +221,15 @@ static void bench_dyn_setup(void)
     snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", BENCH_SHA);
     snprintf(e->target_path, sizeof(e->target_path), "/home/u/.kube/config");
     snprintf(e->cmdline, sizeof(e->cmdline), "kubectl config view --minify");
-    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s", BENCH_SHA);
+    /* Fingerprint the same command line the hit bench passes, so the hit
+     * is a true full match.  (It previously stored an unrelated constant
+     * and therefore measured a mismatch.) */
+    if (sha512_string("kubectl config view --minify", g_bench_cmd_fp) != 0)
+        g_bench_cmd_fp[0] = '\0';
+    if (sha512_string("kubectl get secrets", g_bench_cmd2_fp) != 0)
+        g_bench_cmd2_fp[0] = '\0';
+    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
+             g_bench_cmd_fp);
     fanotify_load_dyn_allowlist(e, 1);
 }
 
@@ -219,12 +261,18 @@ int main(void)
            iters_sha);
 
     bench_dyn_setup();
-    int iters_match_hit = 200; /* full match forks sha512sum per iter */
+    int iters_match_hit = 200000;
     report("dyn_allow_match full hit", bench_dyn_allow_match_hit,
            &iters_match_hit, iters_match_hit);
     int iters_match_miss = 200000;
     report("dyn_allow_match early miss", bench_dyn_allow_match_miss,
            &iters_match_miss, iters_match_miss);
+    int iters_cmd_miss = 200000;
+    report("dyn_allow_match cmd mismatch", bench_dyn_allow_match_cmd_miss,
+           &iters_cmd_miss, iters_cmd_miss);
+    int iters_fp = 20000;
+    report("cmdline fingerprint (own pid)", bench_cmdline_fingerprint,
+           &iters_fp, iters_fp);
 
     return 0;
 }

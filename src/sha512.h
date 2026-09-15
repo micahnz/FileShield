@@ -31,4 +31,14 @@ int sha512_proc_exe(pid_t pid, char hex_out[129]);
  */
 int sha512_string(const char *str, char hex_out[129]);
 
+/*
+ * Compute the SHA-512 digest of a length-delimited memory buffer.  Unlike
+ * sha512_string(), the buffer may contain NUL bytes: the raw
+ * /proc/<pid>/cmdline bytes are NUL-separated, and fingerprinting them
+ * as-is keeps the digest independent of any display truncation.
+ * 'data' must be non-NULL (len may be 0).  Same return semantics as
+ * sha512_file().
+ */
+int sha512_buf(const void *data, size_t len, char hex_out[129]);
+
 #endif /* FILESHIELD_SHA512_H */

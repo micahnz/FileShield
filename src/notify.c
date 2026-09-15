@@ -21,9 +21,6 @@
 #include "session.h"
 #include "utils.h"
 
-/* UID of the desktop user whose session was detected. 0 = not found. */
-static uid_t g_session_uid = 0;
-
 /*
  * Fanotify fd stored here so run_kdialog_3choice() can pump pending events
  * while waiting for the dialog child (prevents mount-mark deadlock).
@@ -212,19 +209,41 @@ void notify_set_fan_fd(int fd)
 }
 
 /*
- * find_wayland_session: look for an active Wayland session owned by
- * uid_val under /run/user/<uid>.  On success exports WAYLAND_DISPLAY,
- * XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS, records g_session_uid,
- * and returns 1.
+ * Desktop session selected for one prompt.  Detection never mutates the
+ * daemon's environment: the values are applied inside the dialog child
+ * after it drops to the desktop user, so a prompt is always shown on the
+ * display detected for that user and cannot leak into later, unrelated
+ * requests (or into forked helpers such as sha512sum).
  */
-static int find_wayland_session(unsigned long uid_val)
+typedef struct
+{
+    uid_t uid;                 /* desktop user; 0 = none found            */
+    char wayland_display[256]; /* "" when unset                           */
+    char display[256];         /* X11 DISPLAY from the unit, "" when unset */
+    char xdg_runtime_dir[PATH_MAX];
+    char dbus_address[PATH_MAX + 32];
+} DisplaySession;
+
+/*
+ * find_wayland_session: look for an active Wayland session owned by
+ * uid_val under /run/user/<uid>.  The runtime directory and the socket
+ * are both validated (real directory / socket, owned by the user) so a
+ * planted regular file or another user's endpoint cannot capture the
+ * prompt.  On success fills *out and returns 1.
+ */
+static int find_wayland_session(unsigned long uid_val, DisplaySession *out)
 {
     char user_dir[PATH_MAX];
+    struct stat st;
     DIR *d;
-    struct dirent *ent;
-    char wayland_sock[256] = "";
+    const struct dirent *ent;
+    char sock[256] = "";
 
     snprintf(user_dir, sizeof(user_dir), "/run/user/%lu", uid_val);
+
+    if (lstat(user_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != (uid_t)uid_val)
+        return 0;
 
     d = opendir(user_dir);
     if (!d)
@@ -232,66 +251,102 @@ static int find_wayland_session(unsigned long uid_val)
 
     while ((ent = readdir(d)) != NULL)
     {
-        if (strncmp(ent->d_name, "wayland-", 8) == 0 &&
-            strstr(ent->d_name, ".lock") == NULL)
-        {
-            snprintf(wayland_sock, sizeof(wayland_sock), "%s", ent->d_name);
-            break;
-        }
+        if (strncmp(ent->d_name, "wayland-", 8) != 0)
+            continue;
+        if (strstr(ent->d_name, ".lock") != NULL)
+            continue;
+
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s/%s", user_dir, ent->d_name) >=
+            (int)sizeof(full))
+            continue;
+
+        struct stat sst;
+        if (lstat(full, &sst) != 0)
+            continue;
+        /* Only a socket owned by the user can serve a Wayland session. */
+        if (!S_ISSOCK(sst.st_mode) || sst.st_uid != (uid_t)uid_val)
+            continue;
+
+        snprintf(sock, sizeof(sock), "%s", ent->d_name);
+        break;
     }
     closedir(d);
 
-    if (wayland_sock[0] == '\0')
+    if (sock[0] == '\0')
         return 0;
 
-    setenv("WAYLAND_DISPLAY", wayland_sock, 1);
-    setenv("XDG_RUNTIME_DIR", user_dir, 1);
-    char dbus[PATH_MAX + 32];
-    snprintf(dbus, sizeof(dbus), "unix:path=%s/bus", user_dir);
-    setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
-    g_session_uid = (uid_t)uid_val;
+    memset(out, 0, sizeof(*out));
+    out->uid = (uid_t)uid_val;
+    snprintf(out->wayland_display, sizeof(out->wayland_display), "%s", sock);
+    snprintf(out->xdg_runtime_dir, sizeof(out->xdg_runtime_dir), "%s",
+             user_dir);
+    snprintf(out->dbus_address, sizeof(out->dbus_address), "unix:path=%s/bus",
+             user_dir);
     return 1;
 }
 
 /*
- * setup_display_env: determine which desktop session should show the
+ * detect_display_session: determine which desktop session should show the
  * prompt.  Preference order:
- *   1. Environment already provides WAYLAND_DISPLAY/DISPLAY (derive the
- *      session uid from XDG_RUNTIME_DIR ownership).
+ *   1. Environment already provides WAYLAND_DISPLAY/DISPLAY (systemd
+ *      override or a manual run); derive the session uid from
+ *      XDG_RUNTIME_DIR ownership.
  *   2. The requesting process's own uid (preferred_uid): the prompt must
  *      be shown to the user whose process triggered it.
  *   3. As a last resort for unknown requesters, the first active non-root
  *      Wayland session found under /run/user.
- * The dialog child drops to g_session_uid; if no non-root session can be
- * determined, notify_ask() refuses to run a GUI as root.
+ * Returns 1 when a non-root session was found; the dialog child then
+ * drops to out->uid.  Returns 0 when no such session exists, in which
+ * case notify_ask() refuses to run a GUI as root (fail closed).
  */
-static void setup_display_env(uid_t preferred_uid)
+static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
 {
-    if (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY"))
+    memset(out, 0, sizeof(*out));
+
+    const char *env_wayland = getenv("WAYLAND_DISPLAY");
+    const char *env_display = getenv("DISPLAY");
+
+    if (env_wayland || env_display)
     {
+        if (env_wayland)
+            snprintf(out->wayland_display, sizeof(out->wayland_display), "%s",
+                     env_wayland);
+        if (env_display)
+            snprintf(out->display, sizeof(out->display), "%s", env_display);
+
         const char *xdg = getenv("XDG_RUNTIME_DIR");
-        if (xdg)
-        {
-            struct stat st;
-            if (stat(xdg, &st) == 0 && st.st_uid != 0)
-                g_session_uid = st.st_uid;
-        }
-        return;
+        struct stat st;
+        if (!xdg || stat(xdg, &st) != 0 || st.st_uid == 0)
+            return 0; /* cannot determine a non-root desktop user */
+        out->uid = st.st_uid;
+        snprintf(out->xdg_runtime_dir, sizeof(out->xdg_runtime_dir), "%s", xdg);
+
+        /* An explicitly configured bus address wins; otherwise derive it
+         * from the runtime directory, as the auto-detection path does. */
+        const char *dbus_env = getenv("DBUS_SESSION_BUS_ADDRESS");
+        if (dbus_env && dbus_env[0] != '\0')
+            snprintf(out->dbus_address, sizeof(out->dbus_address), "%s",
+                     dbus_env);
+        else
+            snprintf(out->dbus_address, sizeof(out->dbus_address),
+                     "unix:path=%s/bus", xdg);
+        return 1;
     }
 
     if (preferred_uid != (uid_t)-1 && preferred_uid != 0)
     {
-        if (find_wayland_session((unsigned long)preferred_uid))
-            return;
+        if (find_wayland_session((unsigned long)preferred_uid, out))
+            return 1;
         log_msg(LOG_WARNING,
                 "no active Wayland session for uid %d; not prompting another user",
                 (int)preferred_uid);
-        return;
+        return 0;
     }
 
     DIR *top = opendir("/run/user");
     if (!top)
-        return;
+        return 0;
 
     const struct dirent *uid_ent;
     while ((uid_ent = readdir(top)) != NULL)
@@ -304,10 +359,32 @@ static void setup_display_env(uid_t preferred_uid)
         if (*endptr != '\0' || uid_val == 0)
             continue;
 
-        if (find_wayland_session(uid_val))
-            break;
+        if (find_wayland_session(uid_val, out))
+        {
+            closedir(top);
+            return 1;
+        }
     }
     closedir(top);
+    return 0;
+}
+
+/*
+ * apply_display_env: called in the dialog child after dropping to the
+ * desktop user.  Exports the detected session so kdialog reaches the
+ * right compositor.  Deliberately never called in the daemon: a session
+ * must not leak across prompts or into unrelated forked helpers.
+ */
+static void apply_display_env(const DisplaySession *session)
+{
+    if (session->wayland_display[0] != '\0')
+        setenv("WAYLAND_DISPLAY", session->wayland_display, 1);
+    if (session->display[0] != '\0')
+        setenv("DISPLAY", session->display, 1);
+    if (session->xdg_runtime_dir[0] != '\0')
+        setenv("XDG_RUNTIME_DIR", session->xdg_runtime_dir, 1);
+    if (session->dbus_address[0] != '\0')
+        setenv("DBUS_SESSION_BUS_ADDRESS", session->dbus_address, 1);
 }
 
 /*
@@ -315,12 +392,12 @@ static void setup_display_env(uid_t preferred_uid)
  * Switches uid/gid to the desktop user (including supplementary groups)
  * so the dialog can connect to their compositor and D-Bus session.
  */
-static void drop_to_session_user(void)
+static void drop_to_session_user(const DisplaySession *session)
 {
-    if (g_session_uid == 0 || getuid() != 0)
+    if (session->uid == 0 || getuid() != 0)
         return;
 
-    struct passwd *pw = getpwuid(g_session_uid);
+    struct passwd *pw = getpwuid(session->uid);
     if (!pw)
         _exit(127);
 
@@ -329,7 +406,7 @@ static void drop_to_session_user(void)
         _exit(127);
     if (setgid(pw->pw_gid) < 0)
         _exit(127);
-    if (setuid(g_session_uid) < 0)
+    if (setuid(session->uid) < 0)
         _exit(127);
     setenv("HOME", pw->pw_dir, 1);
 }
@@ -388,7 +465,8 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
  * events on mount-marked filesystems and would otherwise deadlock the
  * helper behind the daemon's blocked event.
  */
-static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
+static int run_kdialog_3choice(const DisplaySession *session,
+                               const DialogEnvSetting *env, int env_count,
                                const char *text, const char *yes_label,
                                const char *no_label, const char *cancel_label)
 {
@@ -404,7 +482,11 @@ static int run_kdialog_3choice(const DialogEnvSetting *env, int env_count,
         /* Own process group so the timeout kill cannot touch the daemon
          * and so events from every dialog helper can be recognized. */
         setpgid(0, 0);
-        drop_to_session_user();
+        drop_to_session_user(session);
+        /* Export the detected display only here, in the child: the daemon
+         * environment stays untouched so one user's session cannot leak
+         * into another prompt or into unrelated helpers. */
+        apply_display_env(session);
         /* Let kdialog see the user's theme/font/scale/locale settings. */
         apply_dialog_env(env, env_count);
         close_fds_from(3);
@@ -562,16 +644,19 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
              comm_s, (int)pid, pcomm_s, (int)ppid,
              path_s, exe_s, cmd_s);
 
-    /* Auto-detect the active graphical session if env vars are not set. */
-    setup_display_env(user_uid);
+    /* Auto-detect the active graphical session if env vars are not set.
+     * The daemon itself is never modified: the session is applied by the
+     * dialog child, per prompt. */
+    DisplaySession session;
+    int have_session = detect_display_session(user_uid, &session);
     log_msg(LOG_DEBUG,
-            "[notify_ask] display env: WAYLAND=%s DISPLAY=%s uid=%d",
-            getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(none)",
-            getenv("DISPLAY") ? getenv("DISPLAY") : "(none)",
-            (int)g_session_uid);
+            "[notify_ask] session: uid=%d wayland=%s display=%s",
+            (int)session.uid,
+            session.wayland_display[0] ? session.wayland_display : "(none)",
+            session.display[0] ? session.display : "(none)");
 
     /* Never run a security prompt as a root GUI process. */
-    if (getuid() == 0 && g_session_uid == 0)
+    if (getuid() == 0 && !have_session)
     {
         log_msg(LOG_ERR,
                 "no non-root desktop session found; denying access to %s",
@@ -587,7 +672,7 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
             dialog_env_count);
 
     /* First dialog: Allow Once / Allow / Deny. */
-    int r = run_kdialog_3choice(dialog_env, dialog_env_count, msg,
+    int r = run_kdialog_3choice(&session, dialog_env, dialog_env_count, msg,
                                 "Allow Once", "Allow", "Deny");
 
     if (r == 0)
@@ -607,7 +692,8 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                  "\xe2\x80\xa2 Cancel        \xe2\x80\x94 deny this time",
                  path_s);
 
-        int r2 = run_kdialog_3choice(dialog_env, dialog_env_count, msg2,
+        int r2 = run_kdialog_3choice(&session, dialog_env, dialog_env_count,
+                                     msg2,
                                      "Allow Session", "Allow Always", "Cancel");
         if (r2 == 0)
             return NOTIFY_ALLOW_SESSION;
@@ -634,7 +720,7 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
              "\xe2\x80\xa2 Deny         \xe2\x80\x94 this time only",
              path_s);
 
-    int r3 = run_kdialog_3choice(dialog_env, dialog_env_count, msg2,
+    int r3 = run_kdialog_3choice(&session, dialog_env, dialog_env_count, msg2,
                                  "Deny Session", "Deny Always", "Deny");
     if (r3 == 0)
         return NOTIFY_DENY_SESSION;

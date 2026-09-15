@@ -74,6 +74,52 @@ static void test_string_invalid(void)
 }
 
 /*
+ * sha512_buf hashes length-delimited data, so embedded NUL bytes (the raw
+ * /proc/<pid>/cmdline separators) are part of the digest and cannot
+ * truncate it the way a string hash would.
+ */
+static void test_buf_nul_bytes(void)
+{
+    char with_nul[129], truncated[129];
+
+    ASSERT(sha512_buf("abc\0def", 7, with_nul) == 0, "buffer digest computes");
+    ASSERT(sha512_string("abc", truncated) == 0, "prefix digest computes");
+    ASSERT(strcmp(with_nul, truncated) != 0,
+           "embedded NUL bytes are hashed, not treated as a terminator");
+    ASSERT(strlen(with_nul) == 128, "buffer digest is 128 hex chars");
+    ASSERT(sha512_buf(NULL, 0, with_nul) == -1, "NULL buffer fails");
+}
+
+/*
+ * Differential test for raw bytes: sha512_buf must agree with sha512sum
+ * on content that contains NUL bytes.
+ */
+static void test_buf_differential(void)
+{
+    static const char raw[] = {'a', 'b', 'c', '\0', 'd', 'e', 'f'};
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/tmp/fileshield_sha512_bufdiff_%d",
+             (int)getpid());
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0, "open buffer differential temp file");
+    if (fd < 0)
+        return;
+    ASSERT(write(fd, raw, sizeof(raw)) == (ssize_t)sizeof(raw),
+           "write raw sample");
+    close(fd);
+
+    char hex_file[129], hex_buf[129];
+    ASSERT(sha512_file(path, hex_file) == 0, "helper digest (raw bytes)");
+    ASSERT(sha512_buf(raw, sizeof(raw), hex_buf) == 0,
+           "buffer digest (raw bytes)");
+    ASSERT(strcmp(hex_file, hex_buf) == 0,
+           "buffer digest matches sha512sum for raw bytes");
+
+    unlink(path);
+}
+
+/*
  * Differential test: the in-process string digest must agree with
  * sha512sum (exercised through sha512_file's helper path) for the same
  * bytes, at lengths that span block boundaries.
@@ -134,6 +180,8 @@ int main(void)
     test_string_differs();
     test_string_multiblock();
     test_string_invalid();
+    test_buf_nul_bytes();
+    test_buf_differential();
     test_string_differential();
     test_file_digest();
     if (failures)
