@@ -45,8 +45,8 @@ static void test_basic_parse(void)
         "# comment line\n"
         "\n"
         "[allowlist]\n"
-        "/usr/bin/ssh = 3600\n"
-        "/usr/bin/git = 300\n";
+        "/usr/bin/ssh = /etc/ssl/certs\n"
+        "/usr/bin/git\n";
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config");
@@ -63,9 +63,10 @@ static void test_basic_parse(void)
 
     ASSERT(cfg.allowlist_count == 2, "2 allowlist entries");
     ASSERT(strcmp(cfg.allowlist[0].binary, "/usr/bin/ssh") == 0, "allowlist ssh binary");
-    ASSERT(cfg.allowlist[0].ttl_seconds == 3600, "allowlist ssh ttl");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, "/etc/ssl/certs") == 0,
+           "allowlist ssh target");
     ASSERT(strcmp(cfg.allowlist[1].binary, "/usr/bin/git") == 0, "allowlist git binary");
-    ASSERT(cfg.allowlist[1].ttl_seconds == 300, "allowlist git ttl");
+    ASSERT(cfg.allowlist[1].target_path[0] == '\0', "bare entry is a global rule");
 
     config_reset(&cfg);
     ASSERT(cfg.protected_count == 0, "config_reset zeros count");
@@ -90,7 +91,7 @@ static void test_unknown_section(void)
         "[bogus]\n"
         "/tmp/ignored\n"
         "[allowlist]\n"
-        "/usr/bin/x = 60\n";
+        "/usr/bin/x = /tmp/ok\n";
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config");
@@ -229,7 +230,7 @@ static void test_ttl_clamping(void)
         "user_ttl = 2000000000\n"
         "session_ttl = 2000000000\n"
         "[allowlist]\n"
-        "/usr/bin/huge = 999999999\n";
+        "/usr/bin/huge = /tmp/ttl_clamp_test\n";
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config for ttl clamp");
@@ -240,7 +241,8 @@ static void test_ttl_clamping(void)
     int r = config_load(path, &cfg);
     ASSERT(r == 0, "config_load ttl clamp success");
     ASSERT(cfg.allowlist_count == 1, "allowlist parsed for ttl clamp");
-    ASSERT(cfg.allowlist[0].ttl_seconds == 31536000, "allowlist TTL clamped to one year");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, "/tmp/ttl_clamp_test") == 0,
+           "allowlist target parsed");
     ASSERT(cfg.user_ttl_seconds == 31536000, "user_ttl clamped to one year");
     ASSERT(cfg.session_ttl_seconds == 31536000, "session_ttl clamped to one year");
 
@@ -280,7 +282,7 @@ static void test_path_canonicalization(void)
 {
     char real_dir[128];
     char link_dir[128];
-    char conf[1024];
+    char conf[2048];
     char target[512];
 
     snprintf(real_dir, sizeof(real_dir), "/tmp/fileshield_canon_real_%d", (int)getpid());
@@ -295,8 +297,8 @@ static void test_path_canonicalization(void)
              "[protected_paths]\n"
              "%s\n"
              "[allowlist]\n"
-             "%s/bin = 60\n",
-             target, link_dir);
+             "%s/bin = %s\n",
+             target, link_dir, target);
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write symlink config");
@@ -314,12 +316,142 @@ static void test_path_canonicalization(void)
     ASSERT(cfg.allowlist_count == 1, "symlink config allowlist count");
     ASSERT(strncmp(cfg.allowlist[0].binary, real_dir, strlen(real_dir)) == 0,
            "allowlist path canonicalized through symlink");
+    ASSERT(strncmp(cfg.allowlist[0].target_path, real_dir, strlen(real_dir)) == 0,
+           "allowlist target canonicalized through symlink");
 
     config_reset(&cfg);
     unlink(path);
     free(path);
     unlink(link_dir);
     rmdir(real_dir);
+}
+
+/*
+ * Legacy-format safety: "binary = ttl_seconds" entries must be rejected
+ * with a warning, and an '=' with an empty right side is a parse error.
+ * Neither may produce a rule.
+ */
+static void test_rule_rejection(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/rej\n"
+        "[allowlist]\n"
+        "/usr/bin/old = 3600\n"
+        "/usr/bin/empty =\n"
+        "/usr/bin/ok = /tmp/rej\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for rule rejection");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load succeeds with skipped lines");
+    ASSERT(cfg.allowlist_count == 1, "only the valid rule survives");
+    ASSERT(strcmp(cfg.allowlist[0].binary, "/usr/bin/ok") == 0,
+           "surviving rule is the scoped one");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * [denylist] parses the same format as [allowlist]: scoped rules and
+ * bare global rules, with multiple targets for the same binary.
+ */
+static void test_denylist_parse(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/deny\n"
+        "[denylist]\n"
+        "/usr/bin/curl = /tmp/deny\n"
+        "/usr/bin/curl = /tmp/other\n"
+        "/usr/bin/nc\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for denylist");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load denylist success");
+    ASSERT(cfg.denylist_count == 3, "3 denylist entries");
+    ASSERT(strcmp(cfg.denylist[0].binary, "/usr/bin/curl") == 0,
+           "denylist curl binary");
+    ASSERT(strcmp(cfg.denylist[0].target_path, "/tmp/deny") == 0,
+           "denylist first target");
+    ASSERT(strcmp(cfg.denylist[1].target_path, "/tmp/other") == 0,
+           "denylist second target for the same binary");
+    ASSERT(strcmp(cfg.denylist[2].binary, "/usr/bin/nc") == 0,
+           "denylist global binary");
+    ASSERT(cfg.denylist[2].target_path[0] == '\0', "bare deny entry is global");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Trailing slashes on a target are stripped at parse time so matching
+ * is uniformly "equal or under".
+ */
+static void test_target_trailing_slash(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/slash_test/\n"
+        "[allowlist]\n"
+        "/usr/bin/tool = /tmp/slash_test/\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for trailing slash");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load trailing slash success");
+    ASSERT(cfg.allowlist_count == 1, "trailing slash entry parsed");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, "/tmp/slash_test") == 0,
+           "trailing slash stripped from target");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * 'Binary = target' where the target does not exist yet keeps its
+ * basename (canonicalize_path resolves the parent).
+ */
+static void test_scoped_missing_target(void)
+{
+    const char *conf =
+        "[protected_paths]\n"
+        "/tmp/rule_missing/secret\n"
+        "[allowlist]\n"
+        "/usr/bin/app = /tmp/rule_missing/secret\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for missing target");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load missing target success");
+    ASSERT(cfg.allowlist_count == 1, "missing-target rule parsed");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, "/tmp/rule_missing/secret") == 0,
+           "missing target keeps parent resolution");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
 }
 
 int main(void)
@@ -336,6 +468,10 @@ int main(void)
     test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
+    test_rule_rejection();
+    test_denylist_parse();
+    test_target_trailing_slash();
+    test_scoped_missing_target();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

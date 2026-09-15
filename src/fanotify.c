@@ -130,18 +130,52 @@ static int read_cmdline(pid_t pid, char *out, size_t size)
     return (int)n;
 }
 
-static int allowlist_match(const char *binary, int *ttl_out)
+/*
+ * Config rule matching.  A rule matches when the binary path is equal and
+ * the opened target is equal to or under the rule's target path; a rule
+ * with an empty target_path is global and matches every protected path.
+ * path_under() from utils provides the equal-or-under semantics.
+ */
+static int rule_matches(const RuleEntry *e, const char *binary,
+                        const char *target)
 {
-    int i;
+    if (strcmp(e->binary, binary) != 0)
+        return 0;
+    return e->target_path[0] == '\0' || path_under(target, e->target_path);
+}
+
+/*
+ * Config [allowlist]: an explicit admin opt-in.  On a match, grant_target
+ * receives the rule's target for the file-cache insert, or NULL for a
+ * global rule (wildcard cache entry).
+ */
+static int allowlist_match(const char *binary, const char *target,
+                           const char **grant_target)
+{
     if (!g_config)
         return 0;
-    for (i = 0; i < g_config->allowlist_count; i++)
+    for (int i = 0; i < g_config->allowlist_count; i++)
     {
-        if (strcmp(g_config->allowlist[i].binary, binary) == 0)
+        const RuleEntry *e = &g_config->allowlist[i];
+        if (rule_matches(e, binary, target))
         {
-            *ttl_out = g_config->allowlist[i].ttl_seconds;
+            *grant_target = e->target_path[0] ? e->target_path : NULL;
             return 1;
         }
+    }
+    return 0;
+}
+
+/* Config [denylist]: static admin-denied binary/target pairs, checked
+ * before every grant so a denial always wins. */
+static int denylist_match(const char *binary, const char *target)
+{
+    if (!g_config)
+        return 0;
+    for (int i = 0; i < g_config->denylist_count; i++)
+    {
+        if (rule_matches(&g_config->denylist[i], binary, target))
+            return 1;
     }
     return 0;
 }
@@ -1419,7 +1453,6 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     int fd_num = (int)ev->fd;
     char *binary = NULL;
     char *target = NULL;
-    int ttl = 0;
     pid_t ppid = 0;
     char comm[256] = "";
     char pcomm[256] = "";
@@ -1513,12 +1546,15 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
                 binary, (int)pid, target);
     }
 
-    /* Config allowlist: an explicit admin opt-in, binary-wide. */
-    if (allowlist_match(binary, &ttl))
+    /* Config denylist: a static admin denial always wins over every
+     * grant.  Checked before hashing so denied binaries never pay for
+     * binary/ancestor SHA-512 computation. */
+    if (denylist_match(binary, target))
     {
-        cache_insert(pid, binary, NULL, ttl);
-        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        log_msg(LOG_INFO, "config denylist hit: %s (pid %d) -> %s",
+                binary, (int)pid, target);
+        recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_DENY);
+        fanotify_respond(fan_fd, ev, FAN_DENY);
         close(fd_num);
         goto cleanup;
     }
@@ -1554,9 +1590,12 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
 
     /*
      * Decision order (a denial always wins over a grant):
-     *   config allowlist (above)
-     *   -> session deny -> permanent deny -> file cache
-     *   -> session allow -> permanent allow -> rate limit -> dialog
+     *   config deny -> session deny -> permanent deny -> file cache
+     *   -> session allow -> permanent allow -> config allow
+     *   -> rate limit -> dialog
+     * The config allowlist is checked after the runtime grants because
+     * every deny must be evaluated first, which requires the binary and
+     * call-chain hashes computed above.
      */
 
     /* session denylist (runtime "Deny Session") */
@@ -1612,6 +1651,25 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
         fanotify_respond(fan_fd, ev, FAN_ALLOW);
         close(fd_num);
         goto cleanup;
+    }
+
+    /* Config allowlist: an explicit admin opt-in, scoped to a target
+     * file/folder or global for a bare entry.  Checked after every deny
+     * (a denial always wins) and after the runtime grants; the hashes
+     * the deny checks needed were computed above. */
+    {
+        const char *grant = NULL;
+        if (allowlist_match(binary, target, &grant))
+        {
+            int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+            cache_insert(pid, binary, grant, user_ttl);
+            log_msg(LOG_INFO, "config allowlist hit: %s (pid %d) -> %s",
+                    binary, (int)pid, target);
+            recent_cache_insert(pid, ev_dev, ev_ino, (int)FAN_ALLOW);
+            fanotify_respond(fan_fd, ev, FAN_ALLOW);
+            close(fd_num);
+            goto cleanup;
+        }
     }
 
     /* Rate-limit dialog floods from rapidly re-exec'ing processes. */

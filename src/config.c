@@ -75,6 +75,154 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
     snprintf(out, outsz, "%s", in);
 }
 
+/*
+ * Count entries of a NULL-terminated string array.
+ */
+static int string_array_len(char **arr)
+{
+    int n = 0;
+    if (arr)
+        while (arr[n])
+            n++;
+    return n;
+}
+
+/* Append one parsed rule to a section array (shared per-section cap). */
+static void rule_append(RuleEntry *rules, int *count,
+                        const char *binary, const char *target)
+{
+    if (*count >= MAX_RULES)
+    {
+        log_msg(LOG_WARNING, "config_load: too many allow/deny rules (max %d)",
+                MAX_RULES);
+        return;
+    }
+    RuleEntry *e = &rules[*count];
+    snprintf(e->binary, sizeof(e->binary), "%s", binary);
+    snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    (*count)++;
+}
+
+/*
+ * add_rule: parse one [allowlist]/[denylist] line and append the resulting
+ * rule(s).  Format:
+ *
+ *   /path/to/bin = /path/to/target   scoped rule (equal-or-under match)
+ *   /path/to/bin                     global rule (no '=' separator)
+ *
+ * Both sides expand '~' for every real user, mirroring [protected_paths].
+ * When both sides expand, entry i pairs user i's binary with user i's
+ * target (both expansions enumerate /etc/passwd identically); when only
+ * one side expands, the fixed side is shared by every expanded entry.
+ * Trailing slashes are stripped by canonicalize_path so matching is
+ * "equal or under".
+ *
+ * A '=' with an empty right side is a parse error, and a purely numeric
+ * right side is the pre-rework "binary = ttl" format — both log a warning
+ * and skip the line.  Returns 0 on success (skips included), -1 on
+ * out-of-memory.
+ */
+static int add_rule(RuleEntry *rules, int *count, const char *line)
+{
+    char left[PATH_MAX * 2];
+    char bin_raw[PATH_MAX];
+    const char *tgt_raw = NULL;
+
+    snprintf(left, sizeof(left), "%s", line);
+
+    char *eq = strchr(left, '=');
+    if (eq)
+    {
+        *eq = '\0';
+        tgt_raw = trim(eq + 1);
+    }
+    char *b = trim(left);
+    if (!b || b[0] == '\0')
+    {
+        log_msg(LOG_ERR, "config_load: malformed rule line: %s", line);
+        return 0;
+    }
+    snprintf(bin_raw, sizeof(bin_raw), "%s", b);
+
+    if (tgt_raw)
+    {
+        if (*tgt_raw == '\0')
+        {
+            log_msg(LOG_ERR,
+                    "config_load: empty target after '='; use a bare binary "
+                    "line for a global rule: %s", line);
+            return 0;
+        }
+
+        /* Legacy-format guard: entries used to be "binary = ttl_seconds". */
+        int numeric = 1;
+        for (const char *p = tgt_raw; *p != '\0'; p++)
+        {
+            if (*p < '0' || *p > '9')
+            {
+                numeric = 0;
+                break;
+            }
+        }
+        if (numeric)
+        {
+            log_msg(LOG_ERR,
+                    "config_load: numeric target \"%s\" looks like a legacy "
+                    "TTL; rules are now \"binary = target\" — skipping",
+                    tgt_raw);
+            return 0;
+        }
+    }
+
+    /* Expand both sides for all users; non-'~/' paths yield a single copy. */
+    char **bins = expand_home_all_users(bin_raw);
+    if (!bins)
+        return -1;
+
+    char **tgts = NULL;
+    if (tgt_raw)
+    {
+        tgts = expand_home_all_users(tgt_raw);
+        if (!tgts)
+        {
+            free_string_array(bins);
+            return -1;
+        }
+    }
+
+    int nb = string_array_len(bins);
+    int nt = tgts ? string_array_len(tgts) : 1;
+    int n = nb > nt ? nb : nt;
+
+    for (int i = 0; i < n; i++)
+    {
+        const char *bpath = bins[i < nb ? i : nb - 1];
+        const char *tpath = tgts ? tgts[i < nt ? i : nt - 1] : "";
+
+        if (bpath[0] != '/' || (tpath[0] != '\0' && tpath[0] != '/'))
+        {
+            log_msg(LOG_ERR, "config_load: rule paths must be absolute: %s",
+                    line);
+            continue;
+        }
+
+        char bin_canon[PATH_MAX];
+        char tgt_canon[PATH_MAX];
+        canonicalize_path(bpath, bin_canon, sizeof(bin_canon));
+        if (tpath[0] != '\0')
+            canonicalize_path(tpath, tgt_canon, sizeof(tgt_canon));
+        else
+            tgt_canon[0] = '\0';
+
+        rule_append(rules, count, bin_canon, tgt_canon);
+    }
+
+    free_string_array(bins);
+    if (tgts)
+        free_string_array(tgts);
+    return 0;
+}
+
 int config_load(const char *path, Config *cfg)
 {
     FILE *fp = fopen(path, "r");
@@ -134,6 +282,8 @@ int config_load(const char *path, Config *cfg)
                 section = 2;
             else if (strcmp(s + 1, "settings") == 0)
                 section = 3;
+            else if (strcmp(s + 1, "denylist") == 0)
+                section = 4;
             else
                 section = 0;
             continue;
@@ -166,48 +316,13 @@ int config_load(const char *path, Config *cfg)
         }
         else if (section == 2)
         {
-            if (cfg->allowlist_count >= MAX_ALLOWLIST)
-            {
-                log_msg(LOG_WARNING, "config_load: too many allowlist entries (max %d)", MAX_ALLOWLIST);
-                continue;
-            }
-            char *eq = strchr(s, '=');
-            if (!eq)
-            {
-                log_msg(LOG_ERR, "config_load: malformed allowlist line: %s", s);
-                continue;
-            }
-            *eq = '\0';
-            char *binary = trim(s);
-            char *ttl_str = trim(eq + 1);
-
-            int ttl;
-            if (sscanf(ttl_str, "%d", &ttl) != 1 || ttl <= 0)
-            {
-                log_msg(LOG_ERR, "config_load: invalid TTL in allowlist: %s", ttl_str);
-                continue;
-            }
-            if (ttl > MAX_TTL_SECONDS)
-            {
-                log_msg(LOG_WARNING,
-                        "config_load: allowlist TTL %d for %s clamped to %d seconds",
-                        ttl, binary, MAX_TTL_SECONDS);
-                ttl = MAX_TTL_SECONDS;
-            }
-
-            char *expanded = expand_home(binary);
-            if (!expanded)
+            /* [allowlist] "binary = target" or a bare binary (global). */
+            if (add_rule(cfg->allowlist, &cfg->allowlist_count, s) < 0)
             {
                 log_msg(LOG_ERR, "config_load: out of memory");
                 fclose(fp);
                 return -1;
             }
-            canonicalize_path(expanded,
-                              cfg->allowlist[cfg->allowlist_count].binary,
-                              sizeof(cfg->allowlist[cfg->allowlist_count].binary));
-            cfg->allowlist[cfg->allowlist_count].ttl_seconds = ttl;
-            cfg->allowlist_count++;
-            free(expanded);
         }
         else if (section == 3)
         {
@@ -253,6 +368,16 @@ int config_load(const char *path, Config *cfg)
                 }
                 else
                     log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
+            }
+        }
+        else if (section == 4)
+        {
+            /* [denylist] "binary = target" or a bare binary (global). */
+            if (add_rule(cfg->denylist, &cfg->denylist_count, s) < 0)
+            {
+                log_msg(LOG_ERR, "config_load: out of memory");
+                fclose(fp);
+                return -1;
             }
         }
     }
