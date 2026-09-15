@@ -7,9 +7,18 @@
 #define MAX_PATHS 1024
 #define MAX_RULES 128 /* per section: [allowlist] and [denylist] */
 
+/*
+ * One [protected_paths] entry.  Exact entries keep the historical
+ * "equal or under" prefix semantics; glob entries ('*' present) are
+ * matched by glob_match_path() after a path_under_len() prefilter on
+ * the canonical wildcard-free base.
+ */
 typedef struct
 {
-    char path[PATH_MAX];
+    char path[PATH_MAX]; /* canonical pattern (exact path when !is_glob) */
+    int is_glob;
+    int is_exclude;      /* '!' entry: subtracts protection, never marks */
+    int base_len;        /* wildcard-free prefix length; strlen(path) when exact */
 } ProtectedPath;
 
 /*
@@ -28,7 +37,9 @@ typedef struct
 typedef struct
 {
     ProtectedPath protected[MAX_PATHS];
-    int protected_count;
+    int protected_count; /* positives + exclusions                            */
+    int exclude_count;   /* entries in protected[] flagged is_exclude         */
+    int exclude_idx[MAX_PATHS]; /* protected[] indexes of the exclusions      */
     RuleEntry allowlist[MAX_RULES];
     int allowlist_count;
     RuleEntry denylist[MAX_RULES];

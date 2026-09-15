@@ -32,6 +32,9 @@ extern Config *g_config;
 /* Defined later in this file; declared early for the call-chain hasher. */
 static int is_path_under_protected(const char *path);
 
+/* Defined with the protected-path matchers; the inode walk uses it. */
+static const ProtectedPath *exclusion_match(const char *path);
+
 /* Defined later; the decision stages respond through this. */
 static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
                             unsigned int response);
@@ -50,7 +53,9 @@ static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
  * Returns 0 on success, -1 when the link cannot be read.  The caller
  * supplies the buffer: this runs once per event, so no malloc per event
  * (bench_hotpath: 1.960 us with a heap buffer vs 1.915 us with the
- * caller's, and one allocation-failure path fewer).
+ * caller's, and one allocation-failure path fewer).  The kernel appends
+ * " (deleted)" for unlinked-but-open files; that marker is stripped so
+ * matching always sees the real path.
  */
 static int resolve_fd_path(int fd_num, char *out, size_t outsz)
 {
@@ -62,6 +67,11 @@ static int resolve_fd_path(int fd_num, char *out, size_t outsz)
     if (len < 0)
         return -1;
     out[len] = '\0';
+
+    static const char deleted[] = " (deleted)";
+    size_t dlen = sizeof(deleted) - 1;
+    if ((size_t)len >= dlen && strcmp(out + len - dlen, deleted) == 0)
+        out[len - dlen] = '\0';
     return 0;
 }
 
@@ -779,10 +789,13 @@ typedef struct
 static MountEntry g_mounts[MAX_MOUNTS];
 static int g_mount_count = 0;
 
-/* Recursively walk a directory and add inodes of all regular files.
+/* Recursively walk a directory and add inodes of regular files.
  * Stays on the same device (no cross-mount traversal).
- * Depth is capped at MAX_INODE_WALK_DEPTH to bound worst-case traversal time. */
-static void inode_walk_dir(const char *dirpath, dev_t dev, int depth)
+ * Depth is capped at MAX_INODE_WALK_DEPTH to bound worst-case traversal time.
+ * A non-NULL pattern records only files matching a glob protected entry;
+ * exact entries pass NULL and record every file. */
+static void inode_walk_dir(const char *dirpath, dev_t dev, int depth,
+                           const char *pattern)
 {
     if (depth > MAX_INODE_WALK_DEPTH)
         return;
@@ -807,28 +820,86 @@ static void inode_walk_dir(const char *dirpath, dev_t dev, int depth)
         if (st.st_dev != dev) /* skip bind mounts / nested filesystems */
             continue;
         if (S_ISREG(st.st_mode))
-            inode_set_add(st.st_dev, st.st_ino);
+        {
+            if ((pattern == NULL || glob_match_path(pattern, child)) &&
+                exclusion_match(child) == NULL)
+                inode_set_add(st.st_dev, st.st_ino);
+        }
         else if (S_ISDIR(st.st_mode))
-            inode_walk_dir(child, dev, depth + 1);
+        {
+            inode_walk_dir(child, dev, depth + 1, pattern);
+        }
     }
     closedir(d);
 }
 
 /*
- * Returns 1 if `path` falls under any currently protected path.
- * Used to distinguish events from directory marks vs. mount marks (hard-link).
- * Delegates the boundary math to the shared path_under() helper.
+ * Shared entry matcher.  Exact entries use equal-or-under prefix
+ * semantics; glob entries pass a cheap path_under_len() prefilter on
+ * their canonical wildcard-free base before the full matcher, so a
+ * non-matching mount-mark event costs one prefix compare.
+ */
+static int path_matches_entry(const ProtectedPath *pp, const char *path)
+{
+    if (!pp->is_glob)
+        return path_under(path, pp->path);
+    if (!path_under_len(path, pp->path, (size_t)pp->base_len))
+        return 0;
+    return glob_match_path(pp->path, path);
+}
+
+/*
+ * First exclusion ('!') entry matching `path`, or NULL.  Gated on
+ * exclude_count so configs without exclusions keep the exact same hot
+ * path as before, and scans only the recorded exclusion indexes so the
+ * cost scales with the number of carve-outs, not the protected list.
+ */
+static const ProtectedPath *exclusion_match(const char *path)
+{
+    if (!g_config || g_config->exclude_count == 0)
+        return NULL;
+    for (int i = 0; i < g_config->exclude_count; i++)
+    {
+        const ProtectedPath *pp = &g_config->protected[g_config->exclude_idx[i]];
+        if (pp->is_exclude && path_matches_entry(pp, path))
+            return pp;
+    }
+    return NULL;
+}
+
+/*
+ * Returns 1 if `path` falls under any currently protected path and no
+ * exclusion matches it.  Deny wins and config order does not matter: a
+ * path is protected iff a positive matches and no '!' entry does.
+ * Used to distinguish events from directory marks vs. mount marks
+ * (hard-link).
  */
 static int is_path_under_protected(const char *path)
 {
+    int matched = 0;
+
     if (!g_config)
         return 0;
     for (int i = 0; i < g_config->protected_count; i++)
     {
-        if (path_under(path, g_config->protected[i].path))
-            return 1;
+        const ProtectedPath *pp = &g_config->protected[i];
+        if (!pp->is_exclude && path_matches_entry(pp, path))
+        {
+            matched = 1;
+            break;
+        }
     }
-    return 0;
+    if (!matched)
+        return 0;
+
+    const ProtectedPath *ex = exclusion_match(path);
+    if (ex)
+    {
+        log_msg(LOG_DEBUG, "[event] allowed by exclusion !%s: %s",
+                ex->path, path);
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1025,11 +1096,85 @@ int fanotify_add_mark(int fd, const char *path)
     log_msg(LOG_INFO, "fanotify mark added: %s", path);
 
     if (S_ISREG(st.st_mode))
-        inode_set_add(st.st_dev, st.st_ino);
+    {
+        if (exclusion_match(path) == NULL)
+            inode_set_add(st.st_dev, st.st_ino);
+    }
     else if (S_ISDIR(st.st_mode))
-        inode_walk_dir(path, st.st_dev, 0);
+    {
+        inode_walk_dir(path, st.st_dev, 0, NULL);
+    }
 
     add_mount_mark_if_needed(fd, &st, path);
+    return 0;
+}
+
+/*
+ * Add the mark for one configured [protected_paths] entry.
+ *
+ * Exact entries behave exactly like fanotify_add_mark().  A glob
+ * pattern cannot be stat()ed or marked, so its canonical wildcard-free
+ * base is marked instead and the pattern is enforced at match time by
+ * is_path_under_protected().  A base that does not exist yet follows
+ * the same contract as a missing exact path (mount mark up the tree,
+ * return 1/skipped).  Hard-link inode tracking for a glob base records
+ * only the files the pattern matches.  Exclusion entries mark nothing
+ * and return 0.
+ */
+int fanotify_add_protected(int fd, const ProtectedPath *pp)
+{
+    if (pp->is_exclude)
+        return 0; /* exclusions only subtract protection; nothing to mark */
+
+    if (!pp->is_glob)
+        return fanotify_add_mark(fd, pp->path);
+
+    char base[PATH_MAX];
+    if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
+        return -1;
+    memcpy(base, pp->path, (size_t)pp->base_len);
+    base[pp->base_len] = '\0';
+
+    struct stat st;
+    if (stat(base, &st) != 0)
+    {
+        if (errno == ENOENT)
+        {
+            ensure_mount_mark_for_missing(fd, base);
+            log_msg(LOG_WARNING,
+                    "protected glob base does not exist yet, skipping "
+                    "direct mark: %s (pattern %s)",
+                    base, pp->path);
+            return 1;
+        }
+        log_msg(LOG_ERR, "stat %s: %s", base, strerror(errno));
+        return -1;
+    }
+
+    unsigned int mask = fanotify_mark_mask();
+    if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, base) < 0)
+    {
+        log_msg(LOG_ERR, "fanotify_mark ADD %s (glob base of %s): %s",
+                base, pp->path, strerror(errno));
+        return -1;
+    }
+    mark_table_add(base, mask);
+    log_msg(LOG_INFO, "fanotify mark added: %s (glob base of %s)",
+            base, pp->path);
+
+    if (S_ISREG(st.st_mode))
+    {
+        /* The pattern is anchored in a regular file's name; only that
+         * file itself can be recorded. */
+        if (glob_match_path(pp->path, base) && exclusion_match(base) == NULL)
+            inode_set_add(st.st_dev, st.st_ino);
+    }
+    else if (S_ISDIR(st.st_mode))
+    {
+        inode_walk_dir(base, st.st_dev, 0, pp->path);
+    }
+
+    add_mount_mark_if_needed(fd, &st, base);
     return 0;
 }
 
@@ -2169,4 +2314,9 @@ int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129])
 int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path)
 {
     return inode_set_contains(dev, ino) == 0 && !is_path_under_protected(path);
+}
+
+int fanotify_test_resolve_path(int fd, char *out, size_t outsz)
+{
+    return resolve_fd_path(fd, out, outsz);
 }

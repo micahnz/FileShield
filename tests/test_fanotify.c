@@ -34,6 +34,8 @@
 #include <unistd.h>
 
 #include "../src/fanotify.h"
+#include "../src/config.h"
+#include "../src/inode.h"
 #include "../src/sha512.h"
 #include "../src/utils.h"
 
@@ -110,6 +112,197 @@ static void test_missing_path_is_skipped(void) {
     rc = fanotify_add_mark(-1, "/");
     ASSERT(rc == -1, "existing path mark failure is fatal (rc -1)");
     ASSERT(fanotify_any_mark_active() == 0, "failed mark adds no state");
+}
+
+/*
+ * Part 0c: glob entries protect through the fast-path verdict.
+ * fanotify_test_fastpath_allows() is the same classification the mount
+ * fast path uses: 0 means "protected, needs a decision", 1 means
+ * "mount-mark noise, allow instantly".
+ */
+static void test_glob_protected_verdict(void) {
+    static Config cfg;
+    const char *base = "/home/u/.cloudflared";
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "%s", "/home/u/.cloudflared/*.json");
+    cfg.protected[0].is_glob = 1;
+    cfg.protected[0].base_len = (int)strlen(base);
+    snprintf(cfg.protected[1].path, sizeof(cfg.protected[1].path),
+             "%s", "/home/u/.cloudflared/**/*.json");
+    cfg.protected[1].is_glob = 1;
+    cfg.protected[1].base_len = (int)strlen(base);
+    snprintf(cfg.protected[2].path, sizeof(cfg.protected[2].path),
+             "%s", "/home/u/.ssh");
+    cfg.protected[2].is_glob = 0;
+    cfg.protected[2].base_len = (int)strlen(cfg.protected[2].path);
+    cfg.protected_count = 3;
+
+    Config *saved = g_config;
+    g_config = &cfg;
+    inode_set_clear();
+
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.cloudflared/abc.json") == 0,
+           "glob matches a direct child");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.cloudflared/a/b/c.json") == 0,
+           "globstar matches nested files");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.cloudflared/cert.pem") == 1,
+           "non-matching file under the base is mount-mark noise");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.cloudflared/sub/abc.txt") == 1,
+           "non-matching nested file is mount-mark noise");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.cloudflaredX/abc.json") == 1,
+           "glob base boundary is respected");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/other/abc.json") == 1,
+           "path outside the base is not protected");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/id_rsa") == 0,
+           "exact entry still protects its subtree");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.sshd/x") == 1,
+           "exact entry boundary unchanged");
+
+    g_config = saved;
+    inode_set_clear();
+}
+
+/*
+ * Part 0d: a glob entry whose base does not exist is skipped like a
+ * missing exact path (rc 1, no mark state), keeping startup's skipped
+ * accounting and the mount-mark fallback intact.
+ */
+static void test_glob_missing_base_is_skipped(void) {
+    ProtectedPath pp;
+    memset(&pp, 0, sizeof(pp));
+    snprintf(pp.path, sizeof(pp.path),
+             "/nonexistent/fileshield/globbase_%d/*.json", (int)getpid());
+    pp.is_glob = 1;
+    pp.base_len = (int)(strlen(pp.path) - strlen("/*.json"));
+
+    int rc = fanotify_add_protected(-1, &pp);
+    ASSERT(rc == 1, "missing glob base is skipped (rc 1)");
+    ASSERT(fanotify_any_mark_active() == 0, "missing glob base adds no mark state");
+
+    ProtectedPath exact;
+    memset(&exact, 0, sizeof(exact));
+    snprintf(exact.path, sizeof(exact.path),
+             "/nonexistent/fileshield/missing-exact_%d", (int)getpid());
+    exact.base_len = (int)strlen(exact.path);
+
+    rc = fanotify_add_protected(-1, &exact);
+    ASSERT(rc == 1, "missing exact entry is skipped (rc 1)");
+    ASSERT(fanotify_any_mark_active() == 0, "missing exact entry adds no state");
+}
+
+/*
+ * Part 0e: the kernel reports unlinked-but-open fds as
+ * "/path (deleted)"; resolve_fd_path() strips the marker so a deleted
+ * protected file still resolves to (and matches) its real path.
+ */
+static void test_deleted_suffix_stripped(void) {
+    char dir[] = "/tmp/fileshield_del_XXXXXX";
+    char path[PATH_MAX];
+    char link[64];
+    char raw[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (!mkdtemp(dir)) {
+        fprintf(stderr, "FAIL: mkdtemp for deleted-suffix test: %s\n",
+                strerror(errno));
+        failures++;
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%s/secret", dir);
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    ASSERT(fd >= 0, "create file for deleted-suffix test");
+    if (fd < 0) {
+        rmdir(dir);
+        return;
+    }
+    ASSERT(unlink(path) == 0, "unlink the open file");
+
+    /* The kernel must report the marker, or the strip is untested. */
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, raw, sizeof(raw) - 1);
+    ASSERT(n > 0, "readlink the deleted fd");
+    if (n > 0) {
+        raw[n] = '\0';
+        ASSERT(strlen(raw) >= sizeof(" (deleted)") - 1 &&
+               strcmp(raw + strlen(raw) - (sizeof(" (deleted)") - 1),
+                      " (deleted)") == 0,
+               "kernel reports the deleted marker");
+    }
+
+    ASSERT(fanotify_test_resolve_path(fd, resolved, sizeof(resolved)) == 0,
+           "resolve the deleted fd path");
+    ASSERT(strstr(resolved, " (deleted)") == NULL, "deleted marker stripped");
+    ASSERT(strstr(resolved, "secret") != NULL, "real path preserved");
+
+    close(fd);
+    rmdir(dir);
+}
+
+/*
+ * Part 0f: '!' exclusions are deny-wins and order-independent.  The
+ * exclusion is listed before the positive to prove that config order
+ * does not matter.
+ */
+static void test_exclusions_deny_wins(void) {
+    static Config cfg;
+    const char *base = "/home/u/.ssh";
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "%s", "/home/u/.ssh/*.pub");
+    cfg.protected[0].is_glob = 1;
+    cfg.protected[0].is_exclude = 1;
+    cfg.protected[0].base_len = (int)strlen(base);
+    snprintf(cfg.protected[1].path, sizeof(cfg.protected[1].path),
+             "%s", base);
+    cfg.protected[1].is_glob = 0;
+    cfg.protected[1].base_len = (int)strlen(base);
+    cfg.protected_count = 2;
+    cfg.exclude_count = 1;
+
+    Config *saved = g_config;
+    g_config = &cfg;
+    inode_set_clear();
+
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/id_ed25519") == 0,
+           "private key stays protected");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/id_ed25519.pub") == 1,
+           "excluded public key is allowed as mount-mark noise");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/id_ed25519.pub") == 0,
+           "single '*' exclusion does not cross segments");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/id_ed25519.pub.bak") == 0,
+           "exclusion requires the full file-name match");
+
+    /* A '**' exclusion reaches nested files and zero segments. */
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "%s", "/home/u/.ssh/**/*.pub");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/id_ed25519.pub") == 1,
+           "globstar exclusion matches zero segments");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/id_ed25519.pub") == 1,
+           "globstar exclusion matches nested files");
+
+    g_config = saved;
+    inode_set_clear();
+}
+
+/*
+ * Part 0g: an exclusion entry is never marked: fanotify_add_protected()
+ * returns 0 without touching the mark table or the inode set.
+ */
+static void test_exclusion_is_not_marked(void) {
+    ProtectedPath pp;
+    memset(&pp, 0, sizeof(pp));
+    snprintf(pp.path, sizeof(pp.path), "%s", "/home/u/.ssh/*.pub");
+    pp.is_glob = 1;
+    pp.is_exclude = 1;
+    pp.base_len = (int)strlen("/home/u/.ssh");
+
+    int rc = fanotify_add_protected(-1, &pp);
+    ASSERT(rc == 0, "exclusion adds no mark (rc 0)");
+    ASSERT(fanotify_any_mark_active() == 0, "exclusion adds no mark state");
 }
 
 /*
@@ -602,6 +795,11 @@ int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_missing_path_is_skipped();
+    test_glob_protected_verdict();
+    test_glob_missing_base_is_skipped();
+    test_exclusions_deny_wins();
+    test_exclusion_is_not_marked();
+    test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
     test_cmdline_fingerprint_full();

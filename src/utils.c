@@ -128,10 +128,9 @@ void log_msg(int priority, const char *fmt, ...)
     va_end(a2);
 }
 
-int path_under(const char *path, const char *dir)
+int path_under_len(const char *path, const char *dir, size_t dlen)
 {
     size_t plen = strlen(path);
-    size_t dlen = strlen(dir);
 
     if (plen == 0)
         return 0;
@@ -148,6 +147,161 @@ int path_under(const char *path, const char *dir)
         return 0;
 
     return (plen == dlen || path[dlen] == '/');
+}
+
+int path_under(const char *path, const char *dir)
+{
+    return path_under_len(path, dir, strlen(dir));
+}
+
+/* ------------------------------------------------------------------ */
+/*  glob matching for protected paths                                  */
+/* ------------------------------------------------------------------ */
+
+/* Length of the path segment starting at s (up to '/' or NUL). */
+static size_t seg_len(const char *s)
+{
+    const char *slash = strchr(s, '/');
+    return slash ? (size_t)(slash - s) : strlen(s);
+}
+
+/*
+ * seg_glob_match: byte-wise '*' wildcard match confined to one path
+ * segment.  Only '*' is special; the classic single-backtrack loop
+ * keeps it allocation-free with bounded work per segment.
+ */
+static int seg_glob_match(const char *pat, size_t plen,
+                          const char *name, size_t nlen)
+{
+    size_t pi = 0, ni = 0;
+    size_t star_pi = 0, star_ni = 0;
+    int have_star = 0;
+
+    while (ni < nlen)
+    {
+        if (pi < plen && pat[pi] == '*')
+        {
+            have_star = 1;
+            star_pi = pi++;
+            star_ni = ni;
+        }
+        else if (pi < plen && pat[pi] == name[ni])
+        {
+            pi++;
+            ni++;
+        }
+        else if (have_star)
+        {
+            pi = star_pi + 1;
+            ni = ++star_ni;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    while (pi < plen && pat[pi] == '*')
+        pi++;
+    return pi == plen;
+}
+
+int glob_base_len(const char *pattern)
+{
+    const char *seg = pattern;
+
+    if (*seg == '/')
+        seg++;
+
+    for (;;)
+    {
+        const char *end = seg;
+        while (*end != '\0' && *end != '/')
+            end++;
+
+        if (memchr(seg, '*', (size_t)(end - seg)) != NULL)
+        {
+            if (seg == pattern)
+                return 0; /* wildcard in the first segment: no base */
+            if (seg == pattern + 1 && pattern[0] == '/')
+                return 1; /* wildcard directly under root: base is "/" */
+            return (int)(seg - pattern - 1);
+        }
+        if (*end == '\0')
+            return (int)(end - pattern);
+        seg = end + 1;
+    }
+}
+
+int glob_match_path(const char *pattern, const char *path)
+{
+    const char *pp = pattern; /* current pattern segment */
+    const char *sp = path;    /* current path segment */
+    size_t plen = seg_len(pp);
+    size_t slen = seg_len(sp);
+
+    const char *star_pp = NULL; /* pattern just after the active "**" */
+    const char *star_sp = NULL; /* path position the "**" started at */
+    size_t star_slen = 0;
+
+    while (*sp != '\0')
+    {
+        int pat_seg = (*pp != '\0' || plen > 0);
+
+        if (pat_seg && plen == 2 && pp[0] == '*' && pp[1] == '*')
+        {
+            /* Globstar: remember it, then try it with zero segments. */
+            star_pp = pp + 2;
+            if (*star_pp == '/')
+                star_pp++;
+            star_sp = sp;
+            star_slen = slen;
+            pp = star_pp;
+            plen = seg_len(pp);
+            continue;
+        }
+        if (pat_seg && seg_glob_match(pp, plen, sp, slen))
+        {
+            pp += plen;
+            if (*pp == '/')
+                pp++;
+            plen = seg_len(pp);
+            sp += slen;
+            if (*sp == '/')
+                sp++;
+            slen = seg_len(sp);
+            continue;
+        }
+        if (star_pp != NULL)
+        {
+            /* Let the remembered "**" eat one more path segment. */
+            star_sp += star_slen;
+            if (*star_sp == '/')
+                star_sp++;
+            star_slen = seg_len(star_sp);
+            pp = star_pp;
+            plen = seg_len(pp);
+            sp = star_sp;
+            slen = star_slen;
+            continue;
+        }
+        return 0;
+    }
+
+    /* Path exhausted: only trailing "**" segments may remain. */
+    while (*pp != '\0' || plen > 0)
+    {
+        if (plen == 2 && pp[0] == '*' && pp[1] == '*')
+        {
+            pp += 2;
+            if (*pp == '/')
+                pp++;
+            plen = seg_len(pp);
+            continue;
+        }
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */

@@ -177,12 +177,41 @@ static void bench_fastpath_setup(void)
         "/home/u/.local", "/home/u/.cache"};
 
     g_bench_cfg.protected_count = 0;
+    g_bench_cfg.exclude_count = 0;
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
     {
         snprintf(g_bench_cfg.protected[g_bench_cfg.protected_count].path,
                  PATH_MAX, "%s", prefixes[i]);
         g_bench_cfg.protected_count++;
     }
+
+    /* Glob entries mirroring the shipped cloudflared rules, so the
+     * fastpath benches below include the prefilter + matcher cost. */
+    static const char *const globs[] = {
+        "/home/u/.cloudflared/*.json",
+        "/home/u/.cloudflared/**/*.json"};
+
+    for (size_t i = 0; i < sizeof(globs) / sizeof(globs[0]); i++)
+    {
+        ProtectedPath *pp = &g_bench_cfg.protected[g_bench_cfg.protected_count];
+        snprintf(pp->path, PATH_MAX, "%s", globs[i]);
+        pp->is_glob = 1;
+        pp->base_len = (int)strlen("/home/u/.cloudflared");
+        g_bench_cfg.protected_count++;
+    }
+
+    /* One exclusion mirrors the shipped ssh rule: deny-wins costs an
+     * exclusion scan only after a positive entry matches. */
+    {
+        ProtectedPath *pp = &g_bench_cfg.protected[g_bench_cfg.protected_count];
+        snprintf(pp->path, PATH_MAX, "%s", "/home/u/.ssh/*.pub");
+        pp->is_glob = 1;
+        pp->is_exclude = 1;
+        pp->base_len = (int)strlen("/home/u/.ssh");
+        g_bench_cfg.protected_count++;
+        g_bench_cfg.exclude_count = 1;
+    }
+
     g_config = &g_bench_cfg;
 }
 
@@ -225,6 +254,39 @@ static void bench_fastpath_protected(void *arg)
     for (int i = 0; i < iters; i++)
         (void)fanotify_test_fastpath_allows(3, 999999,
                                             "/home/u/.ssh/id_rsa");
+}
+
+/*
+ * Glob entry, non-matching file under the base: rejected by the
+ * path_under_len() prefilter (mount-mark noise cost).
+ */
+static void bench_fastpath_glob_noise(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        (void)fanotify_test_fastpath_allows(3, 999999,
+                                            "/home/u/.cloudflared/cert.pem");
+}
+
+/* Glob entry, matching nested file: prefilter + full segment matcher. */
+static void bench_fastpath_glob_match(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        (void)fanotify_test_fastpath_allows(3, 999999,
+                                            "/home/u/.cloudflared/team/abc.json");
+}
+
+/* Exclusion hit: positive .ssh match, then the !*.pub exclusion wins. */
+static void bench_fastpath_excluded(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        (void)fanotify_test_fastpath_allows(3, 999999,
+                                            "/home/u/.ssh/id_ed25519.pub");
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,6 +466,12 @@ int main(void)
     report("fastpath verdict (noise)", bench_fastpath_noise, &iters_inode,
            iters_inode);
     report("fastpath verdict (protected)", bench_fastpath_protected,
+           &iters_inode, iters_inode);
+    report("fastpath glob (noise under base)", bench_fastpath_glob_noise,
+           &iters_inode, iters_inode);
+    report("fastpath glob (matching file)", bench_fastpath_glob_match,
+           &iters_inode, iters_inode);
+    report("fastpath excluded (ssh pub key)", bench_fastpath_excluded,
            &iters_inode, iters_inode);
     bench_inode_fill(INODE_SET_MAX);
     iters_inode = 5000;

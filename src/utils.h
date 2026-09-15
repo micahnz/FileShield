@@ -76,6 +76,32 @@ void close_fds_from(int first);
 int path_under(const char *path, const char *dir);
 
 /*
+ * path_under_len: path_under() with the directory length supplied by the
+ * caller.  Glob entries cache their wildcard-free base length, so the
+ * hot-path prefilter avoids a strlen per event.
+ */
+int path_under_len(const char *path, const char *dir, size_t dirlen);
+
+/*
+ * glob_base_len: length of the wildcard-free prefix of a glob pattern —
+ * the part before the first segment containing '*'.  That prefix is the
+ * directory a glob entry can be marked on directly and the cheap
+ * prefilter before glob_match_path().  Returns the pattern length when
+ * the pattern contains no '*', and 0 when the first segment is a
+ * wildcard (no usable base).
+ */
+int glob_base_len(const char *pattern);
+
+/*
+ * glob_match_path: full-path match of a glob pattern against a path
+ * (both canonical).  '*' matches zero or more characters within one
+ * segment and never crosses '/'; a segment that is exactly "**" matches
+ * zero or more segments.  '?', '[' and ']' are literal.  No allocation,
+ * no recursion, single-backtrack greedy matcher.  Returns 1 on match.
+ */
+int glob_match_path(const char *pattern, const char *path);
+
+/*
  * expand_home_all_users: expand a ~/... path template for every user in
  * /etc/passwd and return a NULL-terminated array of malloc'd strings.
  * For paths that do not start with ~/ the array contains a single copy.

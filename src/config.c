@@ -216,6 +216,124 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
     return 0;
 }
 
+/*
+ * protected_path_set: canonicalize one [protected_paths] entry into pp.
+ *
+ * Exact entries keep the historical behavior: the whole path is
+ * canonicalized.
+ *
+ * Glob entries are split at the first wildcard segment.  Only the
+ * wildcard-free base is canonicalized (so symlinked homes still match
+ * the canonical /proc/self/fd target paths); the suffix is matched
+ * verbatim by glob_match_path().  A malformed suffix — '..', an empty
+ * segment ("//" or a trailing slash) — rejects the whole entry.  Fail
+ * closed: a typo'd pattern must never silently protect nothing.
+ *
+ * Returns 0 on success, -1 when the entry is rejected.
+ */
+static int protected_path_set(ProtectedPath *pp, const char *raw)
+{
+    memset(pp, 0, sizeof(*pp));
+
+    if (strchr(raw, '*') == NULL)
+    {
+        canonicalize_path(raw, pp->path, sizeof(pp->path));
+        pp->is_glob = 0;
+        pp->base_len = (int)strlen(pp->path);
+        return 0;
+    }
+
+    if (raw[0] != '/')
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern must be absolute: %s", raw);
+        return -1;
+    }
+
+    int blen = glob_base_len(raw);
+    if (blen <= 0)
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern has no static base: %s", raw);
+        return -1;
+    }
+    if (blen >= PATH_MAX)
+    {
+        log_msg(LOG_ERR, "config_load: glob base too long: %s", raw);
+        return -1;
+    }
+
+    char base[PATH_MAX];
+    memcpy(base, raw, (size_t)blen);
+    base[blen] = '\0';
+
+    const char *suffix = raw + blen;
+    if (*suffix != '/')
+    {
+        log_msg(LOG_ERR, "config_load: malformed glob pattern: %s", raw);
+        return -1;
+    }
+
+    /* Suffix segments must be non-empty and free of "..". */
+    for (const char *p = suffix + 1;;)
+    {
+        const char *end = strchr(p, '/');
+        size_t seglen = end ? (size_t)(end - p) : strlen(p);
+        if (seglen == 0)
+        {
+            log_msg(LOG_ERR, "config_load: empty segment in glob pattern: %s", raw);
+            return -1;
+        }
+        if (seglen == 2 && p[0] == '.' && p[1] == '.')
+        {
+            log_msg(LOG_ERR, "config_load: '..' not allowed in glob pattern: %s", raw);
+            return -1;
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+
+    char base_canon[PATH_MAX];
+    canonicalize_path(base, base_canon, sizeof(base_canon));
+
+    size_t base_len = strlen(base_canon);
+    size_t suffix_len = strlen(suffix);
+
+    /* An unresolvable ".." in the base yields a pattern no canonical
+     * target can ever match; reject it rather than protect nothing. */
+    if (strstr(base_canon, "/../") != NULL ||
+        (base_len > 3 && strcmp(base_canon + base_len - 3, "/..") == 0) ||
+        strcmp(base_canon, "/..") == 0)
+    {
+        log_msg(LOG_ERR, "config_load: unresolvable '..' in glob base: %s", raw);
+        return -1;
+    }
+
+    if (base_len + suffix_len >= sizeof(pp->path))
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern too long: %s", raw);
+        return -1;
+    }
+
+    if (base_len == 1 && base_canon[0] == '/')
+    {
+        memcpy(pp->path, suffix, suffix_len + 1);
+    }
+    else
+    {
+        memcpy(pp->path, base_canon, base_len);
+        memcpy(pp->path + base_len, suffix, suffix_len + 1);
+    }
+
+    pp->is_glob = 1;
+    pp->base_len = (int)base_len;
+
+    if (pp->base_len == 1)
+        log_msg(LOG_WARNING,
+                "config_load: glob pattern based at / can be expensive to walk: %s",
+                raw);
+    return 0;
+}
+
 /* Sections of fileshield.conf; SECTION_NONE is "before/outside any". */
 enum
 {
@@ -297,9 +415,31 @@ int config_load(const char *path, Config *cfg)
 
         if (section == SECTION_PROTECTED)
         {
+            /*
+             * A leading '!' marks an exclusion: it protects nothing
+             * itself and removes matching paths from the protection of
+             * every positive entry (deny wins; config order is
+             * irrelevant).  '!' elsewhere is an ordinary path
+             * character.  Exclusions must be absolute after '~'
+             * expansion — unlike legacy exact positives, a relative one
+             * can never match a canonical target.
+             */
+            const char *raw = s;
+            int is_exclude = 0;
+            if (raw[0] == '!')
+            {
+                is_exclude = 1;
+                raw = trim(s + 1);
+                if (*raw == '\0')
+                {
+                    log_msg(LOG_ERR, "config_load: empty exclusion: %s", s);
+                    continue;
+                }
+            }
+
             /* Expand ~/... for every user in /etc/passwd so that each
              * user's home directory is protected, not just root's. */
-            char **paths = expand_home_all_users(s);
+            char **paths = expand_home_all_users(raw);
             if (!paths)
             {
                 log_msg(LOG_ERR, "config_load: out of memory");
@@ -313,9 +453,22 @@ int config_load(const char *path, Config *cfg)
                     log_msg(LOG_WARNING, "config_load: too many protected paths (max %d)", MAX_PATHS);
                     break;
                 }
-                canonicalize_path(paths[pi],
-                                  cfg->protected[cfg->protected_count].path,
-                                  sizeof(cfg->protected[cfg->protected_count].path));
+                if (is_exclude && paths[pi][0] != '/')
+                {
+                    log_msg(LOG_ERR, "config_load: exclusion must be absolute: %s", s);
+                    continue;
+                }
+                ProtectedPath *pp = &cfg->protected[cfg->protected_count];
+                if (protected_path_set(pp, paths[pi]) < 0)
+                    continue; /* malformed glob: rejected with a warning */
+                pp->is_exclude = is_exclude;
+                if (is_exclude)
+                {
+                    cfg->exclude_idx[cfg->exclude_count] = cfg->protected_count;
+                    cfg->exclude_count++;
+                    /* Audit trail: every carve-out is visible in the journal. */
+                    log_msg(LOG_INFO, "config_load: exclusion: !%s", pp->path);
+                }
                 cfg->protected_count++;
             }
             free_string_array(paths);

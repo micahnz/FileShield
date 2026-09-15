@@ -119,54 +119,29 @@ Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove ol
 
 ### Default Protected Paths
 
-FileShield ships with the following paths protected out of the box:
-
-```ini
-[protected_paths]
-# --- Cloud credentials ---
-~/.aws/credentials
-~/.aws/config
-~/.azure/
-~/.config/gcloud/
-
-# --- Kubernetes ---
-~/.kube/config
-~/.kube/cache/
-
-# --- SSH ---
-~/.ssh/
-
-# --- GPG / age / SOPS ---
-~/.gnupg/
-~/.config/sops/
-
-# --- Password managers & vaults ---
-~/.password-store/
-~/.config/op/
-~/.vault-token
-~/.config/vault/
-
-# --- Container registries ---
-~/.docker/config.json
-~/.config/helm/repositories.yaml
-
-# --- Terraform ---
-~/.terraform.d/credentials.tfrc.json
-~/.terraformrc
-
-# --- SCM tokens ---
-~/.config/gh/hosts.yml
-
-# --- GitHub Actions / CI secrets ---
-~/.config/github-copilot/
-~/.config/hub
-
-# --- General ---
-~/.netrc
-~/.env
-```
+The default `[protected_paths]` list ships in [`fileshield.conf`](fileshield.conf); `make install` copies it to `/etc/fileshield.conf`. It is the authoritative list and is maintained there rather than duplicated here. It covers common credential stores: shell histories and environment files, SSH and GPG key material, cloud CLIs (AWS, Azure, GCP, Cloudflare, and others), Kubernetes and container registries, package-manager tokens, password managers, and AI coding agents. Edit the installed copy and reload.
 
 Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start if any configured path that exists cannot be marked, if `[protected_paths]` is empty, or if nothing at all could be marked (fail closed).
+
+#### Glob patterns in `[protected_paths]`
+
+Entries may contain `*` and `**`:
+
+```ini
+~/.cloudflared/*.json      # files directly inside ~/.cloudflared
+~/.cloudflared/**/*.json   # the same, at any depth (including directly inside)
+~/.ssh/id_*                # key material inside ~/.ssh
+```
+
+- `*` matches any characters **within one path segment** and never crosses `/`. It matches dotfiles too (`.env.local` is covered by `~/.env*`).
+- `**` is a **whole-segment** wildcard that matches zero or more segments: `~/.cloudflared/**/*.json` also matches `~/.cloudflared/a.json`, and `~/.cloudflared/**` protects the whole tree.
+- Patterns must be absolute after `~` expansion. `?`, `[`, `]` and `\` are literal characters; matching is case-sensitive.
+- A pattern protects only paths that fully match it — a matched directory does not silently cover its contents. Use `~/.cloudflared/*` for direct children and `~/.cloudflared/**` for the subtree.
+- A glob entry marks its wildcard-free base directory (`~/.cloudflared`). A base that does not exist yet behaves like a missing exact path: it is skipped at startup and covered by the filesystem mount mark until it appears (reload to add the direct mark).
+- A malformed pattern (relative, or `..`, `//` or a trailing slash in the wildcard part) is rejected at load time with a log message — it never silently protects nothing.
+- A line starting with `!` is an **exclusion**: it removes matching paths from protection instead of adding it. `~/.ssh/` plus `!~/.ssh/*.pub` protects the whole directory except public keys; add `!~/.ssh/**/*.pub` to exclude nested ones too.
+- Exclusions **win over positives** and config order does not matter (deny wins): a path is protected if and only if a positive entry matches it and no exclusion does. They must be absolute after `~` expansion, are canonicalized and matched exactly like positives, and a malformed exclusion is rejected at load. An exclusions-only `[protected_paths]` refuses to start.
+- Exclusion matching is path-based: a private key misnamed `*.pub` would be excluded too.
 
 ### Allowlist
 

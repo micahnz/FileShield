@@ -2,6 +2,7 @@
 #define FILESHIELD_FANOTIFY_H
 
 #include <sys/fanotify.h>
+#include "config.h"
 #include "persist.h"
 
 int fanotify_setup(void);
@@ -13,6 +14,14 @@ int fanotify_setup(void);
  * later-created path is still intercepted), or -1 on a real error.
  */
 int fanotify_add_mark(int fd, const char *path);
+
+/*
+ * Add the mark for one configured [protected_paths] entry.  Exact
+ * entries mark the path directly (same contract as fanotify_add_mark);
+ * glob entries mark their canonical wildcard-free base and enforce the
+ * pattern at match time.  Return values match fanotify_add_mark().
+ */
+int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
 void fanotify_loop(int fd);
 
@@ -100,5 +109,13 @@ int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129]);
  * classification cost at realistic table sizes.
  */
 int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path);
+
+/*
+ * Test seam: resolve an open fd to its path exactly like the event
+ * pipeline does (including the " (deleted)" marker stripping).  Lets
+ * test_fanotify pin the unlinked-file behavior without a kernel
+ * permission event.
+ */
+int fanotify_test_resolve_path(int fd, char *out, size_t outsz);
 
 #endif

@@ -44,15 +44,15 @@ Headers are the source of truth for signatures; this table is the map.
 | Module | Owns |
 |--------|------|
 | `main.c` | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state loading |
-| `fanotify.c/h` | fanotify init/marks/mount marks, per-event decision pipeline, runtime allow/deny lists, deferred-event queue, dialog pump |
+| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, deferred-event queue, dialog pump |
 | `inode.c/h` | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades) |
-| `config.c/h` | INI parse (`[protected_paths]`, `[allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, TTL clamps |
+| `config.c/h` | INI parse (`[protected_paths]`, `[allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix), `!` exclusions, TTL clamps |
 | `cache.c/h` | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time) |
 | `session.c/h` | POSIX-session-scoped allow/deny entries, leader-lifetime validity |
 | `notify.c/h` | per-prompt session detection, user drop, environment whitelist, kdialog stages, fail-closed outcomes |
 | `persist.c/h` | atomic JSON save (0600, `O_EXCL` temp + rename), tolerant line parser, fail-secure load |
 | `sha512.c/h` | `sha512_file` (forked `sha512sum`), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf` |
-| `utils.c/h` | `/proc` readers (`proc_exe_path`, `get_ppid`, `read_comm`, `read_cmdline`, `proc_stat_session`), `path_under`, home expansion, logging, `close_fds_from` |
+| `utils.c/h` | `/proc` readers (`proc_exe_path`, `get_ppid`, `read_comm`, `read_cmdline`, `proc_stat_session`), `path_under`/`path_under_len`, protected-path glob matcher (`glob_base_len`, `glob_match_path`), home expansion, logging, `close_fds_from` |
 
 ### Event pipeline (decision order)
 
@@ -151,6 +151,8 @@ match (fail closed, re-prompt).
 - `kdialog` required for popups; missing/failing kdialog denies access (fail closed)
 - Kernel 5.0+ for FAN_OPEN_PERM on directories; no NFS/CIFS coverage; `mmap` and bind-mount aliases are outside the threat model
 - Hard links: inodes present at startup are tracked, and an open through an unprotected path always prompts. Files created after startup, deeper than 8 directory levels, or past the inode-table cap are not inode-tracked (`FAN_REPORT_FID` is a planned follow-up)
+- Protected-path globs: `*` (one segment) and `**` (zero or more segments) only; `?`, `[`, `]` and `\` are literal. A glob entry marks its wildcard-free base directory (mount marks cover the filesystem beyond it), and a malformed pattern is rejected at load time (fail closed)
+- Protected-path exclusions (`!pattern`): deny-wins and order-independent — an excluded path is never protected, never marked, and never inode-tracked; matching is path-based
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
 - Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt

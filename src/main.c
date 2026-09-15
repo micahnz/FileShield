@@ -88,10 +88,12 @@ static void daemonize(void)
 }
 
 /*
- * Install a mark for every configured protected path.  Returns the number
- * of real failures; paths that do not exist yet (rc 1) are counted in
- * *skipped — a filesystem mount mark covers them if they appear later.
- * Callers treat any failure as fatal (fail closed).
+ * Install a mark for every configured positive protected path
+ * (exclusions are never marked; fanotify_add_protected returns 0 for
+ * them).  Returns the number of real failures; paths that do not exist
+ * yet (rc 1) are counted in *skipped — a filesystem mount mark covers
+ * them if they appear later.  Callers treat any failure as fatal (fail
+ * closed).
  */
 static int install_marks(int fan_fd, const Config *cfg, const char *phase,
                          int *skipped)
@@ -101,7 +103,7 @@ static int install_marks(int fan_fd, const Config *cfg, const char *phase,
     *skipped = 0;
     for (int i = 0; i < cfg->protected_count; i++)
     {
-        int rc = fanotify_add_mark(fan_fd, cfg->protected[i].path);
+        int rc = fanotify_add_protected(fan_fd, &cfg->protected[i]);
         if (rc < 0)
         {
             log_msg(LOG_ERR, "%s: failed to add mark for %s", phase,
@@ -185,13 +187,15 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
      * cannot be restored, shut down so systemd restarts from a clean
      * state.  Config paths that do not exist yet (rc 1) are skipped,
      * not fatal. */
-    if (failures > 0 || new_cfg->protected_count == 0 ||
+    if (failures > 0 ||
+        new_cfg->protected_count - new_cfg->exclude_count <= 0 ||
         !fanotify_any_mark_active())
     {
         log_msg(LOG_ERR,
-                "reload rejected (%d mark failures, %d paths); "
-                "restoring previous protection",
-                failures, new_cfg->protected_count);
+                "reload rejected (%d mark failures, %d protected paths, "
+                "%d exclusions); restoring previous protection",
+                failures, new_cfg->protected_count - new_cfg->exclude_count,
+                new_cfg->exclude_count);
 
         int rollback_skipped = 0;
         if (install_marks(fan_fd, *cfg, "rollback", &rollback_skipped) > 0)
@@ -213,9 +217,10 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     }
 
     log_msg(LOG_INFO,
-            "config reloaded, watching %d paths (%d missing, "
-            "covered by mount marks)",
-            new_cfg->protected_count, skipped);
+            "config reloaded, watching %d paths (%d exclusions, "
+            "%d missing, covered by mount marks)",
+            new_cfg->protected_count - new_cfg->exclude_count,
+            new_cfg->exclude_count, skipped);
     free(*cfg);
     *cfg = new_cfg;
     g_config = *cfg;
@@ -312,9 +317,11 @@ int main(int argc, char *argv[])
      * degraded state.  Any path we could not mark would be unprotected
      * while the user believes it is watched, so startup aborts and
      * systemd's Restart=on-failure retries it. */
-    if (cfg->protected_count == 0)
+    if (cfg->protected_count - cfg->exclude_count <= 0)
     {
-        log_msg(LOG_ERR, "no protected paths configured; refusing to start");
+        log_msg(LOG_ERR,
+                "no protected paths configured (exclusions alone do not "
+                "protect); refusing to start");
         close(fan_fd);
         config_reset(cfg);
         free(cfg);
@@ -357,7 +364,8 @@ int main(int argc, char *argv[])
                 "direct mark)",
                 mark_skipped);
 
-    log_msg(LOG_INFO, "FileShield started, watching %d paths", cfg->protected_count);
+    log_msg(LOG_INFO, "FileShield started, watching %d paths (%d exclusions)",
+            cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
 
     /* Load persisted "Always Allow"/"Always Deny" entries from the
      * previous session.  A read error is treated as an empty list (fail

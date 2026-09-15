@@ -489,6 +489,187 @@ static void test_config_load_does_not_publish_global(void)
     free(path);
 }
 
+/*
+ * Glob entries: the wildcard-free base is canonicalized, the suffix is
+ * preserved verbatim, and is_glob/base_len are recorded.  Exact entries
+ * keep is_glob == 0 and a base_len equal to the whole path.
+ */
+static void test_glob_protected_paths(void)
+{
+    char base[128];
+    char conf[1024];
+    char pat_star[256];
+    char pat_globstar[256];
+    char pat_plain[256];
+
+    snprintf(base, sizeof(base), "/tmp/fileshield_globtest_%d", (int)getpid());
+    snprintf(pat_star, sizeof(pat_star), "%s/*.json", base);
+    snprintf(pat_globstar, sizeof(pat_globstar), "%s/**/*.json", base);
+    snprintf(pat_plain, sizeof(pat_plain), "%s/plain", base);
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "%s\n"
+             "%s\n"
+             "%s\n",
+             pat_star, pat_globstar, pat_plain);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob paths");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load glob success");
+    ASSERT(cfg.protected_count == 3, "3 protected entries parsed");
+
+    ASSERT(cfg.protected[0].is_glob == 1, "star entry is a glob");
+    ASSERT(strcmp(cfg.protected[0].path, pat_star) == 0,
+           "glob pattern preserved after base canonicalization");
+    ASSERT(cfg.protected[0].base_len == (int)strlen(base),
+           "glob base length is the wildcard-free prefix");
+
+    ASSERT(cfg.protected[1].is_glob == 1, "globstar entry is a glob");
+    ASSERT(strcmp(cfg.protected[1].path, pat_globstar) == 0,
+           "globstar pattern preserved");
+    ASSERT(cfg.protected[1].base_len == (int)strlen(base),
+           "globstar base length");
+
+    ASSERT(cfg.protected[2].is_glob == 0, "exact entry stays exact");
+    ASSERT(cfg.protected[2].base_len == (int)strlen(cfg.protected[2].path),
+           "exact entry base_len is the full path");
+
+    config_reset(&cfg);
+    ASSERT(cfg.protected[0].is_glob == 0, "config_reset clears glob flag");
+
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Malformed glob patterns are rejected with a warning and must not
+ * produce an entry (fail closed: a typo never silently protects
+ * nothing while looking active).
+ */
+static void test_glob_rejection(void)
+{
+    char conf[1024];
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "/tmp/fileshield_ok_%d\n"      /* survives */
+             "relative/*.json\n"            /* not absolute */
+             "*.json\n"                     /* no static base */
+             "/tmp/glob_rej_%d/*//x.json\n" /* empty segment in suffix */
+             "/tmp/glob_rej_%d/*.json/\n"   /* trailing slash */
+             "/tmp/glob_rej_%d/../*.json\n", /* unresolvable '..' base */
+             (int)getpid(), (int)getpid(), (int)getpid(), (int)getpid());
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob rejection");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives rejected glob lines");
+    ASSERT(cfg.protected_count == 1,
+           "only the valid exact entry survives malformed globs");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * '!' exclusions: parsed into the same protected array with
+ * is_exclude set, counted separately, and canonicalized exactly like
+ * positives.
+ */
+static void test_exclusions_parse(void)
+{
+    char base[128];
+    char pat_pub[256];
+    char pat_exact[256];
+    char conf[1024];
+
+    snprintf(base, sizeof(base), "/tmp/fileshield_excl_%d", (int)getpid());
+    snprintf(pat_pub, sizeof(pat_pub), "%s/*.pub", base);
+    snprintf(pat_exact, sizeof(pat_exact), "%s/known_hosts", base);
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "%s\n"
+             "!%s\n"
+             "!%s\n",
+             base, pat_pub, pat_exact);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for exclusions");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load exclusions success");
+    ASSERT(cfg.protected_count == 3, "positive + 2 exclusions parsed");
+    ASSERT(cfg.exclude_count == 2, "exclude_count counts only '!' entries");
+
+    ASSERT(cfg.protected[0].is_exclude == 0, "positive entry is not an exclusion");
+    ASSERT(strcmp(cfg.protected[0].path, base) == 0, "positive path preserved");
+
+    ASSERT(cfg.protected[1].is_exclude == 1, "glob exclusion flagged");
+    ASSERT(cfg.protected[1].is_glob == 1, "glob exclusion keeps is_glob");
+    ASSERT(strcmp(cfg.protected[1].path, pat_pub) == 0,
+           "exclusion pattern canonicalized");
+    ASSERT(cfg.protected[1].base_len == (int)strlen(base),
+           "exclusion base length computed");
+    ASSERT(cfg.exclude_idx[0] == 1, "first exclusion index recorded");
+
+    ASSERT(cfg.protected[2].is_exclude == 1, "exact exclusion flagged");
+    ASSERT(cfg.protected[2].is_glob == 0, "exact exclusion is not a glob");
+    ASSERT(strcmp(cfg.protected[2].path, pat_exact) == 0,
+           "exact exclusion path preserved");
+    ASSERT(cfg.exclude_idx[1] == 2, "second exclusion index recorded");
+
+    config_reset(&cfg);
+    ASSERT(cfg.exclude_count == 0, "config_reset clears exclude_count");
+
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Malformed exclusions are rejected with a warning and must not
+ * produce an entry (fail closed); a valid positive in the same file
+ * still loads.
+ */
+static void test_exclusion_rejection(void)
+{
+    char conf[1024];
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "/tmp/fileshield_exok_%d\n"
+             "!\n"                          /* empty exclusion */
+             "!relative/*.pub\n"            /* not absolute */
+             "!!/tmp/fileshield_exok_%d\n"  /* path starts with '!' */
+             "!/tmp/fileshield_exok_%d/**/\n", /* trailing slash in suffix */
+             (int)getpid(), (int)getpid(), (int)getpid());
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for exclusion rejection");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives rejected exclusions");
+    ASSERT(cfg.protected_count == 1, "only the valid positive survives");
+    ASSERT(cfg.exclude_count == 0, "no malformed exclusion recorded");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -503,6 +684,10 @@ int main(void)
     test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
+    test_glob_protected_paths();
+    test_glob_rejection();
+    test_exclusions_parse();
+    test_exclusion_rejection();
     test_rule_rejection();
     test_denylist_parse();
     test_target_trailing_slash();
