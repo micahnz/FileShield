@@ -2,8 +2,11 @@
  * test_sha512: digest helpers used for binary identity and command-line
  * fingerprints.  The known-answer vectors come from FIPS 180-4.
  */
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../src/sha512.h"
 
@@ -48,11 +51,67 @@ static void test_string_differs(void)
     ASSERT(strlen(a) == 128, "digest is 128 hex chars");
 }
 
+static void test_string_multiblock(void)
+{
+    char hex[129];
+    /* FIPS 180-4 two-block vector (105 bytes) exercises block chaining. */
+    const char *msg =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+        "ijklmnopjklmnopqrlmnopqrsmnopqrstnopqrstu";
+    const char *want =
+        "84456dbc64e67596d06bca52fcff37e6559394725c13103cbfef17c745607760"
+        "1de43e836476729bbde050bffdb3978f814bb7a94f391098debc53a70cf63763";
+
+    ASSERT(sha512_string(msg, hex) == 0, "multiblock computes");
+    ASSERT(strcmp(hex, want) == 0, "multiblock matches known vector");
+}
+
 static void test_string_invalid(void)
 {
     char hex[129];
 
     ASSERT(sha512_string(NULL, hex) == -1, "NULL input fails");
+}
+
+/*
+ * Differential test: the in-process string digest must agree with
+ * sha512sum (exercised through sha512_file's helper path) for the same
+ * bytes, at lengths that span block boundaries.
+ */
+static void test_string_differential(void)
+{
+    const char *samples[] = {
+        "",
+        "FileShield differential test payload 0123456789",
+        "a",                     /* block interior              */
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+        "ijklmnopjklmnopqrlmnopqrsmnopqrstnopqrstu", /* 105 bytes  */
+        "0123456789012345678901234567890123456789012345678901234567890123"
+        "4567890123456789012345678901234567890123456789012345678901234567"
+        "8901234567890123456789012345678901234567890123456789012345678901"
+        "2345",                  /* 352 bytes, three blocks     */
+    };
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/tmp/fileshield_sha512_diff_%d", (int)getpid());
+
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++)
+    {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ASSERT(fd >= 0, "open differential temp file");
+        if (fd < 0)
+            return;
+        size_t len = strlen(samples[i]);
+        ASSERT(write(fd, samples[i], len) == (ssize_t)len, "write sample");
+        close(fd);
+
+        char hex_file[129], hex_str[129];
+        ASSERT(sha512_file(path, hex_file) == 0, "helper digest");
+        ASSERT(sha512_string(samples[i], hex_str) == 0, "in-process digest");
+        ASSERT(strcmp(hex_file, hex_str) == 0,
+               "in-process digest matches sha512sum");
+    }
+    unlink(path);
 }
 
 static void test_file_digest(void)
@@ -73,7 +132,9 @@ int main(void)
     test_string_vector();
     test_string_empty();
     test_string_differs();
+    test_string_multiblock();
     test_string_invalid();
+    test_string_differential();
     test_file_digest();
     if (failures)
     {

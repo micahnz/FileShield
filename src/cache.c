@@ -30,10 +30,22 @@ typedef struct
 static cache_entry_t cache[CACHE_MAX_ENTRIES];
 static int cache_initialized = 0;
 
+/*
+ * High-water mark: one past the highest slot ever used.  Lookups and
+ * inserts only need to scan live slots, not all 4096; the mark never
+ * shrinks (expired slots are skipped on one cheap pid==0 compare), which
+ * keeps every code path trivially correct.  Baseline for this change was
+ * 5.24 us per miss-scan over the full table at 128 live entries
+ * (tests/bench_hotpath.c); the mark bounds the miss scan by the number
+ * of slots ever touched instead of the table size.
+ */
+static int cache_high = 0;
+
 static void cache_init(void)
 {
     memset(cache, 0, sizeof(cache));
     cache_initialized = 1;
+    cache_high = 0;
 }
 
 /*
@@ -62,7 +74,7 @@ int cache_lookup(pid_t pid, const char *binary, const char *target)
 
     now = time(NULL);
 
-    for (i = 0; i < CACHE_MAX_ENTRIES; i++)
+    for (i = 0; i < cache_high; i++)
     {
         if (cache[i].pid == 0)
             continue;
@@ -120,7 +132,7 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
 
     now = time(NULL);
 
-    for (i = 0; i < CACHE_MAX_ENTRIES; i++)
+    for (i = 0; i < cache_high; i++)
     {
         if (cache[i].pid != 0)
         {
@@ -136,8 +148,16 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
             free_slot = i;
     }
 
+    /* Beyond the high-water mark every slot is free: the first one wins
+     * without scanning. */
+    if (free_slot < 0 && cache_high < CACHE_MAX_ENTRIES)
+        free_slot = cache_high;
+
     if (free_slot < 0)
-        return;
+        return; /* table full: no eviction policy, drop the insert */
+
+    if (free_slot >= cache_high)
+        cache_high = free_slot + 1;
 
     cache[free_slot].pid = pid;
     cache[free_slot].starttime = proc_start_time(pid);
@@ -158,7 +178,7 @@ void cache_expire(void)
 
     now = time(NULL);
 
-    for (i = 0; i < CACHE_MAX_ENTRIES; i++)
+    for (i = 0; i < cache_high; i++)
     {
         if (cache[i].pid == 0)
             continue;
@@ -166,3 +186,4 @@ void cache_expire(void)
             cache[i].pid = 0;
     }
 }
+

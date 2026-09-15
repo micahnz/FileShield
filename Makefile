@@ -1,4 +1,4 @@
-.PHONY: all clean install test lint
+.PHONY: all clean install test bench lint
 
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 \
@@ -84,6 +84,23 @@ test: all $(TSTBINS)
 	else \
 		echo "PASS"; \
 	fi
+
+# Hot-path microbenchmarks (not part of `make test`): timing baselines
+# for the optimization work live in the commit messages and in comments
+# at the changed sites.  Needs the same objects as the daemon.
+$(OBJDIR)/bench_hotpath: $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
+                         $(OBJDIR)/notify.o $(OBJDIR)/config.o \
+                         $(OBJDIR)/cache.o $(OBJDIR)/session.o \
+                         $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
+                         $(OBJDIR)/utils.o
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
+		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
+		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
+		$(OBJDIR)/utils.o -o $@
+
+bench: all $(OBJDIR)/bench_hotpath
+	./$(OBJDIR)/bench_hotpath
 
 install: all
 	install -m 0755 -D $(OBJDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
