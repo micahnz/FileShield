@@ -2172,24 +2172,10 @@ void fanotify_loop(int fd)
 /*  Public API: dynamic allowlist / denylist persistence              */
 /* ------------------------------------------------------------------ */
 
-int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries)
-{
-    if (!out_entries || max_entries <= 0)
-        return 0;
-    return dyn_to_persist(g_dyn_allow, g_dyn_allow_count, out_entries, max_entries);
-}
-
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 {
     load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count,
                   "always-allow", 1, 1, 1);
-}
-
-int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
-{
-    if (!out_entries || max_entries <= 0)
-        return 0;
-    return dyn_to_persist(g_dyn_deny, g_dyn_deny_count, out_entries, max_entries);
 }
 
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)

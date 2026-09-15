@@ -63,18 +63,12 @@ int fanotify_defer_event(const struct fanotify_event_metadata *ev);
 void fanotify_flush_pending(int fan_fd);
 
 /*
- * Dynamic allowlist / denylist management: export the in-memory lists for
- * persistence.
+ * Dynamic allowlist / denylist persistence: load root-only state files
+ * into the in-memory lists (called on daemon startup and reload).
  */
-
-/* Get the current dynamic allowlist entries. Returns count of entries. */
-int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries);
 
 /* Load persisted entries into the dynamic allowlist. Called on daemon startup. */
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count);
-
-/* Get the current dynamic denylist entries. Returns count of entries. */
-int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries);
 
 /* Load persisted entries into the dynamic denylist. Called on daemon startup. */
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count);

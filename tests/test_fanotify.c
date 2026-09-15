@@ -90,13 +90,18 @@ static void test_missing_path_is_skipped(void) {
 /*
  * Part 1b: persisted allow/deny entries are file- and command-scoped.
  * An entry without a target_path, without the raw command line, or
- * without its digest (legacy or hand-edited state file) must be dropped
- * at load so it cannot act as a wildcard grant or a blanket denial.
+ * without its digest (legacy or hand-edited state file) must never act
+ * as a wildcard grant or a blanket denial.  Asserted observably: only a
+ * fully-scoped entry can match, and only with its exact keys.
  */
-static void test_empty_target_entries_dropped(void) {
+static void test_incomplete_entries_grant_nothing(void) {
     const char *sha =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char cmd_fingerprint[129];
+
+    ASSERT(sha512_string("kubectl config view --minify", cmd_fingerprint) == 0,
+           "digest of the stored command line");
 
     PersistEntry entries[4];
     memset(entries, 0, sizeof(entries));
@@ -109,7 +114,7 @@ static void test_empty_target_entries_dropped(void) {
     snprintf(entries[0].cmdline, sizeof(entries[0].cmdline),
              "kubectl config view --minify");
     snprintf(entries[0].cmdline_sha512, sizeof(entries[0].cmdline_sha512),
-             "%s", sha);
+             "%s", cmd_fingerprint);
 
     /* Legacy wildcard entry: no target recorded. */
     snprintf(entries[1].binary, sizeof(entries[1].binary), "/usr/bin/ssh");
@@ -135,18 +140,35 @@ static void test_empty_target_entries_dropped(void) {
 
     fanotify_load_dyn_allowlist(entries, 4);
 
-    PersistEntry out[4];
-    memset(out, 0, sizeof(out));
-    int n = fanotify_get_dyn_allowlist(out, 4);
-    ASSERT(n == 1, "entries with incomplete command records are dropped");
-    ASSERT(strcmp(out[0].target_path, "/home/u/.kube/config") == 0,
-           "remaining allow entry keeps its target");
-    ASSERT(strcmp(out[0].cmdline, "kubectl config view --minify") == 0,
-           "remaining allow entry keeps its raw command line");
-    ASSERT(strcmp(out[0].cmdline_sha512, sha) == 0,
-           "remaining allow entry keeps its command fingerprint");
+    /* The complete entry loads with every matching key preserved. */
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl config view --minify") == 1,
+           "the complete allow entry matches its exact tuple");
 
-    /* Denies do not require a binary SHA-512, but require both scopes. */
+    /* The incomplete records can never act as wildcard grants. */
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/ssh", sha,
+           "/home/u/.ssh/id_rsa", "ssh-add -l") == 0,
+           "target-less allow entry grants nothing");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/aws", sha,
+           "/home/u/.aws/credentials", "aws sts get-caller-identity") == 0,
+           "digest-only allow entry grants nothing");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/gh", sha,
+           "/home/u/.config/gh/hosts.yml", "gh auth status") == 0,
+           "cmdline-only allow entry grants nothing");
+
+    /* The surviving entry stays pinned to each of its keys. */
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", "deadbeef",
+           "/home/u/.kube/config", "kubectl config view --minify") == 0,
+           "unverifiable binary hash does not match");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/other", "kubectl config view --minify") == 0,
+           "different target does not match");
+    ASSERT(fanotify_test_dyn_allow_match("/usr/bin/kubectl", sha,
+           "/home/u/.kube/config", "kubectl get secrets") == 0,
+           "different command does not match");
+
+    /* Denies do not require a binary SHA-512, but incomplete records
+     * deny nothing at all. */
     PersistEntry dentries[2];
     memset(dentries, 0, sizeof(dentries));
     snprintf(dentries[0].binary, sizeof(dentries[0].binary), "/usr/bin/curl");
@@ -156,9 +178,12 @@ static void test_empty_target_entries_dropped(void) {
              "/home/u/.netrc");
 
     fanotify_load_dyn_denylist(dentries, 2);
-    memset(out, 0, sizeof(out));
-    n = fanotify_get_dyn_denylist(out, 4);
-    ASSERT(n == 0, "incomplete deny entries dropped at load");
+    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/curl", "", "/etc/passwd",
+           "curl") == 0,
+           "bare deny record denies nothing");
+    ASSERT(fanotify_test_dyn_deny_match("/usr/bin/wget", "", "/home/u/.netrc",
+           "wget") == 0,
+           "deny record without a command fingerprint denies nothing");
 
     /* Reload an empty list so later tests see the daemon's clean state. */
     fanotify_load_dyn_allowlist(NULL, 0);
@@ -447,7 +472,7 @@ int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_missing_path_is_skipped();
-    test_empty_target_entries_dropped();
+    test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
