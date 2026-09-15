@@ -11,11 +11,15 @@
  *   sha512_string         command-line fingerprints (in-process)
  *   dyn matchers          runtime allow/deny entry matching (fanotify.c)
  *   cmdline fingerprint   /proc/<pid>/cmdline read + hash (fanotify.c)
+ *   inode set / fastpath  mount-mark noise classification (inode.c,
+ *                         fanotify_test_fastpath_allows)
  *
  * Run an optimization's before/after here; keep the change only if it
  * wins.  Results belong in the commit message and as comments at the
  * changed site.
  */
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +28,8 @@
 #include <unistd.h>
 
 #include "../src/cache.h"
+#include "../src/config.h"
+#include "../src/inode.h"
 #include "../src/utils.h"
 #include "../src/sha512.h"
 #include "../src/fanotify.h"
@@ -142,6 +148,135 @@ static void bench_proc_stat_session(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/*  inode set / fast-path verdict benches                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The fast path runs for every open on a mount-marked filesystem, so its
+ * cost is dominated by the inode-set lookup and the protected-prefix
+ * scan.  Fill the set to the sizes a real config can reach and classify a
+ * protected path (worst case for the prefix scan) and mount-mark noise.
+ */
+static int g_inode_fill = 0;
+
+static Config g_bench_cfg; /* static: Config is several MB */
+
+static void bench_fastpath_setup(void)
+{
+    static const char *const prefixes[] = {
+        "/home/u/.aws", "/home/u/.azure", "/home/u/.config/gcloud",
+        "/home/u/.kube", "/home/u/.ssh", "/home/u/.gnupg",
+        "/home/u/.config/sops", "/home/u/.password-store",
+        "/home/u/.config/op", "/home/u/.vault-token", "/home/u/.config/vault",
+        "/home/u/.docker", "/home/u/.config/helm", "/home/u/.terraform.d",
+        "/home/u/.terraformrc", "/home/u/.config/gh", "/home/u/.netrc",
+        "/home/u/.env", "/etc/ssl/private", "/var/lib/vault",
+        "/opt/secrets", "/srv/keys", "/etc/keys", "/root/.aws",
+        "/home/u/projects", "/home/u/work", "/home/u/data",
+        "/home/u/.config", "/home/u/bin", "/var/backups",
+        "/home/u/.local", "/home/u/.cache"};
+
+    g_bench_cfg.protected_count = 0;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+    {
+        snprintf(g_bench_cfg.protected[g_bench_cfg.protected_count].path,
+                 PATH_MAX, "%s", prefixes[i]);
+        g_bench_cfg.protected_count++;
+    }
+    g_config = &g_bench_cfg;
+}
+
+static void bench_inode_fill(int n)
+{
+    inode_set_clear();
+    for (int i = 0; i < n; i++)
+        inode_set_add(3, (ino_t)i);
+    g_inode_fill = n;
+}
+
+static void bench_inode_contains(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+    {
+        /* Stride across the populated range: average-case lookup, not a
+         * cache-friendly sequential walk. */
+        unsigned idx = (unsigned)(i * 2654435761u) % (unsigned)g_inode_fill;
+        (void)inode_set_contains(3, (ino_t)idx);
+    }
+}
+
+/* Mount-mark noise: inode miss plus a path under no prefix (full scan). */
+static void bench_fastpath_noise(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        (void)fanotify_test_fastpath_allows(3, 999999,
+                                            "/home/u/projects/src/main.c");
+}
+
+/* Real protected access: inode miss plus a matching prefix. */
+static void bench_fastpath_protected(void *arg)
+{
+    int iters = *(int *)arg;
+
+    for (int i = 0; i < iters; i++)
+        (void)fanotify_test_fastpath_allows(3, 999999,
+                                            "/home/u/.ssh/id_rsa");
+}
+
+/* ------------------------------------------------------------------ */
+/*  event path resolution benches                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * resolve_fd_path() runs once per event.  It used to malloc a PATH_MAX
+ * buffer per call; the variant below measures the heap/free cost against
+ * the caller-provided (stack) buffer the event pipeline uses now.
+ */
+static int g_resolve_fd = -1;
+
+static void bench_resolve_setup(void)
+{
+    g_resolve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+}
+
+static void bench_resolve_path_heap(void *arg)
+{
+    int iters = *(int *)arg;
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", g_resolve_fd);
+
+    for (int i = 0; i < iters; i++)
+    {
+        char *buf = malloc(PATH_MAX);
+        if (!buf)
+            continue;
+        ssize_t len = readlink(link, buf, PATH_MAX - 1);
+        if (len >= 0)
+            buf[len] = '\0';
+        free(buf);
+    }
+}
+
+static void bench_resolve_path_stack(void *arg)
+{
+    int iters = *(int *)arg;
+    char link[64];
+    char buf[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", g_resolve_fd);
+
+    for (int i = 0; i < iters; i++)
+    {
+        ssize_t len = readlink(link, buf, sizeof(buf) - 1);
+        if (len >= 0)
+            buf[len] = '\0';
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  sha512 + dyn matcher benches                                       */
 /* ------------------------------------------------------------------ */
 
@@ -255,6 +390,34 @@ int main(void)
     int iters_stat = 20000;
     report("proc_stat_session (own pid)", bench_proc_stat_session,
            &iters_stat, iters_stat);
+
+    /* Inode set + fast-path verdict (mount-mark noise classification). */
+    bench_fastpath_setup();
+    int iters_inode = 50000;
+    bench_inode_fill(1024);
+    report("inode lookup (1k)", bench_inode_contains, &iters_inode,
+           iters_inode);
+    bench_inode_fill(8192);
+    iters_inode = 20000;
+    report("inode lookup (8k)", bench_inode_contains, &iters_inode,
+           iters_inode);
+    report("fastpath verdict (noise)", bench_fastpath_noise, &iters_inode,
+           iters_inode);
+    report("fastpath verdict (protected)", bench_fastpath_protected,
+           &iters_inode, iters_inode);
+    bench_inode_fill(INODE_SET_MAX);
+    iters_inode = 5000;
+    report("inode lookup (32k)", bench_inode_contains, &iters_inode,
+           iters_inode);
+    inode_set_clear();
+
+    /* Event path resolution: heap buffer vs caller stack buffer. */
+    bench_resolve_setup();
+    int iters_resolve = 100000;
+    report("resolve path (heap)", bench_resolve_path_heap, &iters_resolve,
+           iters_resolve);
+    report("resolve path (stack)", bench_resolve_path_stack, &iters_resolve,
+           iters_resolve);
 
     int iters_sha = 5000; /* in-process: no fork, safe to run many */
     report("sha512_string (in-process)", bench_sha512_string, &iters_sha,

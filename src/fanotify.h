@@ -93,4 +93,12 @@ int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
  */
 int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129]);
 
+/*
+ * Test seam: the fast path's "mount-mark noise" verdict for a synthetic
+ * (dev, ino, path) — the same condition event_fastpath uses to allow an
+ * event instantly.  Used by bench_hotpath to measure the per-event
+ * classification cost at realistic table sizes.
+ */
+int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path);
+
 #endif
