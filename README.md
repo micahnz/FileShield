@@ -244,7 +244,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | Deny Always   | same key shape as Allow Always                                | until removed                                                 | `runtime-denylist.json`  |
 | Deny          | —                                                             | this attempt only                                             | no                       |
 
-Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog.
+Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link.
 
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
@@ -273,7 +273,7 @@ parent[1]:      systemd           (sha512: 0d4e…)
 
 A future `curl` call from `zsh` instead of `bash` will prompt again because the call chain differs. A trojaned `/usr/bin/curl` will also prompt again because its SHA-512 has changed. The same binary reading `~/.aws/credentials` prompts because the target differs, and invoking it with different arguments (e.g. `kubectl get pods` vs `kubectl get secrets`) prompts because the command line differs.
 
-> The command line is stored verbatim in the root-only (0600) state file so entries can be reviewed, and its SHA-512 is the matching key. Arguments may therefore contain secrets (`-p…`, tokens); the state file is readable only by root, but treat it accordingly. State entries written by older versions without a `target_path` or a command line are dropped at load (fail closed) and the access is prompted again.
+> The command line is stored verbatim in the root-only (0600) state file so entries can be reviewed, and a SHA-512 over the **full raw command line** (arguments and all, bounded at 64 KB) is the matching key — two invocations that share a long prefix do not collide. Arguments may therefore contain secrets (`-p…`, tokens); the state file is readable only by root, but treat it accordingly. State entries written by older versions without a `target_path` or a command line, and entries whose stored fingerprint predates full-line hashing, no longer match: the access is prompted again (fail closed), and choosing _Always_ records a fresh entry. Remove stale duplicates with `jq` as shown below.
 
 #### Persistence
 
@@ -329,7 +329,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
 4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config allowlist, session/permanent denials, file cache, session/permanent grants).
-5. On a miss, it spawns a `kdialog` two-stage popup and waits for user input.
+5. On a miss, it spawns a `kdialog` two-stage popup on the requesting user's desktop session and waits for user input. The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
 
@@ -342,7 +342,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
 - **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on, and does not report `mmap(2)` accesses. Bind-mount aliases of protected paths, or a process that already holds an open descriptor, are outside the threat model.
-- **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode (opening one through a hard link outside the watched directories still prompts). Files created after startup are matched by their canonical path; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
+- **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode. Opening one of those inodes through a path outside every protected prefix (a hard link) always prompts — allow rules are skipped for that open (see [Decision Scopes](#decision-scopes)). Files created after startup, files deeper than 8 directory levels under a protected path, and inodes past the table cap are not inode-tracked; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
 - **Command-line matching**: permanent _Always_ entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use _Allow Session_ or _Allow Once_ for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
@@ -372,6 +372,15 @@ troubleshooting either with `debug = yes` in `[settings]` or with the
 daemon's `-d/--debug` flag (also available via `--foreground` runs); both
 survive a `SIGHUP` config reload for the settings key.
 
+The daemon logs at the following levels:
+
+| Level     | Events                                                                                                                   |
+| --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)     |
+| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug` |
+| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable, hard-link prompts |
+| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                           |
+
 ### Follow live events
 
 ```bash
@@ -397,17 +406,6 @@ journalctl -u fileshield -p err
 # Between two timestamps
 journalctl -u fileshield --since "2026-05-26 09:00" --until "2026-05-26 10:00"
 ```
-
-### Log verbosity
-
-The daemon logs at the following levels:
-
-| Level     | Events                                                                                                                   |
-| --------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)     |
-| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug` |
-| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable |
-| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                           |
 
 ---
 
@@ -468,6 +466,14 @@ make lint
 ```
 
 Runs `cppcheck` over all sources in `src/` and `tests/`. Requires `cppcheck` to be installed (`apt install cppcheck` / `dnf install cppcheck`).
+
+### Benchmarks
+
+```bash
+make bench
+```
+
+Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event hot path (allow cache, path matching, SHA-512 fingerprints, runtime-list matching, protected-inode lookups). Hot-path changes are kept only when the harness shows a win; before/after numbers are recorded in the commit message and in comments at the changed sites.
 
 ---
 

@@ -589,14 +589,3 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     log_msg(LOG_INFO, "persist_save: saved %d entries to %s", count, filepath);
     return 0;
 }
-
-int persist_delete(const char *filepath)
-{
-    if (unlink(filepath) < 0 && errno != ENOENT)
-    {
-        log_msg(LOG_ERR, "persist_delete: unlink %s: %s", filepath,
-                strerror(errno));
-        return -1;
-    }
-    return 0;
-}

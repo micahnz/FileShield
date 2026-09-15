@@ -437,10 +437,10 @@ static int test_persist_over_cap(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  test: persist_delete                                               */
+/*  test: state file removal                                           */
 /* ------------------------------------------------------------------ */
 
-static int test_persist_delete(void)
+static int test_persist_remove(void)
 {
     char path[PATH_MAX];
     make_test_path(path, sizeof(path), "delete_me.json");
@@ -448,11 +448,12 @@ static int test_persist_delete(void)
 
     PersistEntry dummy[1];
     memset(dummy, 0, sizeof(dummy));
-    ASSERT(persist_save(path, dummy, 0) == 0, "persist_save for delete test");
-    ASSERT(persist_delete(path) == 0, "persist_delete existing file");
-    ASSERT(persist_delete(path) == 0, "persist_delete nonexistent is ok");
+    ASSERT(persist_save(path, dummy, 0) == 0, "persist_save for remove test");
+    ASSERT(unlink(path) == 0, "remove existing state file");
+    ASSERT(unlink(path) != 0 && errno == ENOENT,
+           "removing a missing state file reports ENOENT");
 
-    TEST_PASS("persist_delete");
+    TEST_PASS("state file removal");
     return 0;
 }
 
@@ -484,7 +485,7 @@ int main(void)
     failed |= test_persist_malformed_depth();
     failed |= test_persist_truncated();
     failed |= test_persist_over_cap();
-    failed |= test_persist_delete();
+    failed |= test_persist_remove();
 
     rmdir(g_test_dir);
 

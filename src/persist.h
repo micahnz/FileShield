@@ -38,7 +38,4 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
 /* Save entries to JSON file. Returns 0 on success, -1 on error. */
 int persist_save(const char *filepath, const PersistEntry *entries, int count);
 
-/* Delete a persistent state file. Used on daemon cleanup. */
-int persist_delete(const char *filepath);
-
 #endif

@@ -6,6 +6,8 @@
 #include <syslog.h>
 #include <getopt.h>
 #include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 #include "utils.h"
 #include "config.h"
@@ -44,6 +46,14 @@ static void print_usage(const char *prog)
 
 static void daemonize(void)
 {
+    /* Detach from the invoking directory and tighten the file-creation
+     * mask: a daemon must not pin a mount point or create world-readable
+     * files when started by hand (the systemd unit also sets UMask=0077).
+     * A relative --config is resolved by the caller before this runs. */
+    if (chdir("/") < 0)
+        log_msg(LOG_WARNING, "daemonize: chdir /: %s", strerror(errno));
+    umask(0077);
+
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -266,7 +276,18 @@ int main(int argc, char *argv[])
     g_config = cfg;
 
     if (!g_foreground)
+    {
+        /* daemonize() chdir()s to /, so a relative --config must be made
+         * absolute now: a SIGHUP reload would otherwise resolve it from
+         * the wrong directory. */
+        if (config_path[0] != '/')
+        {
+            static char config_abs[PATH_MAX];
+            if (realpath(config_path, config_abs))
+                config_path = config_abs;
+        }
         daemonize();
+    }
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
