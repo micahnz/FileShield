@@ -10,13 +10,6 @@
 
 Config *g_config = NULL;
 
-/*
- * Sanity bound for TTLs (1 year): keeps cache expiry arithmetic safe on
- * 32-bit time_t and prevents a typo from silently granting access for
- * decades.  cache_insert() clamps again defensively.
- */
-#define MAX_TTL_SECONDS (365 * 24 * 60 * 60)
-
 static char *trim(char *s)
 {
     while (*s == ' ' || *s == '\t')
@@ -223,6 +216,16 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
     return 0;
 }
 
+/* Sections of fileshield.conf; SECTION_NONE is "before/outside any". */
+enum
+{
+    SECTION_NONE = 0,
+    SECTION_PROTECTED,
+    SECTION_ALLOWLIST,
+    SECTION_SETTINGS,
+    SECTION_DENYLIST
+};
+
 int config_load(const char *path, Config *cfg)
 {
     if (!path)
@@ -250,7 +253,7 @@ int config_load(const char *path, Config *cfg)
     }
 
     char line[PATH_MAX * 2];
-    int section = 0;
+    int section = SECTION_NONE;
 
     memset(cfg, 0, sizeof(*cfg));
 
@@ -280,19 +283,19 @@ int config_load(const char *path, Config *cfg)
             }
             *close = '\0';
             if (strcmp(s + 1, "protected_paths") == 0)
-                section = 1;
+                section = SECTION_PROTECTED;
             else if (strcmp(s + 1, "allowlist") == 0)
-                section = 2;
+                section = SECTION_ALLOWLIST;
             else if (strcmp(s + 1, "settings") == 0)
-                section = 3;
+                section = SECTION_SETTINGS;
             else if (strcmp(s + 1, "denylist") == 0)
-                section = 4;
+                section = SECTION_DENYLIST;
             else
-                section = 0;
+                section = SECTION_NONE;
             continue;
         }
 
-        if (section == 1)
+        if (section == SECTION_PROTECTED)
         {
             /* Expand ~/... for every user in /etc/passwd so that each
              * user's home directory is protected, not just root's. */
@@ -317,7 +320,7 @@ int config_load(const char *path, Config *cfg)
             }
             free_string_array(paths);
         }
-        else if (section == 2)
+        else if (section == SECTION_ALLOWLIST)
         {
             /* [allowlist] "binary = target" or a bare binary (global). */
             if (add_rule(cfg->allowlist, &cfg->allowlist_count, s) < 0)
@@ -327,7 +330,7 @@ int config_load(const char *path, Config *cfg)
                 return -1;
             }
         }
-        else if (section == 3)
+        else if (section == SECTION_SETTINGS)
         {
             /* [settings] key = value */
             char *eq = strchr(s, '=');
@@ -341,12 +344,12 @@ int config_load(const char *path, Config *cfg)
                 int ttl;
                 if (sscanf(val, "%d", &ttl) == 1 && ttl > 0)
                 {
-                    if (ttl > MAX_TTL_SECONDS)
+                    if (ttl > FS_MAX_TTL_SECONDS)
                     {
                         log_msg(LOG_WARNING,
                                 "config_load: user_ttl %d clamped to %d seconds",
-                                ttl, MAX_TTL_SECONDS);
-                        ttl = MAX_TTL_SECONDS;
+                                ttl, FS_MAX_TTL_SECONDS);
+                        ttl = FS_MAX_TTL_SECONDS;
                     }
                     cfg->user_ttl_seconds = ttl;
                 }
@@ -360,12 +363,12 @@ int config_load(const char *path, Config *cfg)
                 int ttl;
                 if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
                 {
-                    if (ttl > MAX_TTL_SECONDS)
+                    if (ttl > FS_MAX_TTL_SECONDS)
                     {
                         log_msg(LOG_WARNING,
                                 "config_load: session_ttl %d clamped to %d seconds",
-                                ttl, MAX_TTL_SECONDS);
-                        ttl = MAX_TTL_SECONDS;
+                                ttl, FS_MAX_TTL_SECONDS);
+                        ttl = FS_MAX_TTL_SECONDS;
                     }
                     cfg->session_ttl_seconds = ttl;
                 }
@@ -387,7 +390,7 @@ int config_load(const char *path, Config *cfg)
                             val);
             }
         }
-        else if (section == 4)
+        else if (section == SECTION_DENYLIST)
         {
             /* [denylist] "binary = target" or a bare binary (global). */
             if (add_rule(cfg->denylist, &cfg->denylist_count, s) < 0)

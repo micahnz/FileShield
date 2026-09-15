@@ -14,9 +14,6 @@
  */
 #define SESSION_MAX 256
 
-/* Defensive backstop; config.c clamps session_ttl at parse time. */
-#define SESSION_MAX_TTL_SECONDS (365 * 24 * 60 * 60)
-
 typedef struct
 {
     int used;
@@ -152,8 +149,8 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
 
     if (ttl_seconds < 0)
         ttl_seconds = 0;
-    if (ttl_seconds > SESSION_MAX_TTL_SECONDS)
-        ttl_seconds = SESSION_MAX_TTL_SECONDS;
+    if (ttl_seconds > FS_MAX_TTL_SECONDS)
+        ttl_seconds = FS_MAX_TTL_SECONDS;
 
     /* Refresh an identical entry instead of appending a duplicate. */
     SessionEntry *e = NULL;

@@ -38,10 +38,31 @@ static void test_proc_exe(void) {
     ASSERT(exe == NULL, "proc_exe_path returns NULL for invalid pid");
 }
 
+static void test_proc_helpers(void) {
+    char comm[64];
+    char cmdline[512];
+    pid_t self = getpid();
+
+    ASSERT(get_ppid(self) > 0, "own ppid readable");
+    ASSERT(read_comm(self, comm, sizeof(comm)) == 0, "own comm readable");
+    ASSERT(strlen(comm) > 0, "own comm non-empty");
+    ASSERT(read_cmdline(self, cmdline, sizeof(cmdline)) > 0,
+           "own cmdline readable");
+    ASSERT(strstr(cmdline, "test_utils") != NULL,
+           "cmdline contains the test binary name");
+
+    ASSERT(get_ppid(999999) == 0, "invalid pid yields ppid 0");
+    ASSERT(read_comm(999999, comm, sizeof(comm)) == -1,
+           "invalid pid comm fails");
+    ASSERT(read_cmdline(999999, cmdline, sizeof(cmdline)) == -1,
+           "invalid pid cmdline fails");
+}
+
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
     test_proc_exe();
+    test_proc_helpers();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

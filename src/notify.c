@@ -602,6 +602,62 @@ const char *notify_decision_name(int decision)
     }
 }
 
+/*
+ * Stage 2 after "Allow": pick the grant scope.  Returns a NOTIFY_* code;
+ * a Cancel click (or any dialog failure) denies this attempt.
+ */
+static int ask_grant_scope(const DisplaySession *session,
+                           const DialogEnvSetting *env, int env_count,
+                           const char *path_s)
+{
+    char msg[1024];
+
+    snprintf(msg, sizeof(msg),
+             "Allow access to:\n"
+             "%s\n\n"
+             "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this file until this session closes\n"
+             "\xe2\x80\xa2 Allow Always  \xe2\x80\x94 this file permanently\n"
+             "                  (re-prompts if the binary changes)\n"
+             "\xe2\x80\xa2 Cancel        \xe2\x80\x94 deny this time",
+             path_s);
+
+    int r = run_kdialog_3choice(session, env, env_count, msg,
+                                "Allow Session", "Allow Always", "Cancel");
+    if (r == 0)
+        return NOTIFY_ALLOW_SESSION;
+    if (r == 1)
+        return NOTIFY_ALLOW_ALWAYS;
+    return NOTIFY_DENY;
+}
+
+/*
+ * Stage 2 after an explicit "Deny": pick the deny scope.  Returns a
+ * NOTIFY_* code; anything but a clean choice denies this attempt.
+ */
+static int ask_deny_scope(const DisplaySession *session,
+                          const DialogEnvSetting *env, int env_count,
+                          const char *path_s)
+{
+    char msg[1024];
+
+    snprintf(msg, sizeof(msg),
+             "Deny access to:\n"
+             "%s\n\n"
+             "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this file until this session closes\n"
+             "\xe2\x80\xa2 Deny Always  \xe2\x80\x94 this file permanently\n"
+             "                 (runtime-denylist.json)\n"
+             "\xe2\x80\xa2 Deny         \xe2\x80\x94 this time only",
+             path_s);
+
+    int r = run_kdialog_3choice(session, env, env_count, msg,
+                                "Deny Session", "Deny Always", "Deny");
+    if (r == 0)
+        return NOTIFY_DENY_SESSION;
+    if (r == 1)
+        return NOTIFY_DENY_ALWAYS;
+    return NOTIFY_DENY;
+}
+
 int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                const char *comm_parent, const char *exe,
                const char *cmdline, const char *path, uid_t user_uid)
@@ -610,7 +666,6 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
      *                NOTIFY_ALLOW_SESSION, NOTIFY_DENY_SESSION,
      *                NOTIFY_ALLOW_ALWAYS, NOTIFY_DENY_ALWAYS. */
     char msg[2048];
-    char msg2[1024];
     char comm_s[64];
     char pcomm_s[64];
     char cmd_s[256];
@@ -671,10 +726,11 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    /* First dialog: Allow Once / Allow / Deny. */
+    /* First dialog: Allow Once / Allow / Deny.  A failure (timeout, exec
+     * error) denies once without a follow-up prompt; only an explicit
+     * Deny click opens the deny-scope dialog. */
     int r = run_kdialog_3choice(&session, dialog_env, dialog_env_count, msg,
                                 "Allow Once", "Allow", "Deny");
-
     if (r == 0)
         return NOTIFY_ALLOW_ONCE;
 
@@ -683,48 +739,13 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
         /* Allow: choose how broad/long the grant should be.  Allow Always
          * is on the No button per the approved UX; a broken kdialog that
          * exits 1 without user interaction is a known accepted risk. */
-        snprintf(msg2, sizeof(msg2),
-                 "Allow access to:\n"
-                 "%s\n\n"
-                 "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this file until this session closes\n"
-                 "\xe2\x80\xa2 Allow Always  \xe2\x80\x94 this file permanently\n"
-                 "                  (re-prompts if the binary changes)\n"
-                 "\xe2\x80\xa2 Cancel        \xe2\x80\x94 deny this time",
-                 path_s);
-
-        int r2 = run_kdialog_3choice(&session, dialog_env, dialog_env_count,
-                                     msg2,
-                                     "Allow Session", "Allow Always", "Cancel");
-        if (r2 == 0)
-            return NOTIFY_ALLOW_SESSION;
-        if (r2 == 1)
-            return NOTIFY_ALLOW_ALWAYS;
-        return NOTIFY_DENY;
+        return ask_grant_scope(&session, dialog_env, dialog_env_count,
+                               path_s);
     }
 
-    /* A failed first dialog (timeout, exec error) denies once without a
-     * follow-up prompt; only an explicit Deny click opens the deny
-     * dialog. */
-    if (r != 2)
-    {
-        log_msg(LOG_WARNING, "[dialog] no valid kdialog choice; denying once");
-        return NOTIFY_DENY;
-    }
+    if (r == 2)
+        return ask_deny_scope(&session, dialog_env, dialog_env_count, path_s);
 
-    snprintf(msg2, sizeof(msg2),
-             "Deny access to:\n"
-             "%s\n\n"
-             "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this file until this session closes\n"
-             "\xe2\x80\xa2 Deny Always  \xe2\x80\x94 this file permanently\n"
-             "                 (runtime-denylist.json)\n"
-             "\xe2\x80\xa2 Deny         \xe2\x80\x94 this time only",
-             path_s);
-
-    int r3 = run_kdialog_3choice(&session, dialog_env, dialog_env_count, msg2,
-                                 "Deny Session", "Deny Always", "Deny");
-    if (r3 == 0)
-        return NOTIFY_DENY_SESSION;
-    if (r3 == 1)
-        return NOTIFY_DENY_ALWAYS;
+    log_msg(LOG_WARNING, "[dialog] no valid kdialog choice; denying once");
     return NOTIFY_DENY;
 }

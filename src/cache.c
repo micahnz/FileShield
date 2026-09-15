@@ -10,14 +10,6 @@
 
 #define CACHE_MAX_ENTRIES 4096
 
-/*
- * Upper bound for any cached decision (1 year): keeps `now + ttl` safe
- * even with 32-bit time_t and bounds how long a grant can outlive a
- * policy change.  config.c clamps at parse time with a warning; this is
- * the defensive backstop (cache.c stays standalone for unit tests).
- */
-#define CACHE_MAX_TTL_SECONDS (365 * 24 * 60 * 60)
-
 typedef struct
 {
     pid_t pid;
@@ -124,8 +116,8 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
 
     if (ttl_seconds <= 0)
         return;
-    if (ttl_seconds > CACHE_MAX_TTL_SECONDS)
-        ttl_seconds = CACHE_MAX_TTL_SECONDS;
+    if (ttl_seconds > FS_MAX_TTL_SECONDS)
+        ttl_seconds = FS_MAX_TTL_SECONDS;
 
     /* Normalise NULL and "" to the wildcard representation. */
     tgt = (target && target[0] != '\0') ? target : "";

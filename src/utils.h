@@ -5,8 +5,39 @@
 
 extern int g_foreground;
 
+/*
+ * Sanity bound for every decision TTL (1 year): keeps `now + ttl`
+ * arithmetic safe on any time_t width and stops a typo from silently
+ * granting access for decades.  config.c clamps at parse time with a
+ * warning; cache.c and session.c clamp again defensively.
+ */
+#define FS_MAX_TTL_SECONDS (365 * 24 * 60 * 60)
+
 char *proc_exe_path(pid_t pid);
 void log_msg(int priority, const char *fmt, ...);
+
+/*
+ * Generic /proc readers shared by the event pipeline and the dialog
+ * code.  All three return -1 (or 0 for get_ppid) when the process is
+ * gone or unreadable; callers treat that as "identity unavailable".
+ */
+
+/* Parent pid of 'pid' from /proc/<pid>/status, or 0 when unreadable. */
+pid_t get_ppid(pid_t pid);
+
+/*
+ * Copy /proc/<pid>/comm (the process name, at most 15 chars plus NUL)
+ * into out, stripping the trailing newline.  Returns 0 on success.
+ */
+int read_comm(pid_t pid, char *out, size_t size);
+
+/*
+ * Read /proc/<pid>/cmdline and collapse the NUL argument separators into
+ * spaces: the bounded, human-readable display form used in dialogs.
+ * Matching uses a fingerprint of the raw bytes instead (fanotify.c).
+ * Returns the number of bytes written (excluding the NUL), or -1.
+ */
+int read_cmdline(pid_t pid, char *out, size_t size);
 
 /*
  * log_set_debug: enable or disable LOG_DEBUG emission.  Disabled by
@@ -39,8 +70,8 @@ void close_fds_from(int first);
 
 /*
  * path_under: return 1 if 'path' is equal to or inside 'dir'.
- * Not used in the fanotify event loop (marks already target specific paths),
- * but available for tests and future callers.
+ * Boundary primitive behind every rule match: is_path_under_protected()
+ * and rule_matches() in fanotify.c both build on it.
  */
 int path_under(const char *path, const char *dir);
 

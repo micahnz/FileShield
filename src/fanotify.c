@@ -38,47 +38,9 @@ static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
 /* ------------------------------------------------------------------ */
 /*  proc helpers                                                       */
 /* ------------------------------------------------------------------ */
-
-static pid_t get_ppid(pid_t pid)
-{
-    char path[64], line[256];
-    FILE *f;
-    pid_t ppid = 0;
-
-    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
-    f = fopen(path, "r");
-    if (!f)
-        return 0;
-    while (fgets(line, sizeof(line), f))
-    {
-        if (sscanf(line, "PPid:\t%d", &ppid) == 1)
-            break;
-    }
-    fclose(f);
-    return ppid;
-}
-
-static int read_comm(pid_t pid, char *out, size_t size)
-{
-    char path[64];
-    FILE *f;
-    size_t len;
-
-    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
-    f = fopen(path, "r");
-    if (!f)
-        return -1;
-    if (!fgets(out, (int)size, f))
-    {
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-    len = strlen(out);
-    if (len > 0 && out[len - 1] == '\n')
-        out[len - 1] = '\0';
-    return 0;
-}
+/* get_ppid(), read_comm() and the display-form read_cmdline() live in
+ * utils.c (unit-tested there); the command-line fingerprint stays here
+ * because it is part of the event-matching contract. */
 
 /*
  * Resolve the path of a fanotify event fd.
@@ -103,36 +65,6 @@ static char *resolve_fd_path(int fd_num)
     }
     buf[len] = '\0';
     return buf;
-}
-
-/*
- * Read /proc/<pid>/cmdline and collapse null separators into spaces.
- * Returns the number of bytes written (excluding the terminating '\0'),
- * or -1 on error.  This is the bounded DISPLAY form; matching uses
- * read_cmdline_fingerprint() over the full raw bytes.
- */
-static int read_cmdline(pid_t pid, char *out, size_t size)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
-    int fd_c = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd_c < 0)
-        return -1;
-
-    ssize_t n = read(fd_c, out, size - 1);
-    close(fd_c);
-    if (n <= 0)
-        return -1;
-
-    /* Replace every embedded NUL with a space, except the last one. */
-    for (ssize_t i = 0; i < n - 1; i++)
-        if (out[i] == '\0')
-            out[i] = ' ';
-    out[n] = '\0';
-    /* Trim any trailing space left by the last NUL. */
-    while (n > 0 && out[n - 1] == ' ')
-        out[--n] = '\0';
-    return (int)n;
 }
 
 /*
@@ -602,56 +534,53 @@ static void load_dyn_list(DynEntry *list, int *list_count,
 /* ------------------------------------------------------------------ */
 
 /*
- * dyn_allow_match: returns 1 if the (binary, bin_sha512, chain, target,
- * command line) tuple matches a stored "Always Allow" entry, 0 otherwise.
+ * Shared matcher for the runtime allow/deny lists.  Entries are scoped to
+ * the exact file and the exact invocation that triggered the dialog:
+ * approving a plugin's "kubectl config view" must not silently grant a
+ * later "kubectl get secrets" from the same shell.
  *
- * Entries are scoped to the exact file and the exact invocation that
- * triggered the dialog: approving a prompt plugin's "kubectl config view"
- * must not silently grant a later "kubectl get secrets" from the same
- * shell.
- *
- * Matching rules (fail-secure):
- *   - Target path must match exactly.
- *   - Binary path must match.
- *   - If both sides have a SHA-512, they must be equal.
- *   - If the stored entry has a SHA-512 but we failed to compute one now
- *     (sha512sum unavailable?), we DENY -- we cannot verify integrity.
- *   - Call-chain depth must match exactly.
- *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
- *     they must be equal; if stored has one but current is missing, DENY.
- *   - The command-line fingerprint (of the full raw cmdline) must match.
- *     The caller computes it lazily, only after every cheaper key has
- *     matched, so unrelated events never pay for the hash.
+ * Every recorded key must match; an unverifiable key never matches.  The
+ * two lists differ in exactly one admission point, require_binary_sha:
+ *   - allow (1): an entry without a binary SHA-512 is skipped -- a grant
+ *     must prove which binary was approved or it would act as a wildcard.
+ *   - deny  (0): a legacy entry without a binary SHA-512 still matches; a
+ *     missing *current* hash skips the entry (re-prompt) instead of
+ *     denying on an unverified identity.
+ * The command-line fingerprint is compared, not recomputed: the caller
+ * produces it lazily so unrelated events never pay for the hash.
  */
-static int dyn_allow_match(const char *binary, const char *bin_sha512,
-                           const ProcChain *chain, const char *target,
-                           const char *cmdline_fp)
+static int dyn_match(const DynEntry *list, int count,
+                     const char *binary, const char *bin_sha512,
+                     const ProcChain *chain, const char *target,
+                     const char *cmdline_fp, int require_binary_sha)
 {
     if (!target || target[0] == '\0')
         return 0;
 
-    for (int i = 0; i < g_dyn_allow_count; i++)
+    for (int i = 0; i < count; i++)
     {
-        const DynEntry *e = &g_dyn_allow[i];
+        const DynEntry *e = &list[i];
 
+        /* Cheap keys first: path equality before any hash comparison. */
         if (strcmp(e->binary, binary) != 0)
             continue;
-
         if (strcmp(e->target_path, target) != 0)
             continue;
 
-        /* Fail closed: an entry without a binary SHA-512 cannot prove the
-         * binary identity was ever verified, so it must never act as a
-         * wildcard grant. */
         if (e->binary_sha512[0] == '\0')
-            continue;
-
-        /* SHA-512 check on the binary itself: the entry always has one
-         * here, so an unusable current hash fails secure. */
-        if (bin_sha512[0] == '\0') /* couldn't hash it now — fail secure */
-            continue;
-        if (strcmp(e->binary_sha512, bin_sha512) != 0)
-            continue;
+        {
+            if (require_binary_sha)
+                continue;
+        }
+        else
+        {
+            /* A stored hash with no usable current hash cannot be
+             * verified, so the entry does not match (fail secure). */
+            if (bin_sha512[0] == '\0')
+                continue;
+            if (strcmp(e->binary_sha512, bin_sha512) != 0)
+                continue;
+        }
 
         if (e->chain_depth != chain->depth)
             continue;
@@ -664,9 +593,11 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
                 ok = 0;
                 break;
             }
+            /* Ancestor hashes are checked only when the entry recorded
+             * one; a stored hash with no current hash fails the match. */
             if (e->chain_sha512[j][0] != '\0')
             {
-                if (chain->sha512[j][0] == '\0') /* can't verify — fail secure */
+                if (chain->sha512[j][0] == '\0')
                 {
                     ok = 0;
                     break;
@@ -681,15 +612,71 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
         if (!ok)
             continue;
 
-        /* The exact invocation must match.  An unavailable fingerprint
-         * means the invocation cannot be verified — fail closed. */
+        /* An entry without a command fingerprint can never match, and an
+         * unavailable current fingerprint is re-prompted (fail closed). */
+        if (e->cmdline_sha512[0] == '\0')
+            continue;
         if (!cmdline_fp || cmdline_fp[0] == '\0')
-            return 0;
+            continue;
         if (strcmp(e->cmdline_sha512, cmdline_fp) != 0)
             continue;
         return 1;
     }
     return 0;
+}
+
+/* "Always Allow" lookup: grants are strict (see dyn_match). */
+static int dyn_allow_match(const char *binary, const char *bin_sha512,
+                           const ProcChain *chain, const char *target,
+                           const char *cmdline_fp)
+{
+    return dyn_match(g_dyn_allow, g_dyn_allow_count, binary, bin_sha512,
+                     chain, target, cmdline_fp, 1);
+}
+
+/*
+ * Append one runtime entry, dropping the oldest when the list is full.
+ * Shared by the allow and deny sides; each caller keeps its own admission
+ * policy (the allow side refuses entries it cannot pin to a binary).
+ */
+static void dyn_add(DynEntry *list, int *count, const char *binary,
+                    const char *bin_sha512, const ProcChain *chain,
+                    const char *target, const char *cmdline,
+                    const char *cmdline_sha512, const char *name)
+{
+    if (*count >= DYN_MAX)
+    {
+        log_msg(LOG_WARNING, "dynamic %s full (%d); dropping oldest entry",
+                name, DYN_MAX);
+        memmove(&list[0], &list[1], sizeof(DynEntry) * (DYN_MAX - 1));
+        *count = DYN_MAX - 1;
+    }
+
+    DynEntry *e = &list[(*count)++];
+    memset(e, 0, sizeof(*e));
+    snprintf(e->binary, sizeof(e->binary), "%s", binary);
+    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
+    if (target)
+        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
+    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
+             cmdline_sha512);
+    e->chain_depth = chain->depth;
+    for (int i = 0; i < chain->depth; i++)
+    {
+        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
+        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
+    }
+}
+
+/* First 16 hex chars of a digest for log lines; the state file has the
+ * full hash.  An empty digest logs as "????????????????". */
+static void sha_prefix(const char *sha512, char out[17])
+{
+    memcpy(out, "????????????????", 17);
+    if (sha512[0] != '\0')
+        memcpy(out, sha512, 16);
+    out[16] = '\0';
 }
 
 static void dyn_allow_add(const char *binary, const char *bin_sha512,
@@ -721,35 +708,11 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
         return;
     }
 
-    if (g_dyn_allow_count >= DYN_MAX)
-    {
-        log_msg(LOG_WARNING, "dynamic allowlist full (%d); dropping oldest entry",
-                DYN_MAX);
-        memmove(&g_dyn_allow[0], &g_dyn_allow[1],
-                sizeof(DynEntry) * (DYN_MAX - 1));
-        g_dyn_allow_count = DYN_MAX - 1;
-    }
+    dyn_add(g_dyn_allow, &g_dyn_allow_count, binary, bin_sha512, chain,
+            target, cmdline, cmdline_sha512, "allowlist");
 
-    DynEntry *e = &g_dyn_allow[g_dyn_allow_count++];
-    memset(e, 0, sizeof(*e));
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
-    if (target)
-        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
-    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
-    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
-             cmdline_sha512);
-    e->chain_depth = chain->depth;
-    for (int i = 0; i < chain->depth; i++)
-    {
-        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
-        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
-    }
-
-    char sha_short[17] = "????????????????";
-    if (bin_sha512[0] != '\0')
-        memcpy(sha_short, bin_sha512, 16);
-    sha_short[16] = '\0';
+    char sha_short[17];
+    sha_prefix(bin_sha512, sha_short);
     log_msg(LOG_INFO,
             "always-allow added: %s (sha512: %s...) chain-depth=%d -> %s",
             binary, sha_short, chain->depth, target ? target : "(unknown)");
@@ -759,90 +722,16 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
 }
 
 /*
- * dyn_deny_match: returns 1 if the (binary, bin_sha512, chain, target,
- * command line) tuple matches a stored "Always Deny" entry, 0 otherwise.
- * Like dyn_allow_match, entries are scoped to the exact file and command.
- *
- * Matching rules (fail-open for denial safety):
- *   - Target path must match exactly.
- *   - Binary path must match.
- *   - If both sides have a SHA-512, they must be equal.
- *   - If the stored entry has a SHA-512 but the current binary's hash
- *     cannot be computed (e.g., sha512sum missing), we skip the entry
- *     (do NOT deny) — we cannot verify the binary is the one that was
- *     supposed to be blocked.  The user will be re-prompted instead.
- *   - Call-chain depth must match exactly.
- *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
- *     they must be equal; if stored has one but current is missing, skip
- *     (preserve allow — we cannot verify the ancestor).
- *   - The command-line fingerprint (of the full raw cmdline) must match;
- *     if it cannot be computed the entry is skipped and the user is
- *     re-prompted.
+ * "Always Deny" lookup: denials may be broader than grants (legacy
+ * entries without a binary hash still apply) but never match on an
+ * identity that cannot be verified -- see dyn_match.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
                           const ProcChain *chain, const char *target,
                           const char *cmdline_fp)
 {
-    if (!target || target[0] == '\0')
-        return 0;
-
-    for (int i = 0; i < g_dyn_deny_count; i++)
-    {
-        const DynEntry *e = &g_dyn_deny[i];
-
-        if (strcmp(e->binary, binary) != 0)
-            continue;
-
-        if (strcmp(e->target_path, target) != 0)
-            continue;
-
-        if (e->binary_sha512[0] != '\0')
-        {
-            if (bin_sha512[0] == '\0')
-                continue;
-            if (strcmp(e->binary_sha512, bin_sha512) != 0)
-                continue;
-        }
-
-        if (e->chain_depth != chain->depth)
-            continue;
-
-        int ok = 1;
-        for (int j = 0; j < chain->depth; j++)
-        {
-            if (strcmp(e->chain_comm[j], chain->comm[j]) != 0)
-            {
-                ok = 0;
-                break;
-            }
-            if (e->chain_sha512[j][0] != '\0')
-            {
-                if (chain->sha512[j][0] == '\0')
-                {
-                    ok = 0;
-                    break;
-                }
-                if (strcmp(e->chain_sha512[j], chain->sha512[j]) != 0)
-                {
-                    ok = 0;
-                    break;
-                }
-            }
-        }
-        if (!ok)
-            continue;
-
-        /* An entry that cannot pin the command must not deny anything,
-         * and an unverifiable current invocation is re-prompted. */
-        if (e->cmdline_sha512[0] == '\0')
-            continue;
-        if (!cmdline_fp || cmdline_fp[0] == '\0')
-            continue; /* cannot verify the invocation: re-prompt */
-        if (strcmp(e->cmdline_sha512, cmdline_fp) != 0)
-            continue;
-        return 1;
-    }
-    return 0;
+    return dyn_match(g_dyn_deny, g_dyn_deny_count, binary, bin_sha512,
+                     chain, target, cmdline_fp, 0);
 }
 
 static void dyn_deny_add(const char *binary, const char *bin_sha512,
@@ -861,35 +750,11 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
         return;
     }
 
-    if (g_dyn_deny_count >= DYN_MAX)
-    {
-        log_msg(LOG_WARNING, "dynamic denylist full (%d); dropping oldest entry",
-                DYN_MAX);
-        memmove(&g_dyn_deny[0], &g_dyn_deny[1],
-                sizeof(DynEntry) * (DYN_MAX - 1));
-        g_dyn_deny_count = DYN_MAX - 1;
-    }
+    dyn_add(g_dyn_deny, &g_dyn_deny_count, binary, bin_sha512, chain,
+            target, cmdline, cmdline_sha512, "denylist");
 
-    DynEntry *e = &g_dyn_deny[g_dyn_deny_count++];
-    memset(e, 0, sizeof(*e));
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
-    if (target)
-        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
-    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
-    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
-             cmdline_sha512);
-    e->chain_depth = chain->depth;
-    for (int i = 0; i < chain->depth; i++)
-    {
-        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
-        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
-    }
-
-    char sha_short[17] = "????????????????";
-    if (bin_sha512[0] != '\0')
-        memcpy(sha_short, bin_sha512, 16);
-    sha_short[16] = '\0';
+    char sha_short[17];
+    sha_prefix(bin_sha512, sha_short);
     log_msg(LOG_INFO,
             "always-deny added: %s (sha512: %s...) chain-depth=%d -> %s",
             binary, sha_short, chain->depth, target ? target : "(unknown)");
@@ -1317,7 +1182,7 @@ static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino)
             continue;
         long age_ms = (now.tv_sec - e->ts.tv_sec) * 1000L + (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
         if (age_ms > RECENT_CACHE_TTL_MS)
-            return -1; /* expired */
+            continue; /* expired: a newer entry for this key may follow */
         return e->fan_decision;
     }
     return -1;
@@ -1931,6 +1796,87 @@ out:
  *
  * Returns number of events responded to.
  */
+/*
+ * Decide one permission event read while a dialog is open.
+ * Returns 1 when the event was responded to (the caller counts it) and 0
+ * when it was deferred to the main loop with its event fd left open.
+ * Fail closed: a full pending queue denies rather than hanging the caller.
+ */
+static int pump_decide_permission(int fan_fd,
+                                  const struct fanotify_event_metadata *ev,
+                                  pid_t dialog_child_pid)
+{
+    int fd_num = (int)ev->fd;
+    int allow = 0;
+
+    if (dialog_child_pid > 0 &&
+        process_in_dialog_group(ev->pid, dialog_child_pid))
+    {
+        log_msg(LOG_DEBUG, "[pump] ALLOW fd=%d pid=%d (dialog group)",
+                fd_num, (int)ev->pid);
+        allow = 1;
+    }
+    else if (get_ppid(ev->pid) == getpid())
+    {
+        /* Direct child of the daemon (sha512sum hashing for the event
+         * being handled) must never stall. */
+        log_msg(LOG_DEBUG, "[pump] ALLOW fd=%d pid=%d (daemon child)",
+                fd_num, (int)ev->pid);
+        allow = 1;
+    }
+    else
+    {
+        /* Fast path: allow if neither the inode nor the path is
+         * protected. */
+        struct stat st;
+        if (fstat(fd_num, &st) == 0 &&
+            !inode_is_protected(st.st_dev, st.st_ino))
+        {
+            char *tgt = resolve_fd_path(fd_num);
+            if (tgt)
+            {
+                if (!is_path_under_protected(tgt))
+                {
+                    log_msg(LOG_DEBUG,
+                            "[pump] ALLOW fd=%d pid=%d path=%s (non-protected)",
+                            fd_num, (int)ev->pid, tgt);
+                    allow = 1;
+                }
+                else
+                {
+                    log_msg(LOG_DEBUG,
+                            "[pump] QUEUE fd=%d pid=%d path=%s (protected)",
+                            fd_num, (int)ev->pid, tgt);
+                }
+                free(tgt);
+            }
+            else
+            {
+                /* Can't resolve path; allow to avoid stalling. */
+                log_msg(LOG_DEBUG,
+                        "[pump] ALLOW fd=%d pid=%d (path unresolvable)",
+                        fd_num, (int)ev->pid);
+                allow = 1;
+            }
+        }
+    }
+
+    if (allow)
+    {
+        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        close(fd_num);
+        return 1;
+    }
+    if (fanotify_defer_event(ev) == 0)
+        return 0; /* deferred; event fd stays open for the main loop */
+
+    log_msg(LOG_WARNING, "[pump] pending queue full; denying fd=%d pid=%d",
+            fd_num, (int)ev->pid);
+    fanotify_respond(fan_fd, ev, FAN_DENY);
+    close(fd_num);
+    return 1;
+}
+
 int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 {
     char buf[BUF_SIZE]
@@ -1970,85 +1916,17 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
         while (FAN_EVENT_OK(ev, (size_t)remaining))
         {
-            if ((ev->mask & FAN_OPEN_PERM) && ev->fd != FAN_NOFD)
+            if (ev->vers != FANOTIFY_METADATA_VERSION)
             {
-                int fd_num = (int)ev->fd;
-                int allow = 0;
-
-                if (dialog_child_pid > 0 &&
-                    process_in_dialog_group(ev->pid, dialog_child_pid))
-                {
-                    log_msg(LOG_DEBUG,
-                            "[pump] ALLOW fd=%d pid=%d (dialog group)",
-                            fd_num, (int)ev->pid);
-                    allow = 1;
-                }
-                else if (get_ppid(ev->pid) == getpid())
-                {
-                    /* Direct child of the daemon (sha512sum hashing for
-                     * the event being handled) must never stall. */
-                    log_msg(LOG_DEBUG,
-                            "[pump] ALLOW fd=%d pid=%d (daemon child)",
-                            fd_num, (int)ev->pid);
-                    allow = 1;
-                }
-                else
-                {
-                    /* Fast-path: allow if neither inode-protected nor
-                     * under a protected path. */
-                    struct stat st;
-                    if (fstat(fd_num, &st) == 0 &&
-                        !inode_is_protected(st.st_dev, st.st_ino))
-                    {
-                        char *tgt = resolve_fd_path(fd_num);
-                        if (tgt)
-                        {
-                            if (!is_path_under_protected(tgt))
-                            {
-                                log_msg(LOG_DEBUG,
-                                        "[pump] ALLOW fd=%d pid=%d path=%s (non-protected)",
-                                        fd_num, (int)ev->pid, tgt);
-                                allow = 1;
-                            }
-                            else
-                            {
-                                log_msg(LOG_DEBUG,
-                                        "[pump] QUEUE fd=%d pid=%d path=%s (protected)",
-                                        fd_num, (int)ev->pid, tgt);
-                            }
-                            free(tgt);
-                        }
-                        else
-                        {
-                            /* Can't resolve path; allow to avoid stalling. */
-                            log_msg(LOG_DEBUG,
-                                    "[pump] ALLOW fd=%d pid=%d (path unresolvable)",
-                                    fd_num, (int)ev->pid);
-                            allow = 1;
-                        }
-                    }
-                }
-
-                if (allow)
-                {
-                    fanotify_respond(fan_fd, ev, FAN_ALLOW);
-                    close(fd_num);
-                    responded++;
-                }
-                else if (fanotify_defer_event(ev) == 0)
-                {
-                    /* Deferred to the main loop, event fd kept open. */
-                }
-                else
-                {
-                    /* Queue full: fail closed rather than hang or lose it. */
-                    log_msg(LOG_WARNING,
-                            "[pump] pending queue full; denying fd=%d pid=%d",
-                            fd_num, (int)ev->pid);
-                    fanotify_respond(fan_fd, ev, FAN_DENY);
-                    close(fd_num);
-                    responded++;
-                }
+                /* Defensive parity with the main loop: an event we cannot
+                 * interpret is not acted on. */
+                if (ev->fd != FAN_NOFD)
+                    close((int)ev->fd);
+            }
+            else if ((ev->mask & FAN_OPEN_PERM) && ev->fd != FAN_NOFD)
+            {
+                responded += pump_decide_permission(fan_fd, ev,
+                                                    dialog_child_pid);
             }
             else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
             {
@@ -2070,7 +1948,11 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 close((int)ev->fd);
             }
 
-            ev = FAN_EVENT_NEXT(ev, remaining);
+            if (ev->event_len == 0)
+                break;
+            remaining -= ev->event_len;
+            ev = (const struct fanotify_event_metadata *)((const char *)ev +
+                                                          ev->event_len);
         }
     }
 
@@ -2215,12 +2097,11 @@ void fanotify_loop(int fd)
             {
                 if (ev->vers != FANOTIFY_METADATA_VERSION)
                 {
+                    /* Unknown layout: nothing can be interpreted safely. */
                     if (ev->fd != FAN_NOFD)
                         close((int)ev->fd);
-                    goto advance;
                 }
-
-                if (ev->mask & FAN_OPEN_PERM)
+                else if (ev->mask & FAN_OPEN_PERM)
                 {
                     process_open_perm(fd, ev);
                 }
@@ -2245,11 +2126,11 @@ void fanotify_loop(int fd)
                     close((int)ev->fd);
                 }
 
-            advance:
                 if (ev->event_len == 0)
                     break;
                 remaining -= ev->event_len;
-                ev = (const struct fanotify_event_metadata *)((const char *)ev + ev->event_len);
+                ev = (const struct fanotify_event_metadata *)((const char *)ev +
+                                                              ev->event_len);
             }
         }
 

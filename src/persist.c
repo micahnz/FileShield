@@ -256,6 +256,65 @@ static int json_extract_string(const char *line, char *key_out, size_t keysz,
     return 1;
 }
 
+/*
+ * Apply one parsed string field to an entry.  Values arrive already
+ * unescaped; unknown keys are ignored so hand-edited state files stay
+ * loadable.
+ */
+static void apply_entry_field(PersistEntry *e, const char *key,
+                              const char *value)
+{
+    int idx;
+
+    if (strcmp(key, "binary") == 0)
+        copy_field(e->binary, sizeof(e->binary), value);
+    else if (strcmp(key, "binary_sha512") == 0)
+        copy_field(e->binary_sha512, sizeof(e->binary_sha512), value);
+    else if (strcmp(key, "target_path") == 0)
+        copy_field(e->target_path, sizeof(e->target_path), value);
+    else if (strcmp(key, "cmdline") == 0)
+        copy_field(e->cmdline, sizeof(e->cmdline), value);
+    else if (strcmp(key, "cmdline_sha512") == 0)
+        copy_field(e->cmdline_sha512, sizeof(e->cmdline_sha512), value);
+    else if (sscanf(key, "chain_comm[%d]", &idx) == 1 &&
+             idx >= 0 && idx < PERSIST_CHAIN_MAX)
+        copy_field(e->chain_comm[idx], sizeof(e->chain_comm[idx]), value);
+    else if (sscanf(key, "chain_sha512[%d]", &idx) == 1 &&
+             idx >= 0 && idx < PERSIST_CHAIN_MAX)
+        copy_field(e->chain_sha512[idx], sizeof(e->chain_sha512[idx]), value);
+}
+
+/* Apply the numeric fields (chain_depth, created_at) of one line. */
+static void apply_entry_number(PersistEntry *e, const char *line)
+{
+    char key_buf[256];
+    int tmp_int;
+    long created_tmp;
+
+    if (sscanf(line, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
+        strcmp(key_buf, "chain_depth") == 0)
+    {
+        /* chain_depth is used as an array bound: reject anything outside
+         * [0, PERSIST_CHAIN_MAX] at the parse boundary. */
+        if (tmp_int >= 0 && tmp_int <= PERSIST_CHAIN_MAX)
+        {
+            e->chain_depth = tmp_int;
+        }
+        else
+        {
+            log_msg(LOG_WARNING,
+                    "persist_load: chain_depth %d out of range [0,%d], clamping",
+                    tmp_int, PERSIST_CHAIN_MAX);
+            e->chain_depth = tmp_int < 0 ? 0 : PERSIST_CHAIN_MAX;
+        }
+    }
+    else if (sscanf(line, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
+             strcmp(key_buf, "created_at") == 0)
+    {
+        e->created_at = (time_t)created_tmp;
+    }
+}
+
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
 {
     FILE *fp;
@@ -264,6 +323,12 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     int count = 0;
     int warned_truncated = 0;
 
+    /*
+     * Minimal line-oriented scanner: just enough JSON structure to find
+     * the "entries" array and one object per entry, then apply fields
+     * line by line.  Comments (#) and unknown keys are tolerated so the
+     * state files stay hand-editable.
+     */
     enum
     {
         S_OUTSIDE,
@@ -367,62 +432,14 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
 
         /* Parse key-value pairs.  String values are decoded escape-aware
          * (command lines routinely contain quotes); numeric fields fall
-         * through to sscanf.  Patterns intentionally omit the trailing
-         * comma so they match both "value", and "value". */
+         * through to apply_entry_number().  Patterns intentionally omit
+         * the trailing comma so they match both "value", and "value". */
         char key_buf[256], val_buf[4096];
         if (json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
                                 sizeof(val_buf)))
-        {
-            int idx;
-            if (strcmp(key_buf, "binary") == 0)
-                copy_field(current->binary, sizeof(current->binary), val_buf);
-            else if (strcmp(key_buf, "binary_sha512") == 0)
-                copy_field(current->binary_sha512,
-                           sizeof(current->binary_sha512), val_buf);
-            else if (strcmp(key_buf, "target_path") == 0)
-                copy_field(current->target_path,
-                           sizeof(current->target_path), val_buf);
-            else if (strcmp(key_buf, "cmdline") == 0)
-                copy_field(current->cmdline, sizeof(current->cmdline), val_buf);
-            else if (strcmp(key_buf, "cmdline_sha512") == 0)
-                copy_field(current->cmdline_sha512,
-                           sizeof(current->cmdline_sha512), val_buf);
-            else if (sscanf(key_buf, "chain_comm[%d]", &idx) == 1 &&
-                     idx >= 0 && idx < PERSIST_CHAIN_MAX)
-                copy_field(current->chain_comm[idx],
-                           sizeof(current->chain_comm[idx]), val_buf);
-            else if (sscanf(key_buf, "chain_sha512[%d]", &idx) == 1 &&
-                     idx >= 0 && idx < PERSIST_CHAIN_MAX)
-                copy_field(current->chain_sha512[idx],
-                           sizeof(current->chain_sha512[idx]), val_buf);
-        }
+            apply_entry_field(current, key_buf, val_buf);
         else
-        {
-            int tmp_int;
-            long created_tmp;
-            if (sscanf(p, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
-                strcmp(key_buf, "chain_depth") == 0)
-            {
-                /* chain_depth is used as an array bound: reject anything
-                 * outside [0, PERSIST_CHAIN_MAX] at the parse boundary. */
-                if (tmp_int >= 0 && tmp_int <= PERSIST_CHAIN_MAX)
-                {
-                    current->chain_depth = tmp_int;
-                }
-                else
-                {
-                    log_msg(LOG_WARNING,
-                            "persist_load: chain_depth %d out of range [0,%d], clamping",
-                            tmp_int, PERSIST_CHAIN_MAX);
-                    current->chain_depth = tmp_int < 0 ? 0 : PERSIST_CHAIN_MAX;
-                }
-            }
-            else if (sscanf(p, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
-                     strcmp(key_buf, "created_at") == 0)
-            {
-                current->created_at = (time_t)created_tmp;
-            }
-        }
+            apply_entry_number(current, p);
     }
 
     fclose(fp);

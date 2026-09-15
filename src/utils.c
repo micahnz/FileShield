@@ -38,6 +38,71 @@ char *proc_exe_path(pid_t pid)
     return strdup(buf);
 }
 
+pid_t get_ppid(pid_t pid)
+{
+    char path[64], line[256];
+    FILE *f;
+    pid_t ppid = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        if (sscanf(line, "PPid:\t%d", &ppid) == 1)
+            break;
+    }
+    fclose(f);
+    return ppid;
+}
+
+int read_comm(pid_t pid, char *out, size_t size)
+{
+    char path[64];
+    FILE *f;
+    size_t len;
+
+    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    if (!fgets(out, (int)size, f))
+    {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    len = strlen(out);
+    if (len > 0 && out[len - 1] == '\n')
+        out[len - 1] = '\0';
+    return 0;
+}
+
+int read_cmdline(pid_t pid, char *out, size_t size)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+    int fd_c = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd_c < 0)
+        return -1;
+
+    ssize_t n = read(fd_c, out, size - 1);
+    close(fd_c);
+    if (n <= 0)
+        return -1;
+
+    /* Replace every embedded NUL with a space, except the last one. */
+    for (ssize_t i = 0; i < n - 1; i++)
+        if (out[i] == '\0')
+            out[i] = ' ';
+    out[n] = '\0';
+    /* Trim any trailing space left by the last NUL. */
+    while (n > 0 && out[n - 1] == ' ')
+        out[--n] = '\0';
+    return (int)n;
+}
+
 void log_msg(int priority, const char *fmt, ...)
 {
     va_list a1, a2;
