@@ -9,11 +9,11 @@
 
 ```
 FileShield/
+├── AGENTS.md                    # this file (project guide)
+├── README.md                    # user-facing documentation
 ├── Makefile
 ├── fileshield.conf              # default config shipped with install
 ├── fileshield.service           # systemd unit
-├── docs/
-│   └── plan.md                  # this file
 ├── src/
 │   ├── main.c                   # daemonize, signals, startup/reload orchestration
 │   ├── fanotify.c / fanotify.h  # init, marks, event loop, decision pipeline
@@ -100,7 +100,7 @@ the requesting process.
 ### `main.c` — daemon lifecycle
 
 ```c
-// Usage: fileshield [--foreground] [--config /path/to/fileshield.conf]
+// Usage: fileshield [--foreground] [--config /path/to/fileshield.conf] [--debug]
 // Signal handling: SIGTERM/INT -> shutdown, SIGHUP -> reload config
 ```
 
@@ -108,7 +108,7 @@ the requesting process.
 
 | Decision | Match key | Lifetime | Stored in |
 |----------|-----------|----------|-----------|
-| Allow Once | PID + binary + target file | `user_ttl` (default 300s) | memory |
+| Allow Once | PID + binary + target file | `user_ttl` (shipped config: 300s; 0 = not cached) | memory |
 | Allow/Deny Session | SID + leader start + binary (+SHA-512) + target | `session_ttl` (0 = shell lifetime) | memory |
 | Allow/Deny Always | binary SHA-512 + call chain + target file + command line (stored verbatim, matched by SHA-512 over the full raw line, ≤64 KB) | until removed | JSON state files |
 
@@ -122,7 +122,7 @@ match (fail closed, re-prompt).
 
 ## Build & Test
 
-- `make` — compile `fileshield` binary + test binaries
+- `make` — compile the `fileshield` binary
 - `make test` — compile and run all test suites
 - `make bench` — build and run `tests/bench_hotpath.c` (hot-path microbenchmarks)
 - `make install` — install binary, config, systemd unit
@@ -146,8 +146,11 @@ match (fail closed, re-prompt).
 - Tests are self-contained C files linked against the module `.o` files
 - Each test returns 0 on pass, non-zero on failure. `make test` runs them all and reports aggregate.
 
-## Limitations (from README)
-- Root-only (CAP_SYS_ADMIN for fanotify_init)
+## Limitations (see README for detail)
+- Root-only (CAP_SYS_ADMIN for `fanotify_init`); root processes can bypass fanotify
 - `kdialog` required for popups; missing/failing kdialog denies access (fail closed)
-- Kernel 5.0+ for FAN_OPEN_PERM on directories
-- No NFS/CIFS coverage
+- Kernel 5.0+ for FAN_OPEN_PERM on directories; no NFS/CIFS coverage; `mmap` and bind-mount aliases are outside the threat model
+- Hard links: inodes present at startup are tracked, and an open through an unprotected path always prompts. Files created after startup, deeper than 8 directory levels, or past the inode-table cap are not inode-tracked (`FAN_REPORT_FID` is a planned follow-up)
+- TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
+- Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
+- Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt

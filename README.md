@@ -93,7 +93,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. Persisted _Always Allow_ / _Always Deny_ lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. If the new set cannot be installed completely, the daemon restores the previous marks and keeps the old config; if even the rollback fails it shuts down so systemd restarts it cleanly (fail closed). Persisted _Always Allow_ / _Always Deny_ lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
 
 ### Default Protected Paths
 
@@ -135,12 +135,16 @@ FileShield ships with the following paths protected out of the box:
 # --- SCM tokens ---
 ~/.config/gh/hosts.yml
 
+# --- GitHub Actions / CI secrets ---
+~/.config/github-copilot/
+~/.config/hub
+
 # --- General ---
 ~/.netrc
 ~/.env
 ```
 
-Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start only if no configured path on any filesystem could be marked at all.
+Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start if any configured path that exists cannot be marked, if `[protected_paths]` is empty, or if nothing at all could be marked (fail closed).
 
 ### Allowlist
 
@@ -158,7 +162,7 @@ Add entries only for tools you have audited and trust at that exact path:
 - A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. Matching is _equal or under_: `/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it; a bare file target covers exactly that file.
 - A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access _every_ protected path. This is the most dangerous form — use it sparingly.
 - A binary may appear on **multiple lines** with different targets when it needs exceptions for more than one file or folder.
-- `~` in binary and target paths expands for every user's home, the same way `[protected_paths]` do.
+- `~` in binary and target paths expands for every regular user's home (UID 1000–65533; root and system accounts are skipped), the same way `[protected_paths]` do.
 - Rules no longer carry a per-entry TTL: repeated opens refresh the file cache for `user_ttl` seconds (see [Settings](#settings)).
 
 > **Why not pre-allowlist common SRE tools?**  
@@ -183,6 +187,7 @@ A scoped entry denies the binary that one file or folder; a bare binary line is 
 [settings]
 # How long an "Allow Once" decision is cached for the same process and file
 # (seconds).  Config allowlist hits also refresh the cache with this TTL.
+# 0 disables caching (each open prompts again); the shipped config sets 300.
 user_ttl = 300
 
 # Cap for "Allow Session" / "Deny Session" decisions (seconds).
@@ -306,7 +311,7 @@ Each entry records the binary path and SHA-512, the target file, the exact comma
 }
 ```
 
-To remove a single file-scoped entry, edit the state file directly (root-only, JSON array): delete the matching object with `jq`, or simply remove the file to clear the whole list.
+To remove a single file-scoped entry, edit the state file directly (root-only; the entries live in the `entries` array of a JSON object): delete the matching object with `jq`, or simply remove the file to clear the whole list.
 
 ```bash
 # Remove every entry for one binary from the allowlist
@@ -332,10 +337,10 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 
 ## How It Works
 
-1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT, O_RDONLY | O_LARGEFILE)`.
+1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed.
 2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
-4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config allowlist, session/permanent denials, file cache, session/permanent grants).
+4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, config allowlist).
 5. On a miss, it spawns a `kdialog` two-stage popup on the requesting user's desktop session and waits for user input. The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
@@ -445,14 +450,14 @@ This builds with `-O0 -g -fsanitize=address,undefined` and prints any memory err
 
 ## Running Tests
 
-Unit tests cover the cache, config parser, session decisions, JSON state files, SHA-512 digests, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
+Unit tests cover the cache, config parser, session decisions, JSON state files, SHA-512 digests, the protected-inode set, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
 
 ```bash
 # Build and run all tests
 make test
 
 # Build tests without running
-make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_utils build/test_fanotify
+make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_inode build/test_utils build/test_fanotify
 
 # Run a single test binary directly
 ./build/test_cache
@@ -460,6 +465,7 @@ make build/test_cache build/test_config build/test_session build/test_persist bu
 ./build/test_session
 ./build/test_persist
 ./build/test_sha512
+./build/test_inode
 ./build/test_utils
 ./build/test_fanotify
 ```
@@ -486,7 +492,7 @@ Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event h
 
 ## Troubleshooting
 
-- **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). if kdialog is missing or fails, access is denied (fail closed).
+- **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). If kdialog is missing or fails, access is denied (fail closed).
 - **Dialog does not match your theme?** The daemon runs as root with a bare environment, so FileShield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
 - **Dialog behavior on failure**: timeouts, exec failures and Cancel/window close deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — a documented, accepted trade-off; `Allow Session` remains on Yes, and timeouts/exec failures always fail closed.
 - **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.

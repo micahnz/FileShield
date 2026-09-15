@@ -33,7 +33,8 @@ typedef struct
     int allowlist_count;
     RuleEntry denylist[MAX_RULES];
     int denylist_count;
-    int user_ttl_seconds;    /* TTL for user-approved accesses (default 300) */
+    int user_ttl_seconds;    /* "Allow Once" TTL; 0 = not cached (the shipped
+                                config sets 300)                              */
     int session_ttl_seconds; /* TTL cap for session decisions; 0 = for as long
                                 as the session leader (shell) lives          */
 } Config;
