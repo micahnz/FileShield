@@ -355,6 +355,15 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     int mark_skipped = 0;
+
+    /* Load persisted "Always Allow"/"Always Deny" entries and the hash
+     * pins BEFORE installing marks: while marks are active, an open() of
+     * these state files could be answered only by the daemon itself.  A
+     * read error is treated as an empty list (fail secure); the state is
+     * reloaded on SIGHUP as well. */
+    load_persisted_state();
+    load_pin_state();
+
     int mark_failures = install_marks(fan_fd, cfg, "startup", &mark_skipped);
     if (mark_failures > 0)
     {
@@ -392,14 +401,6 @@ int main(int argc, char *argv[])
 
     log_msg(LOG_INFO, "Fileshield started, watching %d paths (%d exclusions)",
             cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
-
-    /* Load persisted "Always Allow"/"Always Deny" entries from the
-     * previous session.  A read error is treated as an empty list (fail
-     * secure).  The hash pins are loaded alongside so a file that is
-     * missing on first boot, or repaired/removed later, is picked up on
-     * SIGHUP as well. */
-    load_persisted_state();
-    load_pin_state();
 
     while (g_running)
     {

@@ -1012,15 +1012,67 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
 
 #define MAX_INODE_WALK_DEPTH 8 /* max recursion depth for protected-directory inode enumeration */
 
-/* One FAN_MARK_MOUNT per unique filesystem device */
+/* One FAN_MARK_MOUNT per unique init-namespace mount.  Mount marks must
+ * be attached to the mount instances user processes open through, and a
+ * mark placed in a private mount namespace never sees them (Phase 0 exp1,
+ * MARK-SCOPE-REDESIGN.md).  The daemon therefore marks through pid 1's
+ * namespace: "/proc/1/root" + path resolves the real mount even while the
+ * daemon itself runs sandboxed (exp2/exp2p proved delivery).  Inode marks
+ * need no prefix: inodes are shared across namespaces. */
+#define NS_ROOT_PREFIX "/proc/1/root"
 #define MAX_MOUNTS 32
 typedef struct
 {
     dev_t dev;
-    char path[PATH_MAX]; /* any path on that mount, used for mark removal */
+    unsigned long long mount_id; /* init-ns mount ID; 0 = unknown */
+    char path[PATH_MAX];         /* init-ns path, used for mark removal */
 } MountEntry;
 static MountEntry g_mounts[MAX_MOUNTS];
 static int g_mount_count = 0;
+
+/* Build the init-namespace path used for mount-mark operations.  Returns
+ * 0 on success, -1 when the result would not fit. */
+static int mark_path_for(const char *path, char *out, size_t outsz)
+{
+    int n = snprintf(out, outsz, NS_ROOT_PREFIX "%s", path);
+
+    if (n < 0 || (size_t)n >= outsz)
+    {
+        log_msg(LOG_ERR, "mark path too long: %s", path);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Mount ID of the mount containing 'path', resolved through the init
+ * namespace.  Used to dedupe marks per mount instance (st_dev is not a
+ * mount identity: btrfs subvolumes share one device).  Returns 0 when
+ * statx(STATX_MNT_ID) is unavailable; callers fall back to device dedupe.
+ */
+static unsigned long long mount_id_of(const char *path)
+{
+    char ns_path[PATH_MAX];
+    struct statx stx;
+
+    if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
+        return 0;
+    if (statx(AT_FDCWD, ns_path, 0, STATX_MNT_ID, &stx) != 0)
+        return 0;
+    return stx.stx_mnt_id;
+}
+
+/* Test seams (fanotify.h): the path builder and mount-ID lookup used for
+ * mount marks.  Unprivileged and side-effect free. */
+int fanotify_test_mark_path(const char *path, char *out, size_t outsz)
+{
+    return mark_path_for(path, out, outsz);
+}
+
+unsigned long long fanotify_test_mount_id(const char *path)
+{
+    return mount_id_of(path);
+}
 
 /* Recursively walk a directory and add inodes of regular files.
  * Stays on the same device (no cross-mount traversal).
@@ -1244,16 +1296,31 @@ int fanotify_setup(void)
     return fd;
 }
 
-/* Add a FAN_MARK_MOUNT for the filesystem containing st, if not already
- * tracked.  "path" may be any existing path on that filesystem; it is
- * remembered for mark removal. */
+/* Add a FAN_MARK_MOUNT for the init-namespace mount containing st, if not
+ * already tracked.  "path" may be any existing path on that mount; the
+ * "/proc/1/root"-prefixed form is what reaches the kernel and what is
+ * remembered for mark removal.  Dedupe is per mount instance (mount ID);
+ * st_dev alone would merge distinct btrfs subvolume mounts. */
 static void add_mount_mark_if_needed(int fd, const struct stat *st,
                                      const char *path)
 {
+    char ns_path[PATH_MAX];
+    unsigned long long mnt_id = mount_id_of(path);
+
+    if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
+        return;
+
     for (int i = 0; i < g_mount_count; i++)
     {
-        if (g_mounts[i].dev == st->st_dev)
-            return;
+        if (mnt_id != 0)
+        {
+            if (g_mounts[i].mount_id == mnt_id)
+                return;
+        }
+        else if (g_mounts[i].mount_id == 0 && g_mounts[i].dev == st->st_dev)
+        {
+            return; /* statx unavailable: fall back to device dedupe */
+        }
     }
 
     if (g_mount_count >= MAX_MOUNTS)
@@ -1266,21 +1333,24 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
     }
 
     if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                      FAN_OPEN_PERM, AT_FDCWD, path) == 0)
+                      FAN_OPEN_PERM, AT_FDCWD, ns_path) == 0)
     {
         g_mounts[g_mount_count].dev = st->st_dev;
+        g_mounts[g_mount_count].mount_id = mnt_id;
         snprintf(g_mounts[g_mount_count].path,
-                 sizeof(g_mounts[g_mount_count].path), "%s", path);
+                 sizeof(g_mounts[g_mount_count].path), "%s", ns_path);
         g_mount_count++;
-        log_msg(LOG_INFO, "fanotify mount mark added (dev %lu) for hard-link detection",
-                (unsigned long)st->st_dev);
+        log_msg(LOG_INFO,
+                "fanotify mount mark added for %s (dev %lu, mount %llu) "
+                "for hard-link detection",
+                path, (unsigned long)st->st_dev, mnt_id);
     }
     else
     {
         log_msg(LOG_ERR,
-                "fanotify mount mark failed for %s: %s "
+                "fanotify mount mark failed for %s (init-ns path %s): %s "
                 "(hard-link detection disabled for this filesystem)",
-                path, strerror(errno));
+                path, ns_path, strerror(errno));
     }
 }
 
@@ -2759,8 +2829,10 @@ void fanotify_clear_marks(int fd)
         if (fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
                           FAN_OPEN_PERM, AT_FDCWD, g_mounts[i].path) < 0)
         {
-            log_msg(LOG_WARNING, "fanotify mount mark remove failed for dev %lu: %s",
-                    (unsigned long)g_mounts[i].dev, strerror(errno));
+            log_msg(LOG_WARNING,
+                    "fanotify mount mark remove failed for %s (dev %lu): %s",
+                    g_mounts[i].path, (unsigned long)g_mounts[i].dev,
+                    strerror(errno));
         }
     }
     g_mount_count = 0;

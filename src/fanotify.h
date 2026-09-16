@@ -178,4 +178,13 @@ int fanotify_test_resolve_path(int fd, char *out, size_t outsz);
  */
 int fanotify_test_unsafe_first_hit(pid_t pid);
 
+/*
+ * Test seams: init-namespace mount-mark plumbing.  fanotify_test_mark_path()
+ * builds "/proc/1/root" + path (0 on success, -1 when it does not fit);
+ * fanotify_test_mount_id() returns the init-namespace mount ID of the mount
+ * containing path, or 0 when statx(STATX_MNT_ID) is unavailable.
+ */
+int fanotify_test_mark_path(const char *path, char *out, size_t outsz);
+unsigned long long fanotify_test_mount_id(const char *path);
+
 #endif

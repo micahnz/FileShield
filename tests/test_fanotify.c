@@ -1360,9 +1360,44 @@ cleanup:
     close(fd);
 }
 
+/*
+ * Part 0d: mount marks must be placed through pid 1's mount namespace
+ * ("/proc/1/root" + path) so they attach to the mount instances user
+ * processes open through, and must be keyed by mount instance.  Inodes are
+ * shared across namespaces, so only mount marks need the prefix
+ * (MARK-SCOPE-REDESIGN.md; Phase 0 exp1/exp2/exp2p).
+ */
+static void test_mark_paths(void) {
+    char buf[PATH_MAX];
+    unsigned long long id_root, id_proc;
+
+    ASSERT(fanotify_test_mark_path("/home/u/.ssh", buf, sizeof(buf)) == 0,
+           "mark path builds");
+    ASSERT(strcmp(buf, "/proc/1/root/home/u/.ssh") == 0,
+           "mark path is prefixed with /proc/1/root");
+
+    ASSERT(fanotify_test_mark_path("/", buf, sizeof(buf)) == 0,
+           "root mark path builds");
+    ASSERT(strcmp(buf, "/proc/1/root/") == 0, "root mark path is prefixed");
+
+    ASSERT(fanotify_test_mark_path("/home/u/.ssh", buf, 8) == -1,
+           "too-small buffer is rejected");
+
+    id_root = fanotify_test_mount_id("/");
+    id_proc = fanotify_test_mount_id("/proc");
+    if (id_root == 0 || id_proc == 0) {
+        printf("SKIP: statx(STATX_MNT_ID) unavailable; mount-ID checks skipped\n");
+    } else {
+        ASSERT(fanotify_test_mount_id("/") == id_root,
+               "mount ID is stable across calls");
+        ASSERT(id_root != id_proc, "different mounts have different IDs");
+    }
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
+    test_mark_paths();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();
