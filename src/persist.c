@@ -500,6 +500,30 @@ static void apply_entry_number(PersistEntry *e, const char *line)
     }
 }
 
+/*
+ * persist_load: read a runtime allow/deny state file.  The reader
+ * accepts exactly the shape persist_save() writes, scanned line by line:
+ *
+ *   {
+ *     "entries": [
+ *       {
+ *         "binary": "...", "binary_sha512": "...", "target_path": "...",
+ *         "cmdline": "...", "cmdline_sha512": "...",
+ *         "chain_depth": 2, "created_at": 123,
+ *         "chain_comm[0]": "...", ... "chain_sha512[j]": "..."
+ *       },
+ *       ...
+ *     ]
+ *   }
+ *
+ * Each line holds at most one "key": "value" string pair or one numeric
+ * field.  Blank lines, comments (#) and unknown keys are tolerated;
+ * structural incompleteness (no "entries" array, missing ] or }, an
+ * entry cut off mid-way), a malformed line, or a line longer than
+ * JSON_LINE_MAX (which the writer can never emit) returns -1: the
+ * caller then clears the in-memory lists (fail secure) and the journal
+ * records the damage.
+ */
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
 {
     FILE *fp;

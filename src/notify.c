@@ -1167,53 +1167,40 @@ static int notify_rate_allow(int kind, const char *binary, const char *target,
     return 1;
 }
 
-void notify_rule_hit(const NotifyHit *hit)
+/*
+ * One-time, cached availability check for notify-send.  A missing
+ * helper must not spend the dedup or flood budget on notifications that
+ * can never be shown; the "not found" warning is emitted once.
+ */
+static int notify_send_available(void)
 {
-    char title[128];
+    if (g_notify_send_ok)
+        return 1;
+
+    g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
+    if (!g_notify_send_ok && !g_notify_send_checked)
+    {
+        g_notify_send_checked = 1;
+        log_msg(LOG_WARNING,
+                "notify_rule_hit: %s not found; rule notifications "
+                "disabled (see README)",
+                NOTIFY_SEND_PATH);
+    }
+    return g_notify_send_ok;
+}
+
+/*
+ * Build the notification text for one rule hit: sanitized fields plus
+ * the title, urgency and icon selected by the hit kind.  notify-send
+ * only knows low/normal/critical urgency, so an unsafe hit is normal
+ * urgency with the warning icon: it stands out without the persistence
+ * of a critical notification.
+ */
+static void build_hit_notification(const NotifyHit *hit, char *title,
+                                   size_t titlesz, char *body, size_t bodysz,
+                                   const char **urgency, const char **icon)
+{
     char rule[512], bin[512], comm[64], target[512];
-    char body[2048];
-    const char *urgency;
-    const char *icon;
-
-    if (!hit || hit->uid == (uid_t)-1 || hit->uid == 0)
-        return;
-
-    /* Availability first: a missing notify-send must not spend the dedup
-     * or flood budget on notifications that are never shown. */
-    if (!g_notify_send_ok)
-    {
-        g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
-        if (!g_notify_send_ok)
-        {
-            if (!g_notify_send_checked)
-            {
-                g_notify_send_checked = 1;
-                log_msg(LOG_WARNING,
-                        "notify_rule_hit: %s not found; rule notifications "
-                        "disabled (see README)",
-                        NOTIFY_SEND_PATH);
-            }
-            return;
-        }
-    }
-
-    /* Deliverability before budget: a uid with no desktop session must
-     * not spend the dedup or flood budget (the global cap is shared by
-     * every user) on notifications that are never shown. */
-    DisplaySession session;
-    if (!detect_display_session(hit->uid, &session))
-    {
-        log_msg(LOG_DEBUG,
-                "notify_rule_hit: no desktop session for uid %d; "
-                "notification skipped",
-                (int)hit->uid);
-        return;
-    }
-
-    if (!notify_rate_allow(hit->kind, hit->binary ? hit->binary : "",
-                           hit->target ? hit->target : "",
-                           hit->dedup_seconds, hit->max_per_window))
-        return;
 
     /* Per-field sanitation: newlines inside fields must not forge lines. */
     sanitize_text(hit->rule ? hit->rule : "(unknown)", rule, sizeof(rule));
@@ -1224,38 +1211,40 @@ void notify_rule_hit(const NotifyHit *hit)
 
     if (hit->kind == NOTIFY_HIT_UNSAFE)
     {
-        /* notify-send only knows low/normal/critical urgency: a warning
-         * is normal urgency with the warning icon, so it stands out
-         * without the persistence of a critical notification. */
-        snprintf(title, sizeof(title),
-                 "Fileshield: unsafe allowlist rule used");
-        urgency = "normal";
-        icon = "dialog-warning";
+        snprintf(title, titlesz, "Fileshield: unsafe allowlist rule used");
+        *urgency = "normal";
+        *icon = "dialog-warning";
     }
     else if (hit->kind == NOTIFY_HIT_DENY)
     {
-        snprintf(title, sizeof(title),
-                 "Fileshield: denylist blocked an access");
-        urgency = "critical";
-        icon = "security-high";
+        snprintf(title, titlesz, "Fileshield: denylist blocked an access");
+        *urgency = "critical";
+        *icon = "security-high";
     }
     else
     {
-        snprintf(title, sizeof(title), "Fileshield: allowlist rule used");
-        urgency = "normal";
-        icon = "dialog-information";
+        snprintf(title, titlesz, "Fileshield: allowlist rule used");
+        *urgency = "normal";
+        *icon = "dialog-information";
     }
 
-    snprintf(body, sizeof(body),
+    snprintf(body, bodysz,
              "rule:   %s\nbinary: %s (pid %d%s%s)\ntarget: %s",
              rule, bin, (int)hit->pid, comm[0] != '\0' ? ", " : "", comm,
              target);
+}
 
-    /*
-     * Double fork: the grandchild is reparented to init and delivers the
-     * notification, the intermediate exits immediately, and the daemon
-     * only reaps the intermediate (no zombie, no event-loop stall).
-     */
+/*
+ * Deliver a notification through notify-send from a double-forked
+ * grandchild reparented to init: the daemon reaps only the intermediate,
+ * with a bounded wait so the event loop never stalls.  A 127 exit means
+ * exec failed (notify-send removed since the cached check), so the
+ * availability flag is dropped for the next hit to re-check.
+ */
+static void spawn_notify_send(const DisplaySession *session,
+                              const char *title, const char *body,
+                              const char *urgency, const char *icon)
+{
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -1272,8 +1261,8 @@ void notify_rule_hit(const NotifyHit *hit)
             _exit(0);
 
         setsid();
-        drop_to_session_user(&session);
-        apply_display_env(&session);
+        drop_to_session_user(session);
+        apply_display_env(session);
         close_fds_from(3);
         execl(NOTIFY_SEND_PATH, "notify-send", "-a", "Fileshield",
               "-u", urgency, "-i", icon, title, body, (char *)NULL);
@@ -1308,11 +1297,53 @@ void notify_rule_hit(const NotifyHit *hit)
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
             ;
     }
-    /* A 127 exit means exec failed: notify-send may have been removed
-     * since the cached check.  Drop the flag so the next hit re-checks
-     * instead of paying a doomed double fork forever. */
+    /* A 127 exit means exec failed (notify-send may have been removed
+     * since the cached check): re-check it on the next hit. */
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
         g_notify_send_ok = 0;
+}
+
+/*
+ * Fire-and-forget notification for one config-rule hit.  Availability
+ * and deliverability are checked before the rate budget (a missing
+ * helper or a desktop-less uid must not consume the shared cap);
+ * failures are logged and never affect the decision.
+ */
+void notify_rule_hit(const NotifyHit *hit)
+{
+    if (!hit || hit->uid == (uid_t)-1 || hit->uid == 0)
+        return;
+
+    /* Availability first: a missing notify-send must not spend the
+     * dedup or flood budget on notifications that are never shown. */
+    if (!notify_send_available())
+        return;
+
+    /* Deliverability before budget: a uid with no desktop session must
+     * not spend the dedup or flood budget (the global cap is shared by
+     * every user) on notifications that are never shown. */
+    DisplaySession session;
+    if (!detect_display_session(hit->uid, &session))
+    {
+        log_msg(LOG_DEBUG,
+                "notify_rule_hit: no desktop session for uid %d; "
+                "notification skipped",
+                (int)hit->uid);
+        return;
+    }
+
+    if (!notify_rate_allow(hit->kind, hit->binary ? hit->binary : "",
+                           hit->target ? hit->target : "",
+                           hit->dedup_seconds, hit->max_per_window))
+        return;
+
+    char title[128];
+    char body[2048];
+    const char *urgency = "";
+    const char *icon = "";
+    build_hit_notification(hit, title, sizeof(title), body, sizeof(body),
+                           &urgency, &icon);
+    spawn_notify_send(&session, title, body, urgency, icon);
 }
 
 int notify_test_hit_rate(int kind, const char *binary, const char *target,

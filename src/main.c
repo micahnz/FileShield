@@ -65,6 +65,78 @@ static void print_usage(const char *prog)
 }
 
 /*
+ * Parse the command line.  Returns 0 to continue, or 1 when the process
+ * should exit immediately with *exit_code (--help, unknown option).
+ * *config_path and *dry_run are only written on success.
+ */
+static int parse_cli(int argc, char *argv[], const char **config_path,
+                     int *dry_run, int *exit_code)
+{
+    static struct option long_opts[] = {
+        {"foreground", no_argument, 0, 'f'},
+        {"config", required_argument, 0, 'c'},
+        {"debug", no_argument, 0, 'd'},
+        {"dry-run", no_argument, 0, 'n'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}};
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "fc:dhn", long_opts, NULL)) != -1)
+    {
+        switch (opt)
+        {
+        case 'f':
+            g_foreground = 1;
+            break;
+        case 'c':
+            *config_path = optarg;
+            break;
+        case 'd':
+            log_set_debug(1);
+            break;
+        case 'n':
+            *dry_run = 1;
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            *exit_code = EXIT_SUCCESS;
+            return 1;
+        default:
+            print_usage(argv[0]);
+            *exit_code = EXIT_FAILURE;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * A relative --config must become absolute before daemonize() chdir()s
+ * to /, or a SIGHUP reload would resolve it from the wrong directory and
+ * silently keep the old config forever.  The config loaded successfully,
+ * so the file exists; a realpath failure here (EACCES on a parent,
+ * ELOOP) is a known inconsistency and fatal.  Returns 0 on success, -1
+ * on failure (already logged).
+ */
+static int make_config_absolute(const char **config_path)
+{
+    if ((*config_path)[0] == '/')
+        return 0;
+
+    static char config_abs[PATH_MAX];
+    if (!realpath(*config_path, config_abs))
+    {
+        log_msg(LOG_ERR,
+                "cannot resolve --config %s: %s (a relative path "
+                "would break reload after daemonize)",
+                *config_path, strerror(errno));
+        return -1;
+    }
+    *config_path = config_abs;
+    return 0;
+}
+
+/*
  * Shared startup-failure cleanup: deny whatever the partially installed
  * marks already queued (the kernel would auto-allow outstanding
  * permission events on close), then close the group fd, drop the config
@@ -133,40 +205,10 @@ int main(int argc, char *argv[])
 {
     const char *config_path = DEFAULT_CONFIG;
     int dry_run = 0;
+    int exit_code = 0;
 
-    static struct option long_opts[] = {
-        {"foreground", no_argument, 0, 'f'},
-        {"config", required_argument, 0, 'c'},
-        {"debug", no_argument, 0, 'd'},
-        {"dry-run", no_argument, 0, 'n'},
-        {"help", no_argument, 0, 'h'},
-        {0, 0, 0, 0}};
-
-    int opt;
-    while ((opt = getopt_long(argc, argv, "fc:dhn", long_opts, NULL)) != -1)
-    {
-        switch (opt)
-        {
-        case 'f':
-            g_foreground = 1;
-            break;
-        case 'c':
-            config_path = optarg;
-            break;
-        case 'd':
-            log_set_debug(1);
-            break;
-        case 'n':
-            dry_run = 1;
-            break;
-        case 'h':
-            print_usage(argv[0]);
-            return EXIT_SUCCESS;
-        default:
-            print_usage(argv[0]);
-            return EXIT_FAILURE;
-        }
-    }
+    if (parse_cli(argc, argv, &config_path, &dry_run, &exit_code))
+        return exit_code;
 
     openlog("fileshield", LOG_PID | LOG_CONS, LOG_DAEMON);
 
@@ -197,25 +239,8 @@ int main(int argc, char *argv[])
 
     if (!g_foreground)
     {
-        /* daemonize() chdir()s to /, so a relative --config must be made
-         * absolute now: a SIGHUP reload would otherwise resolve it from
-         * the wrong directory and keep the old config forever.  The
-         * config loaded successfully, so the file exists — a realpath
-         * failure here (EACCES on a parent, ELOOP) is a known
-         * inconsistency and a silent reload breakage, hence fatal. */
-        if (config_path[0] != '/')
-        {
-            static char config_abs[PATH_MAX];
-            if (!realpath(config_path, config_abs))
-            {
-                log_msg(LOG_ERR,
-                        "cannot resolve --config %s: %s (a relative path "
-                        "would break reload after daemonize)",
-                        config_path, strerror(errno));
-                return startup_fail(-1, cfg);
-            }
-            config_path = config_abs;
-        }
+        if (make_config_absolute(&config_path) < 0)
+            return startup_fail(-1, cfg);
         daemonize();
     }
 

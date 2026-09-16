@@ -162,6 +162,31 @@ static int apply_string_field(PinDraft *d, const char *key, const char *value)
     return 0; /* unknown string key: ignore for forward compatibility */
 }
 
+/*
+ * pin_load: read allowlist-hashes.json.  The reader accepts exactly the
+ * shape pin_serialize() writes, scanned line by line:
+ *
+ *   {
+ *     "pins": [
+ *       {
+ *         "pattern": "...",
+ *         "sha512": "...",       each value on its key's line
+ *         "updated_at": 123
+ *       },
+ *       ...
+ *     ]
+ *   }
+ *
+ * State machine: S_OUTSIDE -> ("pins": [) S_IN_PINS -> ({) S_IN_ENTRY
+ * -> (} with all three fields) S_IN_PINS -> (]) S_OUTSIDE -> (}) S_DONE.
+ * Entries are staged in g_stage and committed only when the whole file
+ * is complete, so a damaged file never partially replaces the live
+ * table.  Blank lines, comments (#) and unknown keys are tolerated; a
+ * second "pins" array, junk after an entry close, an incomplete entry or
+ * a missing closer marks the whole file damaged (fail closed).  A
+ * missing file is a clean empty table (first-use TOFU); any other open
+ * error is damage.
+ */
 int pin_load(const char *filepath)
 {
     FILE *fp;

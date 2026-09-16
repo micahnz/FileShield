@@ -404,6 +404,19 @@ static void hash_pid_fail_forget(pid_t pid, unsigned long long start)
     }
 }
 
+/*
+ * Binary SHA-512 for one process, served from the two caches described
+ * above:
+ *   - /proc/<pid>/exe stat()able: the (dev, ino, size, mtime, ctime)
+ *     identity cache, with a failed lookup served from its slot until
+ *     retry_after.
+ *   - exe unreachable (mid-exec, or not visible in this mount
+ *     namespace): the (pid, start) failure cache, so an immediately
+ *     failing hash is attempted once per window, not once per event.
+ * force_retry ignores both negative windows (the prompt boundary wants
+ * a fresh attempt for the pre-dialog snapshot).  Returns 0 and fills
+ * hex_out on success; -1 with g_hash_failure_reason set otherwise.
+ */
 static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
 {
     char proc_path[64];

@@ -328,65 +328,41 @@ static int rule_append(RuleEntry *rules, int *count, const RuleEntry *e)
 }
 
 /*
- * add_rule: parse one [allowlist]/[unsafe_allowlist]/[denylist] line and
- * append the resulting rule(s).  Format:
- *
- *   /path/to/bin = /path/to/target   scoped rule (equal-or-under match)
- *   /path/to/bin                     global rule (no '=' separator)
- *
- * Either side may be a glob ('*' / '**', the [protected_paths] engine).
- * Both sides are validated and canonicalized by rule_pattern_set(): the
- * wildcard-free base is canonicalized and the suffix kept verbatim.
- * Exact binaries match by strcmp and exact targets by path_under()
- * (equal or under) at event time; globs are matched full-path by
- * glob_match_path() in fanotify.c.  Malformed patterns skip that
- * expanded copy with a log (fail closed).
- *
- * Both sides expand '~' for every real user, mirroring [protected_paths].
- * When both sides expand, entry i pairs user i's binary with user i's
- * target (both expansions enumerate /etc/passwd identically); when only
- * one side expands, the fixed side is shared by every expanded entry.
- * Trailing slashes are stripped by canonicalize_path so matching is
- * "equal or under".
- *
- * A '=' with an empty right side is a parse error, and a purely numeric
- * right side is the pre-rework "binary = ttl" format — both log a warning
- * and skip the line.  Returns 0 on success (skips included), -1 on
- * out-of-memory or when the section's MAX_RULES cap is reached (the
- * caller then refuses the whole config instead of dropping rules).
+ * Parse one rule line in place (buf is a mutable copy of line): split at
+ * '=', validate the binary side (non-empty, shorter than PATH_MAX) and
+ * the target side (non-empty when '=' is present, and not the legacy
+ * numeric TTL form).  Returns 1 when the line is usable and fills
+ * *binary / *target (target NULL for a bare, global rule), 0 when the
+ * line must be skipped with the log already written.
  */
-static int add_rule(RuleEntry *rules, int *count, const char *line)
+static int parse_rule_line(const char *line, char *buf, const char **binary,
+                           const char **target)
 {
-    char left[PATH_MAX * 2];
-    char bin_raw[PATH_MAX];
     const char *tgt_raw = NULL;
 
-    snprintf(left, sizeof(left), "%s", line);
-
-    char *eq = strchr(left, '=');
+    char *eq = strchr(buf, '=');
     if (eq)
     {
         *eq = '\0';
         tgt_raw = trim(eq + 1);
     }
-    const char *b = trim(left);
-    if (!b || b[0] == '\0')
+    const char *b = trim(buf);
+    if (b[0] == '\0')
     {
         log_msg(LOG_ERR, "config_load: malformed rule line: %s", line);
         return 0;
     }
-    /* Reject an over-long binary before it is truncated: a truncated
+    /* Reject an over-long binary before it is expanded: a truncated
      * path is a different rule (a clipped glob suffix can broaden the
-     * match), and rule_pattern_set()'s PATH_MAX guard can never fire
-     * once the copy has already clipped the value. */
-    if (strlen(b) >= sizeof(bin_raw))
+     * match) and rule_pattern_set()'s PATH_MAX guard could not fire on
+     * the clipped copy. */
+    if (strlen(b) >= PATH_MAX)
     {
         log_msg(LOG_ERR,
-                "config_load: rule binary path too long (max %zu): %.64s",
-                sizeof(bin_raw) - 1, b);
+                "config_load: rule binary path too long (max %d): %.64s",
+                PATH_MAX - 1, b);
         return 0;
     }
-    snprintf(bin_raw, sizeof(bin_raw), "%s", b);
 
     if (tgt_raw)
     {
@@ -418,7 +394,22 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
         }
     }
 
-    /* Expand both sides for all users; non-'~/' paths yield a single copy. */
+    *binary = b;
+    *target = tgt_raw;
+    return 1;
+}
+
+/*
+ * Expand both sides of one usable rule for every real user and append
+ * each resulting entry.  When only one side expands, the fixed side is
+ * shared by every entry.  Entries whose expanded paths fail validation
+ * are skipped with a log.  Returns 0 on success, -1 on allocation
+ * failure or when the section's MAX_RULES cap is reached.
+ */
+static int expand_and_append_rule(RuleEntry *rules, int *count,
+                                  const char *line, const char *bin_raw,
+                                  const char *tgt_raw)
+{
     char **bins = expand_home_all_users(bin_raw);
     if (!bins)
         return -1;
@@ -476,6 +467,33 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
     if (tgts)
         free_string_array(tgts);
     return 0;
+}
+
+/*
+ * add_rule: parse one [allowlist]/[unsafe_allowlist]/[denylist] line and
+ * append the resulting rule(s).  Format:
+ *
+ *   /path/to/bin = /path/to/target   scoped rule (equal-or-under match)
+ *   /path/to/bin                     global rule (no '=' separator)
+ *
+ * Either side may be a glob ('*' / '**', the [protected_paths] engine);
+ * both sides are validated/canonicalized by rule_pattern_set() and
+ * expand '~' for every real user (see the two helpers above).  Lines
+ * that fail validation are skipped with a log; returns 0 on success
+ * (skips included), -1 on out-of-memory or when the section's MAX_RULES
+ * cap is reached (the caller then refuses the whole config instead of
+ * dropping rules).
+ */
+static int add_rule(RuleEntry *rules, int *count, const char *line)
+{
+    char left[PATH_MAX * 2];
+    const char *bin_raw = NULL;
+    const char *tgt_raw = NULL;
+
+    snprintf(left, sizeof(left), "%s", line);
+    if (!parse_rule_line(line, left, &bin_raw, &tgt_raw))
+        return 0;
+    return expand_and_append_rule(rules, count, line, bin_raw, tgt_raw);
 }
 
 /*
