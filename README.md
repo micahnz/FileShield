@@ -34,7 +34,7 @@ explicit approval is given.
 - **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed; the dialog inherits your session's Qt theme, fonts and scaling.
 - **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ is scoped to that binary and exact file for the lifetime of the shell session (optionally capped by `session_ttl`); _Allow Always_ is a persistent rule bound to the binary hash, call chain, exact file and exact command line. Matching deny scopes exist too.
 - **Hash-pinned allowlists**: `[allowlist]` rules record the binary's SHA-512 on first use and require an explicit popup approval if it ever changes; `[unsafe_allowlist]` opts tools with unpinnable binaries (AppImages, tmp mounts) out of hash checking.
-- **Security tripwires**: `[unsafe_allowlist]` and `[denylist]` hits raise a critical desktop notification naming the rule, binary and target, so an impersonated binary exploiting a broad unsafe rule is visible immediately. Deduplicated per key with a configurable window and a global flood cap; the pinned `[allowlist]` can notify too, off by default.
+- **Security tripwires**: `[unsafe_allowlist]` grants log at `WARNING` and raise a warning desktop notification on the first hit per process, so an impersonated binary exploiting a broad unsafe rule is visible immediately; `[denylist]` blocks raise a `critical` notification. Both name the matched rule, binary and target, and are bounded by a configurable dedup window and global flood cap; the pinned `[allowlist]` can notify too, off by default.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure,
   Vault token, Docker config, and more — out of the box. Please feel free to
   open an issue suggesting additional defaults.
@@ -52,6 +52,12 @@ explicit approval is given.
 
 ## Architecture
 
+The pipeline runs for every `FAN_OPEN_PERM` event. Rules come from
+`/etc/fileshield.conf`: `[protected_paths]` decide what is watched,
+`[unsafe_allowlist]`, `[allowlist]` and `[denylist]` decide what is allowed
+or denied, and `[settings]` tunes the cache TTLs, session caps and
+notifications. A denial always wins over any grant.
+
 ```text
 Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
         │
@@ -59,11 +65,26 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
   fanotify FAN_OPEN_PERM          ← kernel blocks syscall here
         │
         ▼
-  fileshield daemon
-  ├─ config denylist / session deny / runtime deny
-  ├─ allow-once cache / session allow / runtime allow
-  ├─ unsafe allowlist (no hash check) / hash-pinned allowlist
-  └─ no match → two-stage kdialog popup
+  fileshield daemon — decision pipeline
+  │
+  ├─ config denylist ─────────────▶ FAN_DENY (+ notify-send tripwire)
+  ├─ session deny / runtime deny ─▶ FAN_DENY
+  ├─ allow-once cache
+  ├─ session allow / runtime allow ▶ FAN_ALLOW
+  ├─ [unsafe_allowlist] ──────────▶ FAN_ALLOW + WARNING + notify-send
+  │                                  (no hash check; surfaced once per process)
+  └─ hash-pinned [allowlist]
+       ├─ pin matches ────────────▶ FAN_ALLOW
+       ├─ first use ──────────────▶ FAN_ALLOW + pin stored in
+       │                             /var/lib/fileshield/allowlist-hashes.json
+       ├─ hash changed ───────────▶ kdialog "Update & Allow?"
+       │                              ├─ Yes ─▶ re-pin + FAN_ALLOW
+       │                              └─ No/Cancel/timeout ─▶ FAN_DENY
+       │                                                        (old pin kept)
+       └─ digest unavailable ─────▶ fall through to the dialog (fail closed)
+        │
+        ▼
+  no rule matched → two-stage kdialog popup
         │
         ├─ Allow Once ───────────▶ FAN_ALLOW (cached for user_ttl)
         ├─ Allow  → Session ─────▶ FAN_ALLOW (until terminal closes)
@@ -137,7 +158,7 @@ Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove ol
 
 The default `[protected_paths]` list ships in [`fileshield.conf`](fileshield.conf); `make install` copies it to `/etc/fileshield.conf` on first install, and later installs keep the existing file (see [Installation](#installation)). It is the authoritative list and is maintained there rather than duplicated here. It covers common credential stores: shell histories and environment files, SSH and GPG key material, cloud CLIs (AWS, Azure, GCP, Cloudflare, and others), Kubernetes and container registries, package-manager tokens, password managers, and AI coding agents. Edit the installed copy and reload.
 
-Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start if any configured path that exists cannot be marked, if `[protected_paths]` is empty, or if nothing at all could be marked (fail closed).
+Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start if any configured path that exists cannot be marked, if `[protected_paths]` is empty, or if nothing at all could be marked (fail closed). A config that exceeds the parser's hard caps is refused as a whole instead of being truncated — see [Limitations](#limitations).
 
 #### Glob patterns in `[protected_paths]`
 
@@ -152,7 +173,7 @@ Entries may contain `*` and `**`:
 - `*` matches any characters **within one path segment** and never crosses `/`. It matches dotfiles too (`.env.local` is covered by `~/.env*`).
 - `**` is a **whole-segment** wildcard that matches zero or more segments: `~/.cloudflared/**/*.json` also matches `~/.cloudflared/a.json`, and `~/.cloudflared/**` protects the whole tree.
 - Patterns must be absolute after `~` expansion. `?`, `[`, `]` and `\` are literal characters; matching is case-sensitive.
-- A pattern protects only paths that fully match it — a matched directory does not silently cover its contents. Use `~/.cloudflared/*` for direct children and `~/.cloudflared/**` for the subtree.
+- Exact entries keep their _equal or under_ semantics — `~/.ssh/` protects the directory and everything inside it. A **glob** entry matches only paths that fully match the pattern, so a glob-matched directory does not silently cover its contents: use `~/.cloudflared/*` for direct children and `~/.cloudflared/**` for the whole subtree.
 - A glob entry marks its wildcard-free base directory (`~/.cloudflared`). A base that does not exist yet behaves like a missing exact path: it is skipped at startup and covered by the filesystem mount mark until it appears (reload to add the direct mark).
 - A malformed pattern (relative, or `..`, `//` or a trailing slash in the wildcard part) is rejected at load time with a log message — it never silently protects nothing.
 - A line starting with `!` is an **exclusion**: it removes matching paths from protection instead of adding it. `~/.ssh/` plus `!~/.ssh/*.pub` protects the whole directory except public keys; add `!~/.ssh/**/*.pub` to exclude nested ones too.
@@ -249,7 +270,7 @@ A scoped entry denies the binary that one file or folder; a bare binary line is 
 ```ini
 [settings]
 # How long an "Allow Once" decision is cached for the same process and file
-# (seconds).  Config allowlist hits also refresh the cache with this TTL.
+# (seconds).  Config rule hits also refresh the cache with this TTL.
 # 0 disables caching (each open prompts again); the shipped config sets 300.
 user_ttl = 300
 
@@ -282,7 +303,7 @@ notify_max = 20
 
 ### Notifications
 
-Fileshield can raise a desktop notification through `notify-send` whenever a **config rule** resolves an access — not for user dialog decisions, which are already explicit. Three settings control it:
+Fileshield can raise a desktop notification through `notify-send` whenever a **config rule** resolves an access — not for user dialog decisions, which are already explicit. Three per-list toggles control it:
 
 | Setting                   | Default | Notifies on                                  |
 | ------------------------- | ------- | -------------------------------------------- |
@@ -444,10 +465,10 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 
 ## How It Works
 
-1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed.
-2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
+1. The daemon calls `fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed.
+2. It registers `FAN_OPEN_PERM | FAN_EVENT_ON_CHILD` marks on each protected path via `fanotify_mark()` (the child flag lets directory marks report accesses to their entries).
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
-4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, `[unsafe_allowlist]`, then the hash-pinned `[allowlist]`).
+4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, `[unsafe_allowlist]`, then the hash-pinned `[allowlist]`). Config-rule hits additionally raise the bounded `notify-send` tripwires described under [Notifications](#notifications).
 5. On a miss, it spawns a `kdialog` two-stage popup on the requesting user's desktop session and waits for user input. The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
@@ -461,7 +482,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
 - **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on, and does not report `mmap(2)` accesses. Bind-mount aliases of protected paths, or a process that already holds an open descriptor, are outside the threat model.
-- **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode. Opening one of those inodes through a path outside every protected prefix (a hard link) always prompts — allow rules are skipped for that open (see [Decision Scopes](#decision-scopes)). Files created after startup, files deeper than 8 directory levels under a protected path, and inodes past the table cap are not inode-tracked; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
+- **Hard links and symlinks**: Protected paths are canonicalized at load time, so a symlinked home or config directory is still matched, and files present when the daemon starts are tracked by inode. Opening one of those inodes through a path outside every protected prefix (a hard link) always prompts — allow rules are skipped for that open (see [Decision Scopes](#decision-scopes)). Files created after startup, files deeper than 8 directory levels under a protected path, and inodes past the 32,768-entry table cap are not inode-tracked; tracking brand-new inodes via `FAN_CREATE` requires a `FAN_REPORT_FID` group and is a planned follow-up.
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
 - **Command-line matching**: permanent _Always_ entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use _Allow Session_ or _Allow Once_ for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
@@ -470,7 +491,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Denylist rules are never hash-checked**: pinning exists to detect a replaced allowlisted binary; a deny is enforced regardless of which binary matches.
 - **No pin-management CLI**: `[allowlist]` pins can only be updated through the change dialog. Root can inspect or edit `/var/lib/fileshield/allowlist-hashes.json` directly; a repaired, replaced or removed file takes effect on the next reload.
 - **Config limits are hard refusals**: a config with more than **1024** protected entries — remember each `~/…` line expands once per real user — or more than **128** rules in any of `[allowlist]`, `[unsafe_allowlist]` or `[denylist]` is rejected **as a whole**. Startup exits; a `SIGHUP` reload logs an error and keeps the previous config. Nothing is ever silently dropped. Likewise, if a mark cannot be tracked (mark-table cap) the daemon removes the just-installed kernel mark and fails the load rather than running with a mark set it could not clean up. Inode-set and mount-table capacity overflows remain non-fatal (they can occur from ordinary large directories) but are logged at `ERR` because hard-link detection is degraded.
-- **Notifications are best-effort and attacker-triggerable**: they need a detectable desktop session and `notify-send`; otherwise they are skipped (access decisions are unaffected). Anyone who can trigger a rule can also trigger a notification, so delivery is deduplicated and capped (20 per 60 s), and the notification is only a heads-up — the journal is the record. User dialog decisions (Allow/Deny Once/Session/Always) never notify, because the user just made them.
+- **Notifications are best-effort and attacker-triggerable**: they need a detectable desktop session and `notify-send`; otherwise they are skipped (access decisions are unaffected). Anyone who can trigger a rule can also trigger a notification, so delivery is deduplicated (`notify_dedup_ttl`), capped (`notify_max` per 60 s), and unsafe hits notify once per process; the notification is only a heads-up — the journal is the record. User dialog decisions (Allow/Deny Once/Session/Always) never notify, because the user just made them.
 
 ---
 
@@ -609,7 +630,7 @@ Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event h
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). If kdialog is missing or fails, access is denied (fail closed).
 - **Dialog does not match your theme?** The daemon runs as root with a bare environment, so Fileshield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
 - **Dialog behavior on failure**: timeouts, exec failures and Cancel/window close deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — a documented, accepted trade-off; `Allow Session` remains on Yes, and timeouts/exec failures always fail closed.
-- **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. If the binary is already allowlisted, the prompt may be asking about a hash change — approve it only if you expected the binary to be rebuilt or updated. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
+- **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. If the binary is already allowlisted, the prompt may be asking about a hash change — approve it only if you expected the binary to be rebuilt or updated. If the binary cannot be pinned at all (an AppImage or other tmp-mount tool), `[unsafe_allowlist]` is the escape hatch — with the caution described in [Handle with caution](#handle-with-caution). Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.
 - **All accesses denied with no popup on a headless machine?** Fileshield requires a live desktop session to display dialogs. On headless hosts the daemon will deny all unknown accesses (fail-closed). Run in foreground mode and inspect the stderr output to confirm.
