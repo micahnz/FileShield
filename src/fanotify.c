@@ -2239,6 +2239,17 @@ static int event_resolve(EventCtx *c)
 }
 
 /*
+ * Shared mount-mark-noise predicate: the inode is untracked and the path is
+ * not protected.  event_fastpath() supplies the cached path verdict plus the
+ * runtime guards (mount marks installed, fstat succeeded); the test seam and
+ * benchmark call this directly.
+ */
+static int mount_noise_allows(dev_t dev, ino_t ino, int path_protected)
+{
+    return !inode_set_contains(dev, ino) && !path_protected;
+}
+
+/*
  * Stage 2: cheap pre-identity checks.
  *   - Mount-mark fast path: neither the inode nor the path is protected,
  *     so the event is mount-mark noise and is allowed instantly.
@@ -2253,8 +2264,7 @@ static int event_fastpath(EventCtx *c)
     int have_st = (fstat(c->fd_num, &st) == 0);
 
     if (g_mount_count > 0 && have_st &&
-        !inode_set_contains(st.st_dev, st.st_ino) &&
-        !c->path_protected)
+        mount_noise_allows(st.st_dev, st.st_ino, c->path_protected))
     {
         log_msg(LOG_DEBUG, "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
                 (int)c->ev->pid, c->target);
@@ -3412,7 +3422,7 @@ int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129])
 
 int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path)
 {
-    return inode_set_contains(dev, ino) == 0 && !is_path_under_protected(path);
+    return mount_noise_allows(dev, ino, is_path_under_protected(path));
 }
 
 int fanotify_test_resolve_path(int fd, char *out, size_t outsz)
