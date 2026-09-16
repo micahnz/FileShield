@@ -29,6 +29,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <sys/fanotify.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1432,6 +1433,74 @@ static void test_scope_guard(void) {
     g_config = saved;
 }
 
+/*
+ * Part 1b: the shutdown drain denies and closes every permission event the
+ * kernel still holds.  A socketpair stands in for the group fd: drain()
+ * reads event metadata from it and writes fanotify responses back, exactly
+ * like the real fd (which is both readable and writable).
+ */
+static void test_drain_and_deny(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int sv[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0,
+           "create drain socketpair");
+
+    enum { PERM_EVENTS = 3 };
+    int event_fds[PERM_EVENTS + 1] = { -1 };
+    struct fanotify_event_metadata evs[PERM_EVENTS + 1];
+    size_t total = 0;
+
+    memset(evs, 0, sizeof(evs));
+    for (int i = 0; i < PERM_EVENTS + 1; i++) {
+        int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd >= 0, "open drain event fd");
+        if (efd < 0)
+            break;
+        event_fds[i] = efd;
+
+        /* The last event is a notification: closed, never answered. */
+        evs[i].event_len = sizeof(evs[i]);
+        evs[i].vers = FANOTIFY_METADATA_VERSION;
+        evs[i].mask = (i == PERM_EVENTS) ? FAN_CLOSE_WRITE : FAN_OPEN_PERM;
+        evs[i].fd = efd;
+        evs[i].pid = (int)getpid();
+        total += sizeof(evs[i]);
+    }
+
+    ASSERT(write(sv[1], evs, total) == (ssize_t)total, "queue drain events");
+
+    fanotify_drain_and_deny(sv[0]);
+
+    /* One FAN_DENY per permission event; none for the notification event. */
+    struct fanotify_response resp[PERM_EVENTS];
+    size_t want = sizeof(resp[0]) * PERM_EVENTS;
+    size_t got = 0;
+    while (got < want) {
+        ssize_t n = read(sv[1], (char *)resp + got, want - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    ASSERT(got == want, "one response per drained permission event");
+    for (int i = 0; i < PERM_EVENTS; i++) {
+        ASSERT(resp[i].response == FAN_DENY, "drain response is FAN_DENY");
+        ASSERT(resp[i].fd == event_fds[i],
+               "drain response targets the event fd");
+    }
+    for (int i = 0; i < PERM_EVENTS + 1; i++) {
+        if (event_fds[i] >= 0)
+            ASSERT(fcntl(event_fds[i], F_GETFD) == -1 && errno == EBADF,
+                   "drained event fd was closed");
+    }
+
+    /* Empty queue: a second drain must return immediately. */
+    fanotify_drain_and_deny(sv[0]);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
@@ -1456,6 +1525,7 @@ int main(void) {
     test_cmdline_scoping();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
+    test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
     pin_fixture_cleanup();
     if (failures) {
