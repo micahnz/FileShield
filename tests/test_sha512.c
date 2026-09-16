@@ -128,7 +128,7 @@ static void test_string_differential(void)
 {
     const char *samples[] = {
         "",
-        "FileShield differential test payload 0123456789",
+        "Fileshield differential test payload 0123456789",
         "a",                     /* block interior              */
         "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
         "ijklmnopjklmnopqrlmnopqrsmnopqrstnopqrstu", /* 105 bytes  */

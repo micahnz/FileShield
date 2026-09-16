@@ -1,5 +1,5 @@
 [Unit]
-Description=FileShield - file access interceptor
+Description=Fileshield - file access interceptor
 Documentation=https://github.com/yoransys/fileshield
 After=multi-user.target
 
