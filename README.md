@@ -1,4 +1,4 @@
-# FileShield
+# Fileshield
 
 > **Fork notice:** This repository was originally forked from
 > [YoranSys/FileShield](https://github.com/YoranSys/FileShield), but it has
@@ -7,33 +7,36 @@
 
 ## Purpose
 
-FileShield is an additional layer of defense for machines where LLM agents run
+Fileshield is an additional layer of defense for machines where LLM agents run
 with filesystem access. It watches sensitive files (cloud credentials, SSH
 keys, kubeconfig, API tokens, ...) and asks the operator before a process reads
 one — so an agent accidentally pulling `~/.aws/credentials` into a prompt, an
 upload, or a log is stopped and surfaced instead of going unnoticed.
 
 It is **not a definitive security tool**: I am not a security expert and I
-cannot guarantee that FileShield cannot be bypassed. It is not a substitute for
+cannot guarantee that Fileshield cannot be bypassed. It is not a substitute for
 sandboxing, least-privilege users, or a secret manager. Its value is as a
-backstop — when other harness or sandbox measures fail, FileShield at least
+backstop — when other harness or sandbox measures fail, Fileshield at least
 notifies the operator that a sensitive file is being read and blocks it until
 explicit approval is given.
 
 ## What it does
 
-**FileShield** is a Linux security tool that intercepts and blocks file access to sensitive files (e.g., AWS secrets, SSH keys, kubeconfig) before the read completes, then prompts the user to allow or deny it. It is built on **`fanotify` permission events** — the same kernel mechanism used by Linux antivirus scanners.
+**Fileshield** is a Linux security tool that intercepts and blocks file access to sensitive files (e.g., AWS secrets, SSH keys, kubeconfig) before the read completes, then prompts the user to allow or deny it. It is built on **`fanotify` permission events** — the same kernel mechanism used by Linux antivirus scanners.
 
-> Unlike approaches based on `inotify` or `auditd` alone, FileShield uses `FAN_OPEN_PERM` events which suspend the syscall in the kernel until a decision is made. The file data is never read by the requesting process until you click Allow.
+> Unlike approaches based on `inotify` or `auditd` alone, Fileshield uses `FAN_OPEN_PERM` events which suspend the syscall in the kernel until a decision is made. The file data is never read by the requesting process until you click Allow.
 
 ---
 
 ## Features
 
-- **True pre-access blocking**: The kernel suspends the `open()` syscall until FileShield responds — no race condition.
+- **True pre-access blocking**: The kernel suspends the `open()` syscall until Fileshield responds — no race condition.
 - **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed; the dialog inherits your session's Qt theme, fonts and scaling.
 - **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ is scoped to that binary and exact file for the lifetime of the shell session (optionally capped by `session_ttl`); _Allow Always_ is a persistent rule bound to the binary hash, call chain, exact file and exact command line. Matching deny scopes exist too.
-- **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure, Vault token, Docker config, and more — out of the box.
+- **Hash-pinned allowlists**: `[allowlist]` rules record the binary's SHA-512 on first use and require an explicit popup approval if it ever changes; `[unsafe_allowlist]` opts tools with unpinnable binaries (AppImages, tmp mounts) out of hash checking.
+- **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure,
+  Vault token, Docker config, and more — out of the box. Please feel free to
+  open an issue suggesting additional defaults.
 
 ---
 
@@ -56,7 +59,8 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
         ▼
   fileshield daemon
   ├─ config denylist / session deny / runtime deny
-  ├─ allow-once cache / session allow / runtime allow / config allowlist
+  ├─ allow-once cache / session allow / runtime allow
+  ├─ unsafe allowlist (no hash check) / hash-pinned allowlist
   └─ no match → two-stage kdialog popup
         │
         ├─ Allow Once ───────────▶ FAN_ALLOW (cached for user_ttl)
@@ -107,7 +111,7 @@ The daemon requires root (`CAP_SYS_ADMIN`) to open a `fanotify` permission fd �
 
 ## Usage
 
-Edit `fileshield.conf` to adjust protected paths or the allowlist, then reload:
+Edit `fileshield.conf` to adjust protected paths, the allowlists or the denylist, then reload:
 
 ```bash
 sudo systemctl reload fileshield
@@ -115,7 +119,7 @@ sudo systemctl reload fileshield
 sudo kill -HUP $(pidof fileshield)
 ```
 
-Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. If the new set cannot be installed completely, the daemon restores the previous marks and keeps the old config; if even the rollback fails it shuts down so systemd restarts it cleanly (fail closed). Persisted _Always Allow_ / _Always Deny_ lists are reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set. If the new set cannot be installed completely, the daemon restores the previous marks and keeps the old config; if even the rollback fails it shuts down so systemd restarts it cleanly (fail closed). Persisted state — the _Always Allow_ / _Always Deny_ lists and the `[allowlist]` hash pins — is reloaded from disk at the same time, so edits to the state files (or the state files written by the dialogs themselves) take effect on reload. Session-scoped decisions live only in daemon memory: a config reload keeps them, a full daemon restart clears them (you are prompted again).
 
 ### Default Protected Paths
 
@@ -143,31 +147,69 @@ Entries may contain `*` and `**`:
 - Exclusions **win over positives** and config order does not matter (deny wins): a path is protected if and only if a positive entry matches it and no exclusion does. They must be absolute after `~` expansion, are canonicalized and matched exactly like positives, and a malformed exclusion is rejected at load. An exclusions-only `[protected_paths]` refuses to start.
 - Exclusion matching is path-based: a private key misnamed `*.pub` would be excluded too.
 
+### Unsafe Allowlist
+
+`[unsafe_allowlist]` uses the same format as `[allowlist]` (globs included) but its hits are **never hash-checked or hash-pinned**: a matching access is granted immediately, exactly as `[allowlist]` rules behaved before pinning existed. It is evaluated **before** `[allowlist]`.
+
+Use it only for tools whose binary genuinely cannot be pinned — AppImages or other tmp-mount tools whose binary churns (rebuilt or replaced on every run), or tools that are reinstalled or upgraded many times a day:
+
+```ini
+[unsafe_allowlist]
+# /tmp/.mount_*/openchamber = ~/.local/share/opencode/
+```
+
+This is the escape hatch for the pin's one real trade-off (see [Allowlist](#allowlist)): a glob rule pins its pattern, so every binary matching it shares one pin and switching between them prompts. Prefer `[allowlist]` whenever the binary is stable enough to pin.
+
 ### Allowlist
 
-The `[allowlist]` section is **empty by default**. Pre-allowlisting a binary by path is risky: if that binary is replaced, wrapped, or symlinked by a compromised package, it inherits access without any popup.
+The `[allowlist]` section rules are **hash-pinned**. Pre-allowlisting a binary by path is still a conscious trust decision: the first matching access silently records the binary's SHA-512, and every later access must match it, so a replaced or tampered binary cannot inherit the rule without an explicit prompt.
 
-Add entries only for tools you have audited and trust at that exact path:
+Add entries only for tools you have audited and trust:
 
 ```ini
 [allowlist]
 # Format: /absolute/path/to/binary = /path/to/target/file
 # /usr/bin/ssh       = ~/.ssh/known_hosts
 # /usr/bin/gpg       = ~/.gnupg/
+# /tmp/.mount_*/openchamber = ~/.local/share/opencode/
+# /usr/bin/opencode  = ~/.local/
 ```
 
-- A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. Matching is _equal or under_: `/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it; a bare file target covers exactly that file.
-- A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access _every_ protected path. This is the most dangerous form — use it sparingly.
-- A binary may appear on **multiple lines** with different targets when it needs exceptions for more than one file or folder.
-- `~` in binary and target paths expands for every regular user's home (UID 1000–65533; root and system accounts are skipped), the same way `[protected_paths]` do.
-- Rules no longer carry a per-entry TTL: repeated opens refresh the file cache for `user_ttl` seconds (see [Settings](#settings)).
+#### Glob rules
+
+Either side of a rule may use the same `*` / `**` syntax as [`[protected_paths]`](#glob-patterns-in-protected_paths):
+
+- `*` matches any characters **within one path segment** and never crosses `/`; `**` matches **zero or more** whole segments. `?`, `[`, `]` and `\` are literal characters, and matching is case-sensitive and full-path.
+- An **exact binary** matches by path equality; an **exact target** is matched _equal or under_ (`/usr/bin/gpg = ~/.gnupg/` covers the directory and everything inside it).
+- A **glob target** is matched full-path, so write `/**` when it should cover a whole subtree: `... = ~/.local/share/opencode/**` includes nested files, while `... = ~/.local/share/opencode/*` covers only direct children.
+- `[unsafe_allowlist]` and `[denylist]` accept the same globs on both sides.
+- A malformed pattern (relative, no static base, `..`, or an empty segment such as `//` or a trailing slash after the wildcard part) is rejected at load with a log message — it never silently matches nothing.
+- A **scoped** entry (`binary = target`) grants the binary access to that one target file or folder. A **bare** entry (binary alone, no `=`) is a **global rule**: the binary may access _every_ protected path — the most dangerous form. A binary may appear on **multiple lines** with different targets when it needs exceptions for more than one file or folder.
+- `~` in either side expands for every regular user's home (UID 1000–65533; root and system accounts are skipped), the same way `[protected_paths]` do.
+- Rules do not carry a per-entry TTL: repeated opens refresh the file cache for `user_ttl` seconds (see [Settings](#settings)).
+
+#### Hash pinning
+
+The pin key is the rule's **canonical binary pattern** (the left-hand side, after `~` expansion and canonicalization); the pinned value is the SHA-512 of the binary that first matched it. An exact rule therefore pins one binary path, while a glob rule pins the pattern — which is what lets an AppImage keep working across random `/tmp/.mount_*` paths.
+
+- **First use** (no stored pin): the digest is recorded silently and the access is allowed. The state file is written immediately (atomically); a failed write logs a warning and still allows the access, and the next daemon start re-pins.
+- **Matching pin**: allowed normally.
+- **Changed hash**: a `kdialog` prompt shows the rule pattern, the concrete binary, the old and new SHA-512 (16-hex prefixes; the full digests go to the journal), the target file and the command. **Update & Allow** replaces the pin and allows that access; **Deny**, Cancel, window close and timeouts deny **this attempt only** and keep the old pin. The next access prompts again, subject to the dialog rate limiter.
+- **Hash unavailable**: if the digest cannot be computed (fork/exec failure, timeout) or the binary deliberately is not hashed because it lives under a protected path, the access falls back to the normal Allow Once/Session/Always dialog — never a silent grant.
+- **Damaged pin file**: an existing but unreadable or corrupt `allowlist-hashes.json` fails closed: every `[allowlist]` match behaves as _hash unavailable_ (normal prompt, no silent re-pin) with an error log until an admin repairs or removes the file. A missing file is normal first use.
+
+Pins live in `/var/lib/fileshield/allowlist-hashes.json` (root-only, mode 0600, written atomically). The table holds at most **256 entries**; storing a new one evicts the entry with the oldest `updated_at`. The file is re-read on daemon startup and on every `SIGHUP` reload, so repairing or deleting a damaged file takes effect on reload. There is no CLI for pins: the dialog is the only sanctioned update path, and root may review or edit the JSON directly.
+
+Because a glob rule pins the pattern itself, two different binaries matching the same rule **share one pin**, so switching between them triggers the change prompt — use [`[unsafe_allowlist]`](#unsafe-allowlist) when that churn is constant.
+
+> **Upgrading from a pre-pinning config?** Existing `[allowlist]` entries keep working. Their first access pins the binary that exists then — silently, as usual. After that, every in-place binary upgrade triggers one hash-change prompt on its next access (approve it to re-pin the new build).
 
 > **Why not pre-allowlist common SRE tools?**  
-> A supply-chain attack that replaces `/usr/local/bin/aws` would get unconditional access to `~/.aws/credentials` forever. An empty default forces a conscious opt-in decision per binary.
+> A supply-chain attack that replaces `/usr/local/bin/aws` can no longer use the rule silently: the replaced binary triggers an explicit hash-change prompt. An empty default still forces a conscious opt-in decision per tool, and approving an unexpected change prompt is exactly how trust erodes — read the dialog.
 
 ### Denylist
 
-`[denylist]` uses the same format as `[allowlist]` but denies access:
+`[denylist]` uses the same format and glob syntax as `[allowlist]` but denies access:
 
 ```ini
 [denylist]
@@ -176,7 +218,7 @@ Add entries only for tools you have audited and trust at that exact path:
 # /usr/bin/nc
 ```
 
-A scoped entry denies the binary that one file or folder; a bare binary line is a global deny covering every protected path; the same binary may appear on multiple lines. **Denials are always evaluated first**: a config denylist hit produces `FAN_DENY` (the open fails with `EPERM`) before any allowlist, cache, or session rule is consulted, and no dialog is shown.
+A scoped entry denies the binary that one file or folder; a bare binary line is a global deny covering every protected path; the same binary may appear on multiple lines. Deny rules are **never hash-pinned or hash-checked**: a pin detects a replaced allowlisted binary, while a deny blocks the access no matter which binary matches. **Denials are always evaluated first**: a config denylist hit produces `FAN_DENY` (the open fails with `EPERM`) before any allowlist, cache, or session rule is consulted, and no dialog is shown.
 
 ### Settings
 
@@ -249,11 +291,12 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | Allow Once    | PID + binary + exact file                                     | `user_ttl` seconds                                                | no                       |
 | Allow Session | POSIX session + binary (+ SHA-512) + exact file               | until the shell/session leader exits, capped by `session_ttl`     | no                       |
 | Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                     | `runtime-allowlist.json` |
+| Allowlist pin | matched `[allowlist]` rule binary pattern + binary SHA-512    | until an approved hash change replaces it, or evicted at 256 pins | `allowlist-hashes.json`  |
 | Deny Session  | same key shape as Allow Session                               | same as Allow Session                                             | no                       |
 | Deny Always   | same key shape as Allow Always                                | until removed                                                     | `runtime-denylist.json`  |
 | Deny          | —                                                             | this attempt (rapid retries of the same open are denied for ~2 s) | no                       |
 
-Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → config allowlist → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link.
+Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]` → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link.
 
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
@@ -330,6 +373,8 @@ sudo cat /var/lib/fileshield/runtime-allowlist.json | jq .
 sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 ```
 
+`[allowlist]` hash pins use a separate state file (`/var/lib/fileshield/allowlist-hashes.json`) with the same permissions and reload behavior; see [Hash pinning](#hash-pinning).
+
 ---
 
 ## How It Works
@@ -337,7 +382,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 1. The daemon calls `fanotify_init(FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed.
 2. It registers `FAN_OPEN_PERM` marks on each protected path via `fanotify_mark()`.
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
-4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, config allowlist).
+4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, `[unsafe_allowlist]`, then the hash-pinned `[allowlist]`).
 5. On a miss, it spawns a `kdialog` two-stage popup on the requesting user's desktop session and waits for user input. The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
@@ -346,7 +391,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 
 ## Limitations
 
-- **Root processes**: A process running as root can bypass fanotify. FileShield protects against unprivileged or compromised user-space processes.
+- **Root processes**: A process running as root can bypass fanotify. Fileshield protects against unprivileged or compromised user-space processes.
 - **GUI dependency**: Requires a desktop session for popups; on non-KDE desktops the popup matches the system theme only when a Qt platform theme integration is installed.
 - **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
 - **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
@@ -355,24 +400,28 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **TOCTOU on binary identity**: The daemon resolves the calling process's binary via `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between the `readlink()` and the allowlist/cache check. This is an inherent limitation of all fanotify-based permission systems and is considered low-risk in practice.
 - **Dialog rate limiting**: To bound prompt-flooding (e.g. a process that re-execs itself repeatedly), a binary path is denied without prompting after 20 prompts within 60 seconds, for a 30-second cooldown.
 - **Command-line matching**: permanent _Always_ entries pin the exact command line, so tools whose arguments change every run (timestamps, random tokens, one-off URLs) will prompt on each invocation. Use _Allow Session_ or _Allow Once_ for those, or remove the persisted entry with `jq` (see [Persistence](#persistence)).
+- **Allowlist pins are keyed by rule pattern**: an exact rule pins one binary path, but a glob rule pins the pattern itself, so two different binaries matching the same rule **share one pin** and switching between them prompts for a hash update. Use `[unsafe_allowlist]` for tools whose binary churns (AppImages, tmp mounts). Pins are also evicted once the table exceeds 256 entries (oldest `updated_at` first).
+- **Allowlisted binaries must be hashable**: a binary under a protected path is deliberately not hashed, and a fork/exec failure or timeout leaves the digest unavailable — in both cases an `[allowlist]` match falls back to the normal prompt instead of granting silently. A damaged or unreadable `allowlist-hashes.json` fails closed the same way until it is repaired or removed.
+- **Denylist rules are never hash-checked**: pinning exists to detect a replaced allowlisted binary; a deny is enforced regardless of which binary matches.
+- **No pin-management CLI**: `[allowlist]` pins can only be updated through the change dialog. Root can inspect or edit `/var/lib/fileshield/allowlist-hashes.json` directly; a repaired, replaced or removed file takes effect on the next reload.
 
 ---
 
 ## Logs
 
-FileShield writes all events to the system journal via `syslog(3)` under the `LOG_DAEMON` facility and the identifier `fileshield`.
+Fileshield writes all events to the system journal via `syslog(3)` under the `LOG_DAEMON` facility and the identifier `fileshield`.
 
 ### Log verbosity
 
-By default FileShield logs **one line per access**: a rule hit logs which
+By default Fileshield logs **one line per access**: a rule hit logs which
 list allowed/denied it (first access per TTL window — repeats inside the
 window are silent), and a dialog access logs the prompt plus a
 human-readable choice:
 
 ```text
-dynamic allowlist hit: /usr/bin/md5sum (pid 108385) -> /home/micah/.kube/config
-[dialog] asking user: pid=108783 binary=/usr/bin/cat target=/home/micah/.kube/config comm=cat
-[dialog] user chose Allow Once for /usr/bin/cat (pid 108783) -> /home/micah/.kube/config
+dynamic allowlist hit: /usr/bin/md5sum (pid 108385) -> ~/.kube/config
+[dialog] asking user: pid=108783 binary=/usr/bin/cat target=~/.kube/config comm=cat
+[dialog] user chose Allow Once for /usr/bin/cat (pid 108783) -> ~/.kube/config
 ```
 
 The per-event plumbing (`[event]`, `[dedup]`, `[pump]`, display-env
@@ -383,12 +432,12 @@ survive a `SIGHUP` config reload for the settings key.
 
 The daemon logs at the following levels:
 
-| Level     | Events                                                                                                                                                                            |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices)                                                             |
-| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug` |
-| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable, hard-link prompts                                       |
-| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure                                                                                                                    |
+| Level     | Events                                                                                                                                                                                                          |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices), config allowlist first-use hash pins                                                     |
+| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug`                               |
+| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary/command hashing unavailable, allowlist hash-change prompts (full old/new digests) and approvals, hard-link prompts |
+| `ERR`     | `fanotify_init` failure, config parse error, fork/exec failure, damaged `allowlist-hashes.json`                                                                                                                 |
 
 ### Follow live events
 
@@ -447,20 +496,21 @@ This builds with `-O0 -g -fsanitize=address,undefined` and prints any memory err
 
 ## Running Tests
 
-Unit tests cover the cache, config parser, session decisions, JSON state files, SHA-512 digests, the protected-inode set, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
+Unit tests cover the cache, config parser, session decisions, JSON state files, allowlist hash pins, SHA-512 digests, the protected-inode set, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
 
 ```bash
 # Build and run all tests
 make test
 
 # Build tests without running
-make build/test_cache build/test_config build/test_session build/test_persist build/test_sha512 build/test_inode build/test_utils build/test_fanotify
+make build/test_cache build/test_config build/test_session build/test_persist build/test_pin build/test_sha512 build/test_inode build/test_utils build/test_fanotify
 
 # Run a single test binary directly
 ./build/test_cache
 ./build/test_config
 ./build/test_session
 ./build/test_persist
+./build/test_pin
 ./build/test_sha512
 ./build/test_inode
 ./build/test_utils
@@ -490,12 +540,12 @@ Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event h
 ## Troubleshooting
 
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). If kdialog is missing or fails, access is denied (fail closed).
-- **Dialog does not match your theme?** The daemon runs as root with a bare environment, so FileShield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
+- **Dialog does not match your theme?** The daemon runs as root with a bare environment, so Fileshield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
 - **Dialog behavior on failure**: timeouts, exec failures and Cancel/window close deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — a documented, accepted trade-off; `Allow Session` remains on Yes, and timeouts/exec failures always fail closed.
-- **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
+- **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. If the binary is already allowlisted, the prompt may be asking about a hash change — approve it only if you expected the binary to be rebuilt or updated. Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.
-- **All accesses denied with no popup on a headless machine?** FileShield requires a live desktop session to display dialogs. On headless hosts the daemon will deny all unknown accesses (fail-closed). Run in foreground mode and inspect the stderr output to confirm.
+- **All accesses denied with no popup on a headless machine?** Fileshield requires a live desktop session to display dialogs. On headless hosts the daemon will deny all unknown accesses (fail-closed). Run in foreground mode and inspect the stderr output to confirm.
 
 ---
 

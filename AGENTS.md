@@ -1,4 +1,4 @@
-# FileShield — Implementation Plan
+# Fileshield — Implementation Plan
 
 ## Language & Philosophy
 
@@ -8,7 +8,7 @@
 ## Project Layout
 
 ```
-FileShield/
+Fileshield/
 ├── AGENTS.md                    # this file (project guide)
 ├── README.md                    # user-facing documentation
 ├── Makefile
@@ -23,6 +23,7 @@ FileShield/
 │   ├── session.c / session.h    # in-memory session-scoped allow/deny decisions
 │   ├── notify.c / notify.h      # kdialog-only two-stage popups
 │   ├── persist.c / persist.h    # runtime allow/deny JSON state files
+│   ├── pin.c / pin.h            # [allowlist] SHA-512 pins (TOFU, 256-entry table, change state)
 │   ├── sha512.c / sha512.h      # digests: helper fork for files, in-process strings/buffers
 │   └── utils.c / utils.h        # /proc helpers, path matching, logging, home expansion
 └── tests/
@@ -30,6 +31,7 @@ FileShield/
     ├── test_config.c            # unit tests for config parser
     ├── test_session.c           # unit tests for session decisions
     ├── test_persist.c           # unit tests for JSON state files
+    ├── test_pin.c               # unit tests for allowlist hash pins
     ├── test_sha512.c            # known-answer + differential digest tests
     ├── test_inode.c             # protected-inode set (exact keys, overflow)
     ├── test_fanotify.c          # mark mask, deferred queue, fingerprints, state loading
@@ -41,18 +43,19 @@ FileShield/
 
 Headers are the source of truth for signatures; this table is the map.
 
-| Module | Owns |
-|--------|------|
-| `main.c` | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state loading |
-| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, deferred-event queue, dialog pump |
-| `inode.c/h` | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades) |
-| `config.c/h` | INI parse (`[protected_paths]`, `[allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix), `!` exclusions, TTL clamps |
-| `cache.c/h` | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time) |
-| `session.c/h` | POSIX-session-scoped allow/deny entries, leader-lifetime validity |
-| `notify.c/h` | per-prompt session detection, user drop, environment whitelist, kdialog stages, fail-closed outcomes |
-| `persist.c/h` | atomic JSON save (0600, `O_EXCL` temp + rename), tolerant line parser, fail-secure load |
-| `sha512.c/h` | `sha512_file` (forked `sha512sum`), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf` |
-| `utils.c/h` | `/proc` readers (`proc_exe_path`, `get_ppid`, `read_comm`, `read_cmdline`, `proc_stat_session`), `path_under`/`path_under_len`, protected-path glob matcher (`glob_base_len`, `glob_match_path`), home expansion, logging, `close_fds_from` |
+| Module         | Owns                                                                                                                                                                                                                                                                                                |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.c`       | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state and pin-table loading                                                                                                                                                                      |
+| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, deferred-event queue, dialog pump |
+| `inode.c/h`    | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades)                                                                                                                                                                                               |
+| `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                |
+| `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                 |
+| `session.c/h`  | POSIX-session-scoped allow/deny entries, leader-lifetime validity                                                                                                                                                                                                                                   |
+| `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes                                                                                                                                                             |
+| `persist.c/h`  | atomic JSON save (0600, `O_EXCL` temp + rename), tolerant line parser, fail-secure load                                                                                                                                                                                                             |
+| `pin.c/h`      | `[allowlist]` binary SHA-512 pins: strict fail-closed JSON load (missing = TOFU), 256-entry table with oldest-eviction, atomic store, change detection                                                                                                                                              |
+| `sha512.c/h`   | `sha512_file` (forked `sha512sum`), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf`                                                                                                                                                                                                      |
+| `utils.c/h`    | `/proc` readers (`proc_exe_path`, `get_ppid`, `read_comm`, `read_cmdline`, `proc_stat_session`), `path_under`/`path_under_len`, protected-path glob matcher (`glob_base_len`, `glob_match_path`), home expansion, logging, `close_fds_from`                                                         |
 
 ### Event pipeline (decision order)
 
@@ -64,7 +67,8 @@ Headers are the source of truth for signatures; this table is the map.
 5. `event_runtime_denied` — session deny, runtime deny (full-cmdline fingerprint compared,
    computed lazily only when a runtime list can match).
 6. `event_runtime_allowed` — skipped entirely for hard-link events; otherwise file cache →
-   session allow → runtime allow → config allowlist.
+   session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]`
+   (first use pins silently, a changed hash prompts).
 7. `event_ask_user` — dialog rate limit, kdialog stages, decision recording.
 
 ### `notify.h` decision codes
@@ -79,22 +83,22 @@ Headers are the source of truth for signatures; this table is the map.
 ```
 
 Both stages are `kdialog --yesnocancel` prompts whose bodies repeat the
-binary, command and file.  Stage 1: Yes = allow once, No = grant scope,
-Cancel = deny scope.  Stage 2 (grants): Yes = allow session, No = allow
-always, Cancel = deny.  Stage 2 (denies): Yes = deny session, No = deny
-always, Cancel = deny once.  kdialog's No button shares its exit code (1)
+binary, command and file. Stage 1: Yes = allow once, No = grant scope,
+Cancel = deny scope. Stage 2 (grants): Yes = allow session, No = allow
+always, Cancel = deny. Stage 2 (denies): Yes = deny session, No = deny
+always, Cancel = deny once. kdialog's No button shares its exit code (1)
 with some runtime errors, so a dialog that fails with exit 1 on the grant
 stage can create a permanent rule -- a documented, accepted trade-off;
-timeouts, exec failures and Cancel/window close always deny.  Scope text
+timeouts, exec failures and Cancel/window close always deny. Scope text
 states the real match keys: session = this binary + this exact file for
 the session; always = file, command and call chain.
 
 The dialog child forwards a whitelist of the user's session appearance
 variables (desktop identity, Qt theme/scale, locale, cursor) read from
-`/proc/<pid>/environ` so kdialog follows the desktop theme.  Display,
+`/proc/<pid>/environ` so kdialog follows the desktop theme. Display,
 session-bus, `LD_*`, `PATH` and `QT_PLUGIN_PATH`/`QT_QPA_PLATFORM*` variables
 are deliberately never forwarded: the prompt must stay on the display
-FileShield detected, and no code-loading or platform override may come from
+Fileshield detected, and no code-loading or platform override may come from
 the requesting process.
 
 ### `main.c` — daemon lifecycle
@@ -106,19 +110,20 @@ the requesting process.
 
 ## Decision Scopes
 
-| Decision | Match key | Lifetime | Stored in |
-|----------|-----------|----------|-----------|
-| Allow Once | PID + binary + target file | `user_ttl` (shipped config: 300s; 0 = not cached) | memory |
-| Allow/Deny Session | SID + leader start + binary (+SHA-512) + target | `session_ttl` (0 = shell lifetime) | memory |
-| Allow/Deny Always | binary SHA-512 + call chain + target file + command line (stored verbatim, matched by SHA-512 over the full raw line, ≤64 KB) | until removed | JSON state files |
+| Decision           | Match key                                                                                                                     | Lifetime                                                       | Stored in               |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------- |
+| Allow Once         | PID + binary + target file                                                                                                    | `user_ttl` (shipped config: 300s; 0 = not cached)              | memory                  |
+| Allow/Deny Session | SID + leader start + binary (+SHA-512) + target                                                                               | `session_ttl` (0 = shell lifetime)                             | memory                  |
+| Allow/Deny Always  | binary SHA-512 + call chain + target file + command line (stored verbatim, matched by SHA-512 over the full raw line, ≤64 KB) | until removed                                                  | JSON state files        |
+| Allowlist pin      | matched `[allowlist]` rule binary pattern + binary SHA-512                                                                    | until an approved hash change or eviction at the 256-entry cap | `allowlist-hashes.json` |
 
 Lookup order (a denial always wins): config denylist → session deny → permanent
-deny → file cache → session allow → permanent allow → config allowlist →
-dialog rate limit → prompt.  A hard-link event (protected inode reached through
-a path outside every protected prefix) skips the grant stages entirely and
-always prompts.  Persisted entries without a `target_path` or a recorded
-command line, and entries whose fingerprint predates full-line hashing, do not
-match (fail closed, re-prompt).
+deny → file cache → session allow → permanent allow → `[unsafe_allowlist]` →
+hash-pinned `[allowlist]` → dialog rate limit → prompt. A hard-link event
+(protected inode reached through a path outside every protected prefix) skips
+the grant stages entirely and always prompts. Persisted entries without a
+`target_path` or a recorded command line, and entries whose fingerprint
+predates full-line hashing, do not match (fail closed, re-prompt).
 
 ## Build & Test
 
@@ -135,18 +140,20 @@ match (fail closed, re-prompt).
 ## Testing Strategy
 
 - **`test_cache`**: target-scoped insert/lookup/expire, wildcard vs file-scoped, PID reuse, TTL clamp
-- **`test_config`**: parse valid/invalid .conf, ~ expansion, user_ttl/session_ttl, clamping, edge cases
+- **`test_config`**: parse valid/invalid .conf, rule globs on both sides, `[unsafe_allowlist]`, ~ expansion, user_ttl/session_ttl, clamping, edge cases
 - **`test_session`**: SID resolution, allow/deny matching, hash verification, TTL, dead leaders
 - **`test_persist`**: save/load roundtrip, escaping, malformed input, truncation warnings
+- **`test_pin`**: strict load/save roundtrip, missing vs damaged file, escaping, 256-entry eviction (oldest `updated_at`, tie-breaks), write-failure behavior
 - **`test_sha512`**: FIPS 180-4 known-answer vectors, differential tests vs `sha512sum`, NUL-safe buffer hashing
 - **`test_inode`**: exact-key lookup, device separation, duplicates, clear, overflow degradation
-- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, kernel queue saturation (root)
+- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, kernel queue saturation (root)
 - **`test_utils`**: `proc_exe_path`, `/proc` readers, home expansion, `path_under`
 - **`bench_hotpath`**: cache, path matching, SHA-512, runtime matchers, inode set, fast-path verdict, path resolution (`make bench`; kept only when a change wins)
 - Tests are self-contained C files linked against the module `.o` files
 - Each test returns 0 on pass, non-zero on failure. `make test` runs them all and reports aggregate.
 
 ## Limitations (see README for detail)
+
 - Root-only (CAP_SYS_ADMIN for `fanotify_init`); root processes can bypass fanotify
 - `kdialog` required for popups; missing/failing kdialog denies access (fail closed)
 - Kernel 5.0+ for FAN_OPEN_PERM on directories; no NFS/CIFS coverage; `mmap` and bind-mount aliases are outside the threat model
@@ -156,3 +163,5 @@ match (fail closed, re-prompt).
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
 - Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt
+- Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the table is capped at 256 entries (oldest evicted)
+- Denylist rules are never hash-checked, and there is no CLI for pins: updates go through the change dialog, or root edits `/var/lib/fileshield/allowlist-hashes.json` and reloads
