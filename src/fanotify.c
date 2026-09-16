@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <dirent.h>
 #include <sys/fanotify.h>
 #include <sys/stat.h>
@@ -227,8 +228,11 @@ static const RuleEntry *denylist_match(const char *binary, const char *target)
 /*
  * Hashing forks sha512sum and runs on the event-loop critical path while
  * the requesting process is suspended, so repeat lookups of the same
- * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime); any
- * metadata change invalidates the entry.
+ * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime,
+ * ctime); any metadata change invalidates the entry.  ctime matters for
+ * the pin verdict: mtime is settable by the file's owner (utimensat), so
+ * a user-writable binary could otherwise be swapped in place and keep a
+ * stale cached digest that still matches the allowlist pin.
  *
  * Failures are remembered for a short window too: a binary that cannot
  * be hashed (helper timeout on a FUSE mount, unreadable path) would
@@ -246,6 +250,8 @@ typedef struct
     off_t size;
     time_t mtime_sec;
     long mtime_nsec;
+    time_t ct_sec;
+    long ct_nsec;
     char hex[129];
     int failed;         /* 1 = last attempt failed; retry after the window */
     time_t retry_after; /* valid when failed                                */
@@ -400,7 +406,9 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
         if (e->dev == st.st_dev && e->ino == st.st_ino &&
             e->size == st.st_size &&
             e->mtime_sec == st.st_mtim.tv_sec &&
-            e->mtime_nsec == st.st_mtim.tv_nsec)
+            e->mtime_nsec == st.st_mtim.tv_nsec &&
+            e->ct_sec == st.st_ctim.tv_sec &&
+            e->ct_nsec == st.st_ctim.tv_nsec)
         {
             if (!e->failed)
             {
@@ -441,6 +449,8 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
     e->size = st.st_size;
     e->mtime_sec = st.st_mtim.tv_sec;
     e->mtime_nsec = st.st_mtim.tv_nsec;
+    e->ct_sec = st.st_ctim.tv_sec;
+    e->ct_nsec = st.st_ctim.tv_nsec;
 
     if (r < 0)
     {
@@ -2774,7 +2784,29 @@ static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
         {
             if (errno == EINTR)
                 continue;
+            if (errno == ENOENT)
+            {
+                /* The kernel reports "response for this fd has already
+                 * been written" when a decision was already delivered
+                 * (e.g. a duplicate deferred event); not fatal. */
+                log_msg(LOG_WARNING,
+                        "fanotify write response: already answered");
+                return -1;
+            }
+            if (errno == EAGAIN)
+            {
+                /* Transient non-blocking mode; the caller may retry. */
+                log_msg(LOG_WARNING, "fanotify write response: would block");
+                return -1;
+            }
             log_msg(LOG_ERR, "fanotify write response: %s", strerror(errno));
+            g_fatal = 1; /* the group cannot deliver decisions; restart */
+            return -1;
+        }
+        if (w == 0)
+        {
+            log_msg(LOG_ERR, "fanotify write response: zero-length write");
+            g_fatal = 1;
             return -1;
         }
         total += w;
@@ -2811,6 +2843,69 @@ void fanotify_flush_pending(int fan_fd)
         log_msg(LOG_WARNING, "denied %d pending permission events",
                 g_pending_count);
     g_pending_count = 0;
+}
+
+/*
+ * Deny and close every FAN_OPEN_PERM event still queued in the kernel.
+ *
+ * Closing the fanotify fd makes the kernel allow outstanding permission
+ * events (fanotify(7): "Upon close(2), outstanding permission events
+ * will be set to allowed"), so shutdown must drain the queue first and
+ * respond FAN_DENY to everything.  Zero-timeout poll then read: the
+ * daemon is single-threaded, so a readable poll guarantees read() will
+ * not block.  Unrequested notification events just have their fd closed.
+ */
+void fanotify_drain_and_deny(int fan_fd)
+{
+    char buf[BUF_SIZE]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    int denied = 0;
+
+    while (1)
+    {
+        struct pollfd pfd;
+        pfd.fd = fan_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+            break;
+
+        ssize_t n = read(fan_fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+
+        const struct fanotify_event_metadata *ev =
+            (const struct fanotify_event_metadata *)buf;
+        ssize_t remaining = n;
+
+        while (FAN_EVENT_OK(ev, (size_t)remaining))
+        {
+            if (ev->vers == FANOTIFY_METADATA_VERSION &&
+                (ev->mask & FAN_OPEN_PERM) && ev->fd != FAN_NOFD)
+            {
+                log_msg(LOG_DEBUG, "[drain] DENY fd=%d pid=%d (shutdown)",
+                        (int)ev->fd, (int)ev->pid);
+                fanotify_respond(fan_fd, ev, FAN_DENY);
+                close((int)ev->fd);
+                denied++;
+            }
+            else if (ev->fd != FAN_NOFD)
+            {
+                close((int)ev->fd);
+            }
+
+            if (ev->event_len == 0)
+                break;
+            remaining -= ev->event_len;
+            ev = (const struct fanotify_event_metadata *)((const char *)ev +
+                                                          ev->event_len);
+        }
+    }
+
+    if (denied > 0)
+        log_msg(LOG_WARNING,
+                "denied %d queued permission event(s) before shutdown",
+                denied);
 }
 
 void fanotify_loop(int fd)

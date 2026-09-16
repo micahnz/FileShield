@@ -72,6 +72,14 @@ int fanotify_defer_event(const struct fanotify_event_metadata *ev);
 void fanotify_flush_pending(int fan_fd);
 
 /*
+ * Deny and close every FAN_OPEN_PERM event still queued in the kernel.
+ * Must run before close(fan_fd) on shutdown: the kernel responds
+ * FAN_ALLOW to outstanding permission events when the group fd is
+ * closed, so the queue has to be drained and denied first (fail closed).
+ */
+void fanotify_drain_and_deny(int fan_fd);
+
+/*
  * Dynamic allowlist / denylist persistence: load root-only state files
  * into the in-memory lists (called on daemon startup and reload).
  */
