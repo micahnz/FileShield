@@ -63,8 +63,10 @@ void inode_set_add(dev_t dev, ino_t ino)
 
     if (g_inode_count >= INODE_SET_MAX)
     {
-        log_msg(LOG_WARNING,
-                "inode table full; hard-link detection may be incomplete");
+        log_msg(LOG_ERR,
+                "inode table full (max %d); hard-link detection is "
+                "incomplete",
+                INODE_SET_MAX);
         return;
     }
     g_slots[idx].dev = dev;

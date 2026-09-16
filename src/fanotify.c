@@ -1157,28 +1157,38 @@ static MarkEntry *mark_find(const char *path)
     return NULL;
 }
 
-static void mark_table_add(const char *path, unsigned int mask)
+/*
+ * Track one installed mark so clear_marks() can remove it on reload.
+ * Returns 0 when tracked/updated, -1 when it cannot be tracked (table
+ * full or OOM).  A -1 is fatal for the installation: an untracked mark
+ * would survive config reloads and could never be removed, so the caller
+ * removes the kernel mark again and fails the load.
+ */
+static int mark_table_add(const char *path, unsigned int mask)
 {
     MarkEntry *e = mark_find(path);
     if (e)
     {
         e->mask = mask;
-        return;
+        return 0;
     }
     if (g_mark_count >= MAX_MARK_TABLE)
     {
-        log_msg(LOG_WARNING, "mark table full; cannot track %s", path);
-        return;
+        log_msg(LOG_ERR,
+                "mark table full (max %d); cannot track %s; refusing the "
+                "mark set", MAX_MARK_TABLE, path);
+        return -1;
     }
     char *copy = strdup(path);
     if (!copy)
     {
-        log_msg(LOG_WARNING, "out of memory tracking mark %s", path);
-        return;
+        log_msg(LOG_ERR, "out of memory tracking mark %s", path);
+        return -1;
     }
     g_marks[g_mark_count].path = copy;
     g_marks[g_mark_count].mask = mask;
     g_mark_count++;
+    return 0;
 }
 
 /*
@@ -1239,7 +1249,10 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
 
     if (g_mount_count >= MAX_MOUNTS)
     {
-        log_msg(LOG_WARNING, "mount table full; hard-link detection limited");
+        log_msg(LOG_ERR,
+                "mount table full (max %d); hard-link detection is "
+                "incomplete for this filesystem",
+                MAX_MOUNTS);
         return;
     }
 
@@ -1255,7 +1268,7 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
     }
     else
     {
-        log_msg(LOG_WARNING,
+        log_msg(LOG_ERR,
                 "fanotify mount mark failed for %s: %s "
                 "(hard-link detection disabled for this filesystem)",
                 path, strerror(errno));
@@ -1316,7 +1329,13 @@ int fanotify_add_mark(int fd, const char *path)
         log_msg(LOG_ERR, "fanotify_mark ADD %s: %s", path, strerror(errno));
         return -1;
     }
-    mark_table_add(path, mask);
+    if (mark_table_add(path, mask) < 0)
+    {
+        /* The kernel mark was installed before tracking: remove it so a
+         * refused load cannot leave a stale mark behind. */
+        fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, path);
+        return -1;
+    }
     log_msg(LOG_INFO, "fanotify mark added: %s", path);
 
     if (S_ISREG(st.st_mode))
@@ -1382,7 +1401,12 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp)
                 base, pp->path, strerror(errno));
         return -1;
     }
-    mark_table_add(base, mask);
+    if (mark_table_add(base, mask) < 0)
+    {
+        /* See fanotify_add_mark(): never leave an untracked kernel mark. */
+        fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, base);
+        return -1;
+    }
     log_msg(LOG_INFO, "fanotify mark added: %s (glob base of %s)",
             base, pp->path);
 

@@ -225,18 +225,23 @@ static int string_array_len(char **arr)
 /*
  * Append one prepared rule to a section array.  The entry is already
  * canonicalized and bounds-checked by rule_pattern_set(), so this is a
- * plain copy past the shared per-section cap.
+ * plain copy past the shared per-section cap.  Returns 0 on success and
+ * -1 at the cap: the caller must refuse the whole config, because a
+ * dropped allow/deny rule would silently change access behavior.
  */
-static void rule_append(RuleEntry *rules, int *count, const RuleEntry *e)
+static int rule_append(RuleEntry *rules, int *count, const RuleEntry *e)
 {
     if (*count >= MAX_RULES)
     {
-        log_msg(LOG_WARNING, "config_load: too many allow/deny rules (max %d)",
+        log_msg(LOG_ERR,
+                "config_load: too many allow/deny rules (max %d); refusing "
+                "the config instead of dropping rules",
                 MAX_RULES);
-        return;
+        return -1;
     }
     rules[*count] = *e;
     (*count)++;
+    return 0;
 }
 
 /*
@@ -264,7 +269,8 @@ static void rule_append(RuleEntry *rules, int *count, const RuleEntry *e)
  * A '=' with an empty right side is a parse error, and a purely numeric
  * right side is the pre-rework "binary = ttl" format — both log a warning
  * and skip the line.  Returns 0 on success (skips included), -1 on
- * out-of-memory.
+ * out-of-memory or when the section's MAX_RULES cap is reached (the
+ * caller then refuses the whole config instead of dropping rules).
  */
 static int add_rule(RuleEntry *rules, int *count, const char *line)
 {
@@ -363,7 +369,13 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
                 continue;
         }
 
-        rule_append(rules, count, &e);
+        if (rule_append(rules, count, &e) < 0)
+        {
+            free_string_array(bins);
+            if (tgts)
+                free_string_array(tgts);
+            return -1;
+        }
     }
 
     free_string_array(bins);
@@ -518,8 +530,18 @@ int config_load(const char *path, Config *cfg)
             {
                 if (cfg->protected_count >= MAX_PATHS)
                 {
-                    log_msg(LOG_WARNING, "config_load: too many protected paths (max %d)", MAX_PATHS);
-                    break;
+                    /* Refuse the whole config: truncating the protection
+                     * list would silently leave the dropped paths
+                     * unmarked and unwatched.  A '~/...' line expands once
+                     * per real user, so multi-user machines reach this
+                     * sooner than the line count suggests. */
+                    log_msg(LOG_ERR,
+                            "config_load: too many protected paths (max %d); "
+                            "refusing the config (note: '~/...' expands once "
+                            "per real user)", MAX_PATHS);
+                    free_string_array(paths);
+                    fclose(fp);
+                    return -1;
                 }
                 if (is_exclude && paths[pi][0] != '/')
                 {
@@ -546,7 +568,9 @@ int config_load(const char *path, Config *cfg)
             /* [allowlist] "binary = target" or a bare binary (global). */
             if (add_rule(cfg->allowlist, &cfg->allowlist_count, s) < 0)
             {
-                log_msg(LOG_ERR, "config_load: out of memory");
+                log_msg(LOG_ERR,
+                        "config_load: cannot add to [allowlist] (out of "
+                        "memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }
@@ -557,7 +581,9 @@ int config_load(const char *path, Config *cfg)
              * skip the binary hash pinning entirely. */
             if (add_rule(cfg->unsafe_allowlist, &cfg->unsafe_allowlist_count, s) < 0)
             {
-                log_msg(LOG_ERR, "config_load: out of memory");
+                log_msg(LOG_ERR,
+                        "config_load: cannot add to [unsafe_allowlist] (out "
+                        "of memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }
@@ -685,7 +711,9 @@ int config_load(const char *path, Config *cfg)
             /* [denylist] "binary = target" or a bare binary (global). */
             if (add_rule(cfg->denylist, &cfg->denylist_count, s) < 0)
             {
-                log_msg(LOG_ERR, "config_load: out of memory");
+                log_msg(LOG_ERR,
+                        "config_load: cannot add to [denylist] (out of "
+                        "memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }

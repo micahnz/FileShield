@@ -299,6 +299,82 @@ static void test_settings_notifications(void)
 }
 
 /*
+ * Limit overflow is blocking: too many protected paths or too many rules
+ * in a section must refuse the whole config (startup fails; a reload
+ * keeps the previous config) instead of silently dropping entries.
+ */
+static void test_limits_are_blocking(void)
+{
+    Config cfg;
+    const size_t path_cap = 64 * 1024;
+    char *buf = malloc(path_cap);
+    ASSERT(buf != NULL, "allocate protected-path overflow config");
+    if (buf)
+    {
+        size_t off = (size_t)snprintf(buf, path_cap, "[protected_paths]\n");
+        for (int i = 0; i < MAX_PATHS + 1 && off < path_cap; i++)
+            off += (size_t)snprintf(buf + off, path_cap - off,
+                                    "/tmp/fslimit_%d\n", i);
+
+        char *path = write_temp(buf);
+        free(buf);
+        ASSERT(path != NULL, "write protected-path overflow config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == -1,
+               "too many protected paths refuses the config");
+        ASSERT(cfg.protected_count <= MAX_PATHS,
+               "refused config exposes no overflow");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    const size_t rule_cap = 32 * 1024;
+    buf = malloc(rule_cap);
+    ASSERT(buf != NULL, "allocate rule overflow config");
+    if (buf)
+    {
+        size_t off = (size_t)snprintf(buf, rule_cap, "[allowlist]\n");
+        for (int i = 0; i < MAX_RULES + 1 && off < rule_cap; i++)
+            off += (size_t)snprintf(buf + off, rule_cap - off,
+                                    "/usr/bin/fslimit_%d = /tmp/fslimit_t_%d\n",
+                                    i, i);
+
+        char *path = write_temp(buf);
+        free(buf);
+        ASSERT(path != NULL, "write rule overflow config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == -1,
+               "too many rules refuses the config");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* A config exactly at the protected-path cap still loads. */
+    buf = malloc(path_cap);
+    ASSERT(buf != NULL, "allocate at-cap config");
+    if (buf)
+    {
+        size_t off = (size_t)snprintf(buf, path_cap, "[protected_paths]\n");
+        for (int i = 0; i < MAX_PATHS && off < path_cap; i++)
+            off += (size_t)snprintf(buf + off, path_cap - off,
+                                    "/tmp/fslimit_%d\n", i);
+
+        char *path = write_temp(buf);
+        free(buf);
+        ASSERT(path != NULL, "write at-cap config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0, "exactly MAX_PATHS loads");
+        ASSERT(cfg.protected_count == MAX_PATHS,
+               "at-cap config keeps every entry");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+}
+
+/*
  * Absurd TTL values must be clamped (to one year) so cache expiry
  * arithmetic cannot overflow on any time_t width.
  */
@@ -1173,6 +1249,7 @@ int main(void)
     test_settings_invalid_session_ttl();
     test_settings_invalid_user_ttl();
     test_settings_notifications();
+    test_limits_are_blocking();
     test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
