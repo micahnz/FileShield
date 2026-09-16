@@ -592,18 +592,19 @@ sudo ./build/fileshield --dry-run --config fileshield.conf
 
 ## Running Tests
 
-Unit tests cover the cache, config parser, session decisions, JSON state files, allowlist hash pins, SHA-512 digests, the protected-inode set, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
+Unit tests cover the cache, config parser, session decisions, JSON state files, allowlist hash pins, SHA-512 digests, the protected-inode set, the reload decision path, fanotify event handling, and utility functions. They require no root and no kernel fanotify support (the kernel saturation test self-skips without `CAP_SYS_ADMIN`).
 
 ```bash
 # Build and run all tests
 make test
 
 # Build tests without running
-make build/test_cache build/test_config build/test_session build/test_persist build/test_pin build/test_sha512 build/test_inode build/test_utils build/test_fanotify
+make build/test_cache build/test_config build/test_reload build/test_session build/test_persist build/test_pin build/test_sha512 build/test_inode build/test_utils build/test_fanotify
 
 # Run a single test binary directly
 ./build/test_cache
 ./build/test_config
+./build/test_reload
 ./build/test_session
 ./build/test_persist
 ./build/test_pin

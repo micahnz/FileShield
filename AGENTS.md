@@ -24,6 +24,7 @@ Fileshield/
 │   ├── notify.c / notify.h      # kdialog-only two-stage popups
 │   ├── persist.c / persist.h    # runtime allow/deny JSON state files
 │   ├── pin.c / pin.h            # [allowlist] SHA-512 pins (TOFU, 256-entry table, change state)
+│   ├── reload.c / reload.h      # SIGHUP reload: mark install, state/pin loading, reject/rollback
 │   ├── sha512.c / sha512.h      # digests: helper fork for files, in-process strings/buffers
 │   └── utils.c / utils.h        # /proc helpers, path matching, logging, home expansion
 └── tests/
@@ -32,6 +33,7 @@ Fileshield/
     ├── test_session.c           # unit tests for session decisions
     ├── test_persist.c           # unit tests for JSON state files
     ├── test_pin.c               # unit tests for allowlist hash pins
+    ├── test_reload.c            # reload decision path (parse failure, rollback, shutdown)
     ├── test_sha512.c            # known-answer + differential digest tests
     ├── test_inode.c             # protected-inode set (exact keys, overflow)
     ├── test_fanotify.c          # mark mask, deferred queue, fingerprints, state loading
@@ -45,7 +47,8 @@ Headers are the source of truth for signatures; this table is the map.
 
 | Module         | Owns                                                                                                                                                                                                                                                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `main.c`       | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state and pin-table loading                                                                                                                                                                                                                                |
+| `main.c`       | daemonize, signal flags, startup orchestration                                                                                                                                                                                                                                |
+| `reload.c/h`   | mark installation, persisted-state and pin-table loading, `reload_protection()` with fail-closed reject/rollback (unit-tested with `fan_fd = -1`) |
 | `fanotify.c/h` | fanotify init, inode marks and init-namespace mount marks via `/proc/1/root` (glob entries mark their static base), startup scope guard, protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, dialog pump |
 | `inode.c/h`    | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades)                                                                                                                                                                                                                                                         |
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                                                                          |
@@ -159,6 +162,7 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 - **`test_pin`**: strict load/save roundtrip, missing vs damaged file, escaping, 256-entry eviction (oldest `updated_at`, tie-breaks), write-failure behavior
 - **`test_sha512`**: FIPS 180-4 known-answer vectors, differential tests vs `sha512sum`, NUL-safe buffer hashing
 - **`test_inode`**: exact-key lookup, device separation, duplicates, clear, overflow degradation
+- **`test_reload`**: parse failure keeps the old config, a rejected reload restores the previous mark set, a failed rollback requests shutdown (runs unprivileged with `fan_fd = -1`)
 - **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, kernel queue saturation (root)
 - **`test_utils`**: `proc_exe_path`, `/proc` readers, home expansion, `path_under`
 - **`bench_hotpath`**: cache, path matching, SHA-512, runtime matchers, inode set, fast-path verdict, path resolution (`make bench`; kept only when a change wins)

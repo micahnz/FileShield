@@ -27,11 +27,11 @@ REPLACE_CONFIG ?= 0
 SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/session.c $(SRCDIR)/notify.c \
            $(SRCDIR)/fanotify.c $(SRCDIR)/inode.c $(SRCDIR)/sha512.c \
-           $(SRCDIR)/persist.c $(SRCDIR)/pin.c
+           $(SRCDIR)/persist.c $(SRCDIR)/pin.c $(SRCDIR)/reload.c
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS    := $(OBJS:.o=.d)
 
-TESTS   := test_cache test_config test_utils test_persist test_pin test_session test_sha512 test_inode test_fanotify
+TESTS   := test_cache test_config test_reload test_utils test_persist test_pin test_session test_sha512 test_inode test_fanotify
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
 all: $(OBJDIR)/$(TARGET)
@@ -90,6 +90,19 @@ $(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR
 		$(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/session.o \
 		$(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
 		$(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
+
+# Links the reload decision path with fan_fd = -1: every kernel mark fails,
+# so parse failure, reject plus rollback, and rollback failure are exercised
+# without privileges.
+$(OBJDIR)/test_reload: $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
+                       $(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
+                       $(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
+                       $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
+		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
+		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
+		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
 
 test: all $(TSTBINS)
 	@failed=0; \
