@@ -2883,6 +2883,22 @@ static void event_ask_user(EventCtx *c)
  * stage 4.  Inside the pinned section a damaged table or an unavailable
  * digest falls through to the dialog (fail closed).
  */
+/*
+ * Run the deny stages before the grant stages over one event.  Shared by
+ * process_open_perm() and the order test seam so the ordering (every
+ * denial wins over every grant) cannot drift.
+ * Returns 1 when a deny stage decided, 2 when a grant stage decided, 0
+ * when the event still needs the dialog.
+ */
+static int run_verdict_stages(EventCtx *c)
+{
+    if (event_runtime_denied(c))
+        return 1;
+    if (event_runtime_allowed(c))
+        return 2;
+    return 0;
+}
+
 static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
 {
     EventCtx c;
@@ -2902,9 +2918,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     if (event_load_binary(&c))
         goto out;
     event_gather_identity(&c);
-    if (event_runtime_denied(&c))
-        goto out;
-    if (event_runtime_allowed(&c))
+    if (run_verdict_stages(&c))
         goto out;
     event_ask_user(&c);
 
@@ -2912,6 +2926,62 @@ out:
     if (c.close_fd)
         close(c.fd_num);
     free(c.binary);
+}
+
+/*
+ * Test seam (fanotify.h): run the real verdict stages over a synthetic
+ * request.  Returns 1 when a deny stage decided, 2 when a grant stage
+ * decided, 0 when the event would reach the dialog.  sid > 0 makes the
+ * synthetic context look like a member of that session (for recorded
+ * session decisions); cmdline_fp may be NULL.  hardlink mirrors the
+ * pipeline's hard-link classification.
+ */
+int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
+                                const char *target, const char *cmdline_fp,
+                                pid_t sid, int hardlink)
+{
+    struct fanotify_event_metadata ev;
+    EventCtx c;
+    int pipefd[2];
+    int verdict;
+
+    if (pipe(pipefd) < 0)
+        return 0;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = FAN_NOFD;
+    ev.pid = (int)getpid();
+
+    memset(&c, 0, sizeof(c));
+    c.fan_fd = pipefd[1];
+    c.ev = &ev;
+    c.fd_num = FAN_NOFD;
+    c.binary = (char *)binary; /* owned by the caller; not freed here */
+    snprintf(c.target, sizeof(c.target), "%s", target ? target : "");
+    snprintf(c.bin_sha512, sizeof(c.bin_sha512), "%s",
+             bin_sha512 ? bin_sha512 : "");
+    if (cmdline_fp)
+    {
+        snprintf(c.cmdline_sha512, sizeof(c.cmdline_sha512), "%s", cmdline_fp);
+        c.cmdline_sha_state = 1;
+    }
+    else
+        c.cmdline_sha_state = -1;
+    if (sid > 0)
+    {
+        c.sid = sid;
+        c.have_sid = 1;
+    }
+    c.hardlink_event = hardlink;
+
+    verdict = run_verdict_stages(&c);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return verdict;
 }
 
 /* ------------------------------------------------------------------ */

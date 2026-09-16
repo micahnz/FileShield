@@ -217,4 +217,16 @@ int fanotify_test_recent_lookup(pid_t pid, dev_t dev, ino_t ino,
                                 const char *target);
 void fanotify_test_recent_clear(void);
 
+/*
+ * Test seam: run the real verdict stages (denials before grants) over a
+ * synthetic request.  Returns 1 when a deny stage decided, 2 when a grant
+ * stage decided, 0 when the event would reach the dialog.  sid > 0 marks
+ * the synthetic context as a member of that session; cmdline_fp may be
+ * NULL; hardlink mirrors the pipeline's hard-link classification (which
+ * strips every grant).
+ */
+int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
+                                const char *target, const char *cmdline_fp,
+                                pid_t sid, int hardlink);
+
 #endif

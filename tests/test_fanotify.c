@@ -39,6 +39,7 @@
 #include "../src/inode.h"
 #include "../src/notify.h"
 #include "../src/pin.h"
+#include "../src/session.h"
 #include "../src/sha512.h"
 #include "../src/utils.h"
 
@@ -1580,6 +1581,66 @@ static void test_dialog_env_whitelist(void) {
            "QT_QPA_PLATFORMTHEME is the documented exception");
 }
 
+/*
+ * Run the verdict-stage seam in a child: an unsafe grant records the
+ * per-process "first hit" gate for whatever pid asks, and the test binary
+ * must not spend its own gate (test_unsafe_hit_once_per_process relies on
+ * it).  The child inherits the in-memory session table and config.
+ */
+static int child_verdict(const char *binary, const char *sha,
+                         const char *target, pid_t sid, int hardlink) {
+    int status = 0;
+    pid_t pid = fork();
+
+    if (pid < 0)
+        return -1;
+    if (pid == 0)
+        _exit(fanotify_test_verdict_stage(binary, sha, target, NULL, sid,
+                                          hardlink));
+    if (waitpid(pid, &status, 0) != pid)
+        return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/*
+ * Part 0h: the verdict stages run denials before grants (a recorded
+ * session deny must beat an unsafe grant), and hard-link events skip
+ * every grant stage.
+ */
+static void test_verdict_stage_order(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.unsafe_allowlist[0].binary,
+             sizeof(cfg.unsafe_allowlist[0].binary), "/bin/tool");
+    snprintf(cfg.unsafe_allowlist[0].target_path,
+             sizeof(cfg.unsafe_allowlist[0].target_path), "/home/u/secret");
+    cfg.unsafe_allowlist_count = 1;
+    g_config = &cfg;
+    session_clear();
+
+    /* The unsafe rule grants when nothing denies. */
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0) == 2,
+           "unsafe rule grants when nothing denies");
+
+    /* Hard-link events must not inherit any grant. */
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1) == 0,
+           "hard-link event skips every grant stage");
+
+    /* A recorded session deny beats the unsafe grant. */
+    ASSERT(session_id_of(getpid(), &sid, &start) == 0,
+           "resolve own session");
+    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0) == 1,
+           "session deny wins over an unsafe grant");
+
+    session_clear();
+    g_config = saved;
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
@@ -1587,6 +1648,7 @@ int main(void) {
     test_scope_guard();
     test_recent_decision_cache();
     test_dialog_env_whitelist();
+    test_verdict_stage_order();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();
