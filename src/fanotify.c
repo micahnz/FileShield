@@ -1771,6 +1771,17 @@ int fanotify_any_mark_active(void)
 }
 
 /*
+ * Test seam: record a mark-table entry exactly like a real installation
+ * (strdup'd, tracked for removal) without touching the kernel, so reload
+ * tests can exercise the "rollback left no active marks" shutdown branch
+ * with fan_fd = -1.  Returns 0 on success, -1 when the table is full.
+ */
+int fanotify_test_seed_mark(const char *path)
+{
+    return mark_table_add(path, fanotify_mark_mask());
+}
+
+/*
  * Newly created directories inside a protected tree need their own mark:
  * directory marks are not recursive, and this keeps path matching (and
  * hard-link inode tracking) effective for their contents.  Bounded by

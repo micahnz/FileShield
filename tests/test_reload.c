@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../src/config.h"
+#include "../src/fanotify.h"
 #include "../src/reload.h"
 #include "../src/utils.h"
 
@@ -163,12 +164,54 @@ static void test_failed_rollback_shuts_down(void)
     free(new_p);
 }
 
+/*
+ * A rollback whose install reports no failures can still leave zero
+ * active marks when every old-config path vanished since startup (the
+ * paths are skipped, not failed).  Protection was active before the
+ * reload, so this is the silently-unprotected state main.c refuses at
+ * startup: the daemon must shut down.  A seed mark makes the
+ * pre-reload state active without a kernel group.
+ */
+static void test_rollback_without_marks_shuts_down(void)
+{
+    char *old_p = write_temp("[protected_paths]\n"
+                             "/nonexistent/fileshield/reload-gone\n");
+    char *new_p = write_temp("[protected_paths]\n"
+                             "/dev\n");
+    ASSERT(old_p != NULL && new_p != NULL, "write configs");
+
+    Config old;
+    memset(&old, 0, sizeof(old));
+    ASSERT(config_load(old_p, &old) == 0, "load old config");
+
+    /* Pretend the daemon started with a live mark somewhere else. */
+    ASSERT(fanotify_test_seed_mark("/tmp/fileshield_reload_seed") == 0,
+           "seed a mark-table entry");
+
+    Config *cfg = &old;
+    g_config = &old;
+    g_fatal = 0;
+
+    ASSERT(reload_protection(-1, new_p, &cfg) == -1,
+           "protection-less rollback requests shutdown");
+    ASSERT(g_fatal == 1, "protection-less rollback sets g_fatal");
+    ASSERT(cfg == &old, "protection-less rollback keeps the old config");
+    g_fatal = 0;
+
+    config_reset(&old);
+    unlink(old_p);
+    unlink(new_p);
+    free(old_p);
+    free(new_p);
+}
+
 int main(void)
 {
     printf("=== test_reload ===\n");
     test_parse_failure_keeps_config();
     test_reject_rolls_back();
     test_failed_rollback_shuts_down();
+    test_rollback_without_marks_shuts_down();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

@@ -242,4 +242,13 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
 /* Test seam: the per-binary dialog rate limiter. */
 int fanotify_test_dialog_rate_limited(const char *binary);
 
+/*
+ * Test seam: record a mark-table entry like a real installation (no
+ * kernel call), so unprivileged reload tests can start from a state
+ * where marks are active and exercise the "rollback left no active
+ * marks" shutdown branch.  Returns 0 on success, -1 when the table is
+ * full; fanotify_clear_marks() removes it again.
+ */
+int fanotify_test_seed_mark(const char *path);
+
 #endif

@@ -16,10 +16,6 @@
 #include "pin.h"
 #include "utils.h"
 
-/* Defined in main.c; the reload path reads and clears them. */
-extern volatile sig_atomic_t g_need_reload;
-extern volatile sig_atomic_t g_fatal;
-
 int install_marks(int fan_fd, const Config *cfg, const char *phase,
                   int *skipped)
 {
@@ -115,6 +111,12 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         return 0;
     }
 
+    /* Protection state before this reload: the rollback check below
+     * treats "nothing active afterwards" as a failure only when
+     * protection existed beforehand (the daemon refuses to start without
+     * marks, so a production daemon always has some). */
+    int was_protected = fanotify_any_mark_active();
+
     /* clear_marks() removes every mark the daemon installed (including
      * auto-added directory marks) with the exact masks they were added
      * with, so the new config rebuilds the mark set from scratch. */
@@ -148,7 +150,16 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         g_config = *cfg;
 
         int rollback_skipped = 0;
-        if (install_marks(fan_fd, *cfg, "rollback", &rollback_skipped) > 0)
+        int rollback_failures =
+            install_marks(fan_fd, *cfg, "rollback", &rollback_skipped);
+        /* An install that reports no failures can still leave the daemon
+         * with zero active marks when every old-config path has vanished
+         * since startup (they are skipped, not failed).  That is the
+         * silently-unprotected state main.c refuses at startup — treat
+         * it as a rollback failure unless protection was already absent
+         * before the reload (unprivileged tests run with fd = -1). */
+        if (rollback_failures > 0 ||
+            (was_protected && !fanotify_any_mark_active()))
         {
             log_msg(LOG_ERR, "rollback failed; shutting down");
             g_fatal = 1;
