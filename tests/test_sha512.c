@@ -190,6 +190,33 @@ static void test_file_failure_reason(void)
            "failure reason is cleared after a successful hash");
 }
 
+/*
+ * GNU sha512sum prefixes its output line with a backslash when the
+ * printed filename contains a backslash or newline; the digest must
+ * still parse for such paths.
+ */
+static void test_file_backslash_path(void)
+{
+    char path[PATH_MAX];
+    char hex[129];
+
+    snprintf(path, sizeof(path), "/tmp/fileshield_sha512_back\\slash_%d",
+             (int)getpid());
+    unlink(path);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0, "create backslash-named file");
+    if (fd >= 0)
+    {
+        ASSERT(write(fd, "backslash", 9) == 9, "write backslash-named file");
+        close(fd);
+        ASSERT(sha512_file(path, hex) == 0,
+               "digest parses for a backslash-named file");
+        ASSERT(strlen(hex) == 128, "digest is 128 hex chars");
+        unlink(path);
+    }
+}
+
 int main(void)
 {
     printf("=== test_sha512 ===\n");
@@ -203,6 +230,7 @@ int main(void)
     test_string_differential();
     test_file_digest();
     test_file_failure_reason();
+    test_file_backslash_path();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

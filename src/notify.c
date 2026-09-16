@@ -1261,9 +1261,34 @@ void notify_rule_hit(const NotifyHit *hit)
         _exit(127);
     }
 
+    /* Bounded reap: the intermediate exits immediately in practice, but
+     * the single-threaded event loop must never block on it. */
     int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-        ;
+    int reaped = 0;
+    for (int i = 0; i < 100; i++) /* up to ~1 s */
+    {
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid)
+        {
+            reaped = 1;
+            break;
+        }
+        if (w < 0 && errno != EINTR)
+        {
+            log_msg(LOG_WARNING, "notify_rule_hit: waitpid: %m");
+            return;
+        }
+        usleep(10000);
+    }
+    if (!reaped)
+    {
+        log_msg(LOG_WARNING,
+                "notify_rule_hit: intermediate %d did not exit; killing it",
+                (int)pid);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+            ;
+    }
     /* A 127 exit means exec failed: notify-send may have been removed
      * since the cached check.  Drop the flag so the next hit re-checks
      * instead of paying a doomed double fork forever. */

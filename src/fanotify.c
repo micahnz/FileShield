@@ -94,8 +94,10 @@ static int resolve_fd_path(int fd_num, char *out, size_t outsz)
  * Fingerprint the FULL raw command line of pid (bounded by
  * CMDLINE_FP_MAX).  The NUL-separated bytes are hashed as-is, so two
  * invocations that differ anywhere inside the bound get different
- * fingerprints.  Returns 0 on success, -1 when the cmdline is unreadable
- * or empty (callers fail closed).
+ * fingerprints.  A command line that does not fit the bound has no
+ * fingerprint at all (two over-long commands sharing the first 64 KB
+ * must not share a key), so callers fail closed.  Returns 0 on success,
+ * -1 when the cmdline is unreadable, empty, or over-long.
  */
 static int read_cmdline_fingerprint(pid_t pid, char hex_out[129])
 {
@@ -128,7 +130,32 @@ static int read_cmdline_fingerprint(pid_t pid, char hex_out[129])
             break;
         total += (size_t)n;
     }
+
+    int overflow = 0;
+    if (total == CMDLINE_FP_MAX)
+    {
+        /* One byte past the bound tells whether the command line was
+         * truncated at CMDLINE_FP_MAX. */
+        char extra;
+        ssize_t n;
+        do
+        {
+            n = read(fd, &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n > 0)
+            overflow = 1;
+    }
     close(fd);
+
+    if (overflow)
+    {
+        log_msg(LOG_WARNING,
+                "cmdline fingerprint: pid %d command line exceeds %d bytes; "
+                "no fingerprint (fail closed)",
+                (int)pid, CMDLINE_FP_MAX);
+        free(buf);
+        return -1;
+    }
 
     int rc = (total > 0) ? sha512_buf(buf, total, hex_out) : -1;
     free(buf);
@@ -3435,35 +3462,70 @@ void fanotify_clear_marks(int fd)
      * including auto-added directory marks, then the mount marks, and
      * clear the in-memory tables.  Called before a config reload so the
      * tables are rebuilt cleanly by the subsequent fanotify_add_mark()
-     * calls.  Any deferred permission event is denied first (fail closed). */
+     * calls.  Any deferred permission event is denied first (fail closed).
+     *
+     * A mark whose removal fails stays tracked and is retried on the next
+     * clear: forgetting it would leave an untracked kernel mark intercepting
+     * opens under a later config.  A negative fd (unprivileged tests) means
+     * no group exists and nothing was ever installed in the kernel, so the
+     * table is cleared outright. */
     fanotify_flush_pending(fd);
 
-    for (int i = g_mark_count - 1; i >= 0; i--)
+    int kept = 0;
+    for (int i = 0; i < g_mark_count; i++)
     {
-        if (fanotify_mark(fd, FAN_MARK_REMOVE, g_marks[i].mask,
-                          AT_FDCWD, g_marks[i].path) < 0)
-        {
-            log_msg(LOG_WARNING, "fanotify mark remove failed for %s: %s",
-                    g_marks[i].path, strerror(errno));
-        }
-        free(g_marks[i].path);
-        g_marks[i].path = NULL;
-    }
-    g_mark_count = 0;
-    g_auto_mark_count = 0;
-
-    for (int i = 0; i < g_mount_count; i++)
-    {
-        if (fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
-                          FAN_OPEN_PERM, AT_FDCWD, g_mounts[i].path) < 0)
+        int rc = (fd >= 0)
+                     ? fanotify_mark(fd, FAN_MARK_REMOVE, g_marks[i].mask,
+                                     AT_FDCWD, g_marks[i].path)
+                     : 0;
+        if (rc < 0 && errno == ENOENT)
+            rc = 0; /* no kernel mark to remove: already gone */
+        if (rc < 0)
         {
             log_msg(LOG_WARNING,
-                    "fanotify mount mark remove failed for %s (dev %lu): %s",
-                    g_mounts[i].path, (unsigned long)g_mounts[i].dev,
-                    strerror(errno));
+                    "fanotify mark remove failed for %s: %s; keeping it "
+                    "tracked for the next clear",
+                    g_marks[i].path, strerror(errno));
+            if (kept != i)
+            {
+                g_marks[kept] = g_marks[i];
+                g_marks[i].path = NULL;
+            }
+            kept++;
+        }
+        else
+        {
+            free(g_marks[i].path);
+            g_marks[i].path = NULL;
         }
     }
-    g_mount_count = 0;
+    g_mark_count = kept;
+    if (kept == 0)
+        g_auto_mark_count = 0;
+
+    int kept_mounts = 0;
+    for (int i = 0; i < g_mount_count; i++)
+    {
+        int rc = (fd >= 0)
+                     ? fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
+                                     FAN_OPEN_PERM, AT_FDCWD,
+                                     g_mounts[i].path)
+                     : 0;
+        if (rc < 0 && errno == ENOENT)
+            rc = 0; /* no kernel mount mark to remove */
+        if (rc < 0)
+        {
+            log_msg(LOG_WARNING,
+                    "fanotify mount mark remove failed for %s (dev %lu): %s; "
+                    "keeping it tracked for the next clear",
+                    g_mounts[i].path, (unsigned long)g_mounts[i].dev,
+                    strerror(errno));
+            if (kept_mounts != i)
+                g_mounts[kept_mounts] = g_mounts[i];
+            kept_mounts++;
+        }
+    }
+    g_mount_count = kept_mounts;
     inode_set_clear();
     recent_cache_clear(); /* a reload may change every verdict */
     log_msg(LOG_INFO, "marks and inode table cleared");

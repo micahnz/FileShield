@@ -410,10 +410,14 @@ static int collect_digest(int fd, pid_t pid, const char *label,
         return -1;
     }
 
-    /* Validate: first 128 chars must all be hex digits. */
+    /* GNU sha512sum prefixes the line with a backslash when the printed
+     * filename contains a backslash or newline; accept and skip it. */
+    size_t digest_off = (buf[0] == '\\') ? 1 : 0;
+
+    /* Validate: the 128 digest characters must all be hex digits. */
     for (int i = 0; i < 128; i++)
     {
-        if (!isxdigit((unsigned char)buf[i]))
+        if (!isxdigit((unsigned char)buf[digest_off + i]))
         {
             set_failure("sha512sum returned an invalid digest");
             log_msg(LOG_ERR, "sha512: %s: invalid digest output", label);
@@ -421,7 +425,7 @@ static int collect_digest(int fd, pid_t pid, const char *label,
         }
     }
 
-    memcpy(hex_out, buf, 128);
+    memcpy(hex_out, buf + digest_off, 128);
     hex_out[128] = '\0';
     set_failure("");
     return 0;

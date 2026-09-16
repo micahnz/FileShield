@@ -1370,6 +1370,87 @@ static void test_respond_failure_retry(void) {
 }
 
 /*
+ * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
+ * retried on the next clear) instead of being forgotten, which would
+ * leave an untracked kernel mark behind.  A negative fd means no group
+ * (unprivileged tests) and clears the table outright.
+ */
+static void test_clear_marks_retains_failures(void) {
+    ASSERT(fanotify_test_seed_mark("/tmp/clear-retain-a") == 0,
+           "seed first mark");
+    ASSERT(fanotify_test_seed_mark("/tmp/clear-retain-b") == 0,
+           "seed second mark");
+    ASSERT(fanotify_any_mark_active() == 1, "seeded marks are active");
+
+    /* /dev/null cannot be a fanotify group: every removal fails. */
+    int bad_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(bad_fd >= 0, "open non-fanotify fd");
+    fanotify_clear_marks(bad_fd);
+    close(bad_fd);
+    ASSERT(fanotify_any_mark_active() == 1,
+           "failed removals stay tracked for the next clear");
+
+    /* No group: nothing was installed in the kernel, clear outright. */
+    fanotify_clear_marks(-1);
+    ASSERT(fanotify_any_mark_active() == 0, "table clear releases the marks");
+}
+
+/*
+ * Part 0j: a command line longer than the 64 KB fingerprint bound must
+ * yield no fingerprint (fail closed) instead of a digest of the
+ * truncated prefix, which two different over-long invocations could
+ * otherwise share.
+ */
+static void test_cmdline_fingerprint_overflow(void) {
+    const size_t big = 70 * 1024;
+    char *arg = malloc(big + 1);
+    ASSERT(arg != NULL, "alloc long argv");
+    if (!arg)
+        return;
+    memset(arg, 'x', big);
+    arg[big] = '\0';
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork long-argv child");
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0)
+            dup2(devnull, STDIN_FILENO);
+        execl("/bin/sh", "sh", "-c", "while :; do sleep 1; done", arg,
+              (char *)NULL);
+        _exit(127);
+    }
+
+    char hex[129];
+    int rc = 0;
+    for (int i = 0; i < 200 && rc == 0; i++) {
+        rc = fanotify_test_cmdline_fingerprint(pid, hex);
+        if (rc == 0)
+            usleep(10000);
+    }
+
+    /* Prove the child really exec'd with the over-long argv: measure its
+     * raw command line (a failed exec would otherwise fake the result). */
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    size_t total = 0;
+    if (fd >= 0) {
+        char buf[8192];
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof(buf))) > 0)
+            total += (size_t)n;
+        close(fd);
+    }
+    ASSERT(total > (size_t)64 * 1024, "child cmdline really exceeds 64 KB");
+    ASSERT(rc < 0, "an over-long cmdline has no fingerprint");
+
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    free(arg);
+}
+
+/*
  * Part 2: real kernel fanotify group, no FAN_UNLIMITED_QUEUE.  Open 20000
  * distinct files under one marked directory without draining; the kernel
  * default queue holds 16384 events, so saturation is guaranteed and the
@@ -1992,6 +2073,8 @@ int main(void) {
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_respond_failure_retry();
+    test_clear_marks_retains_failures();
+    test_cmdline_fingerprint_overflow();
     test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
     pin_fixture_cleanup();

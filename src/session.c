@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <time.h>
 
 /*
@@ -187,10 +188,28 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
         }
         else
         {
-            /* Full: drop the oldest live entry (same policy as the
-             * runtime allow/deny lists). */
-            memmove(&list[0], &list[1], sizeof(SessionEntry) * (SESSION_MAX - 1));
-            slot = SESSION_MAX - 1;
+            /* Full: reclaim a dead hole before dropping a live entry;
+             * only when every slot is live is the oldest (slot 0)
+             * evicted, which the log records. */
+            slot = -1;
+            for (int i = 0; i < SESSION_MAX; i++)
+            {
+                if (!list[i].used)
+                {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0)
+            {
+                log_msg(LOG_INFO,
+                        "session table full; dropping the oldest entry "
+                        "(sid %d, %s -> %s)",
+                        (int)list[0].sid, list[0].binary, list[0].target);
+                memmove(&list[0], &list[1],
+                        sizeof(SessionEntry) * (SESSION_MAX - 1));
+                slot = SESSION_MAX - 1;
+            }
         }
         e = &list[slot];
     }
