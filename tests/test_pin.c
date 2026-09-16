@@ -812,6 +812,58 @@ static int test_failed_append_then_store(void)
     return 0;
 }
 
+/*
+ * Structural strictness: junk after an entry close, a duplicate "pins"
+ * array, and a non-canonical pin_check() pattern are all damage, not
+ * silently tolerated input.
+ */
+static int test_pin_strict_structure(void)
+{
+    char path[TPATH];
+    char old[129];
+    char valid[512];
+    int failed = 0;
+
+    make_test_path(path, sizeof(path), "strict.json");
+
+    const char *junk =
+        "{\n  \"pins\": [\n    {\n"
+        "      \"pattern\": \"/usr/bin/a\",\n"
+        "      \"sha512\": \"" SHA_A "\",\n"
+        "      \"updated_at\": 1\n"
+        "    } trailing\n  ]\n}\n";
+    if (expect_damaged(path, junk, "junk after entry close") != 0)
+        failed = 1;
+
+    const char *dup =
+        "{\n  \"pins\": [\n    {\n"
+        "      \"pattern\": \"/usr/bin/a\",\n"
+        "      \"sha512\": \"" SHA_A "\",\n"
+        "      \"updated_at\": 1\n"
+        "    }\n  ]\n  \"pins\": [\n  ]\n}\n";
+    if (expect_damaged(path, dup, "duplicate pins array") != 0)
+        failed = 1;
+
+    if (failed)
+        return 1;
+
+    /* Control: a writer-shaped file still loads after the damage. */
+    build_valid_json(valid, sizeof(valid), "/usr/bin/a", SHA_A, 1);
+    ASSERT(write_raw_file(path, valid) == 0, "write valid control file");
+    ASSERT(pin_load(path) == 0, "valid file still loads");
+
+    /* pin_check() rejects a non-canonical pattern as damaged instead of
+     * reporting a clean first use. */
+    ASSERT(pin_check("relative/path", SHA_A, old) == PIN_CHECK_DAMAGED,
+           "non-canonical pattern is damaged");
+    ASSERT(pin_check("", SHA_A, old) == PIN_CHECK_DAMAGED,
+           "empty pattern is damaged");
+
+    unlink(path);
+    TEST_PASS("pin structure strictness");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  main                                                              */
 /* ------------------------------------------------------------------ */
@@ -846,6 +898,7 @@ int main(void)
     failed |= test_write_failure_keeps_memory();
     failed |= test_unwritable_dir_non_root();
     failed |= test_failed_append_then_store();
+    failed |= test_pin_strict_structure();
 
     rmdir(g_test_dir);
 

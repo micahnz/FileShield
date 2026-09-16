@@ -22,6 +22,11 @@ void log_set_debug(int enabled)
     g_log_debug = enabled ? 1 : 0;
 }
 
+int log_debug_enabled(void)
+{
+    return g_log_debug;
+}
+
 time_t mono_seconds(void)
 {
     struct timespec ts;

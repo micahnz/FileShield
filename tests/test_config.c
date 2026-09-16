@@ -1509,12 +1509,80 @@ static void test_overlong_rule_binary(void)
     free(path);
 }
 
+/*
+ * A typo'd [settings] key must be reported, and the config must still
+ * load: unlike unknown sections, a bad key cannot drop protection.
+ */
+static void test_unknown_setting(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "user_ttl = 120\n"
+        "user_tll = 55\n"; /* typo: must not vanish silently */
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for unknown setting");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    ASSERT(config_load(path, &cfg) == 0,
+           "unknown setting is reported but does not refuse the config");
+    ASSERT(cfg.user_ttl_seconds == 120, "known settings still apply");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * [settings] debug is staged: a config that is later refused must not
+ * toggle the global logging state, while an accepted config applies it.
+ */
+static void test_debug_staging(void)
+{
+    log_set_debug(0);
+
+    char conf[8192];
+    size_t off = 0;
+    off += (size_t)snprintf(conf + off, sizeof(conf) - off,
+                            "[settings]\ndebug = yes\n[allowlist]\n");
+    for (int i = 0; i < 129 && off < sizeof(conf); i++)
+        off += (size_t)snprintf(conf + off, sizeof(conf) - off,
+                                "/usr/bin/x%d = /tmp/t\n", i);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write over-cap config");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == -1, "over-cap config is refused");
+    ASSERT(log_debug_enabled() == 0,
+           "refused config did not toggle the global debug flag");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    path = write_temp("[settings]\ndebug = yes\n");
+    ASSERT(path != NULL, "write debug config");
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "debug config loads");
+    ASSERT(log_debug_enabled() == 1, "accepted config applies debug");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    log_set_debug(0);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
     test_basic_parse();
     test_missing_file();
     test_unknown_section();
+    test_unknown_setting();
+    test_debug_staging();
     test_relative_protected_rejected();
     test_settings_user_ttl();
     test_settings_session_ttl();

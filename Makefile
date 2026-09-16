@@ -107,14 +107,19 @@ $(OBJDIR)/test_reload: $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fano
 		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
 
 test: all $(TSTBINS)
-	@failed=0; \
+	@failed=0; skips=0; \
 	for t in $(TSTBINS); do \
 		echo "=== $$t ==="; \
-		$$t || failed=1; \
+		out=`$$t 2>&1` || failed=1; \
+		printf '%s\n' "$$out"; \
+		n=`printf '%s\n' "$$out" | grep -c '^SKIP'`; \
+		skips=`expr $$skips + $$n`; \
 	done; \
 	if [ $$failed -eq 1 ]; then \
 		echo "FAIL"; \
 		exit 1; \
+	elif [ $$skips -gt 0 ]; then \
+		echo "PASS ($$skips environment-skipped test check(s))"; \
 	else \
 		echo "PASS"; \
 	fi

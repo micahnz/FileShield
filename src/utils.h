@@ -72,6 +72,9 @@ int read_cmdline(pid_t pid, char *out, size_t size);
  */
 void log_set_debug(int enabled);
 
+/* Current debug gate state (test/introspection only). */
+int log_debug_enabled(void);
+
 /*
  * proc_stat_session: read /proc/<pid>/stat once and extract the POSIX
  * session id (field 6) and the process start time (field 22, clock ticks

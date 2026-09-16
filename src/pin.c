@@ -220,6 +220,13 @@ int pin_load(const char *filepath)
             pins_key = strstr(p, "\"pins\":");
             if (pins_key != NULL)
             {
+                if (saw_pins)
+                {
+                    /* A second "pins" array is structural damage; the
+                     * first array's pins would silently win. */
+                    ok = 0;
+                    break;
+                }
                 char *q = pins_key + 7; /* just after the "pins": key */
 
                 saw_pins = 1;
@@ -322,10 +329,21 @@ int pin_load(const char *filepath)
             }
             if (*p == '}')
             {
-                if (!cur->have_pattern || !cur->have_sha512 ||
+                /* Only whitespace, an optional entry comma and the
+                 * newline may follow the close: anything else is junk
+                 * this line-oriented reader would silently ignore. */
+                const char *q = p + 1;
+                while (*q == ' ' || *q == '\t')
+                    q++;
+                if (*q == ',')
+                    q++;
+                while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+                    q++;
+                if (*q != '\0' || !cur->have_pattern || !cur->have_sha512 ||
                     !cur->have_updated_at)
                 {
-                    ok = 0; /* incomplete entry: never dropped silently */
+                    ok = 0; /* junk after the close, or incomplete entry:
+                             * never dropped or tolerated silently */
                     break;
                 }
                 cur->pin.seq = (unsigned long)count;
@@ -417,7 +435,7 @@ int pin_check(const char *pattern, const char *sha512, char old_out[129])
 
     if (g_pin_damaged)
         return PIN_CHECK_DAMAGED;
-    if (!pattern || pattern[0] == '\0' || !is_valid_sha512(sha512))
+    if (!pattern || !is_valid_pattern(pattern) || !is_valid_sha512(sha512))
         return PIN_CHECK_DAMAGED;
 
     for (i = 0; i < g_pin_count; i++)

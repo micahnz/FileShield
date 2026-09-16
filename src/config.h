@@ -78,6 +78,15 @@ typedef struct
     int notify_deny;           /* [denylist] hit; default on          */
     int notify_dedup_seconds;  /* per (list, binary, target); 0 = every hit */
     int notify_max;            /* global cap per 60 s window; >= 1     */
+
+    /*
+     * [settings] debug is staged here and applied only after the whole
+     * config parses successfully, so a refused config cannot toggle the
+     * global logging state.  debug_set distinguishes "absent" (keep the
+     * --debug state) from an explicit value.
+     */
+    int debug_set;
+    int debug;
 } Config;
 
 int config_load(const char *path, Config *cfg);

@@ -516,17 +516,34 @@ int config_load(const char *path, Config *cfg)
         return -1;
     }
 
-    /* The daemon runs as root: warn loudly about a config that another
-     * user could modify. */
+    /* The daemon runs as root: a config another user can modify is a
+     * privilege-escalation path (e.g. adding an [unsafe_allowlist]
+     * rule), so it is refused rather than merely warned about. */
     if (geteuid() == 0)
     {
         struct stat st;
         if (fstat(fileno(fp), &st) == 0 && S_ISREG(st.st_mode))
         {
+            int unsafe = 0;
             if (st.st_uid != 0)
-                log_msg(LOG_WARNING, "config_load: %s is not owned by root", path);
+            {
+                log_msg(LOG_ERR, "config_load: %s is not owned by root", path);
+                unsafe = 1;
+            }
             if (st.st_mode & 022)
-                log_msg(LOG_WARNING, "config_load: %s is writable by group/other", path);
+            {
+                log_msg(LOG_ERR, "config_load: %s is writable by group/other",
+                        path);
+                unsafe = 1;
+            }
+            if (unsafe)
+            {
+                log_msg(LOG_ERR,
+                        "config_load: refusing a config another user can "
+                        "modify; fix the ownership/permissions and reload");
+                fclose(fp);
+                return -1;
+            }
         }
     }
 
@@ -747,10 +764,14 @@ int config_load(const char *path, Config *cfg)
             }
             else if (strcmp(key, "debug") == 0)
             {
-                /* Enables the per-event LOG_DEBUG firehose at runtime. */
+                /* Enables the per-event LOG_DEBUG firehose at runtime.
+                 * Staged: applied only when the whole config is accepted. */
                 int on;
                 if (parse_bool(val, &on))
-                    log_set_debug(on);
+                {
+                    cfg->debug_set = 1;
+                    cfg->debug = on;
+                }
                 else
                     log_msg(LOG_ERR,
                             "config_load: invalid debug value (yes|no): %s",
@@ -817,6 +838,13 @@ int config_load(const char *path, Config *cfg)
                     log_msg(LOG_ERR, "config_load: invalid notify_max (>= 1): %s",
                             val);
             }
+            else
+            {
+                /* A typo'd key must be visible: silently ignoring it could
+                 * leave a protection or notification toggle at its default
+                 * while the admin believes it is set. */
+                log_msg(LOG_WARNING, "config_load: unknown setting: %s", key);
+            }
         }
         else if (section == SECTION_DENYLIST)
         {
@@ -839,6 +867,11 @@ int config_load(const char *path, Config *cfg)
         fclose(fp);
         return -1;
     }
+
+    /* Apply the staged [settings] debug only now that the config is
+     * accepted; a refused config leaves the previous logging state. */
+    if (cfg->debug_set)
+        log_set_debug(cfg->debug);
 
     fclose(fp);
     /*
