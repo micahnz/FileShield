@@ -2074,6 +2074,11 @@ typedef struct
      * skipped and the user is prompted for this exact path. */
     int hardlink_event;
 
+    /* Defer mode (events read while another dialog is open): the whole
+     * verdict chain runs, but the ask stage defers instead of showing a
+     * second dialog — the caller queues the event with its fd open. */
+    int defer_on_ask;
+
     /* Requester identity, gathered after the pre-hash deny checks. */
     pid_t ppid;
     char comm[256];
@@ -2863,13 +2868,18 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
 /*
  * Stage 7: no rule matched — rate-limit the dialog flood risk, then ask
  * the user and record their decision.
+ * Returns 1 when the event must defer instead of asking (defer mode: the
+ * caller queues it with its fd open), 0 when the event was decided.
  */
-static void event_ask_user(EventCtx *c)
+static int event_ask_user(EventCtx *c)
 {
+    if (c->defer_on_ask)
+        return 1; /* never a second dialog while another decision is open */
+
     if (dialog_rate_limited(c->binary))
     {
         ctx_respond(c, FAN_DENY);
-        return;
+        return 0;
     }
 
     /* Snapshot the chain before the dialog: an Always/Deny Always decision
@@ -2917,12 +2927,18 @@ static void event_ask_user(EventCtx *c)
         response = record_deny_decision(c, decision);
 
     ctx_respond(c, response);
+    return 0;
 }
 
 /*
  * Full decision path for a FAN_OPEN_PERM event.  Takes ownership of ev->fd:
- * every path responds and closes the event fd (except FAN_NOFD), or (in
- * the pump) defers it.
+ * every path responds and closes the event fd (except FAN_NOFD) — or, in
+ * defer mode, defers the event to the caller when the pipeline reaches the
+ * ask stage (the fd stays open and is queued, never closed).
+ *
+ * Returns 1 when the event was decided here (responded and closed), 0 when
+ * it was deferred in defer mode (fd still open; the caller queues it or
+ * denies fail-closed).
  *
  * The stages below are pure structure: each one was a block inside this
  * function, and every respond/close/cache side effect happens in the
@@ -2951,7 +2967,8 @@ static int run_verdict_stages(EventCtx *c)
     return 0;
 }
 
-static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
+static int process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev,
+                             int defer_on_ask)
 {
     EventCtx c;
     memset(&c, 0, sizeof(c));
@@ -2959,6 +2976,7 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     c.ev = ev;
     c.fd_num = (int)ev->fd;
     c.close_fd = (c.fd_num != FAN_NOFD);
+    c.defer_on_ask = defer_on_ask;
 
     log_msg(LOG_DEBUG, "[event] FAN_OPEN_PERM pid=%d fd=%d",
             (int)ev->pid, c.fd_num);
@@ -2972,12 +2990,17 @@ static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *
     event_gather_identity(&c);
     if (run_verdict_stages(&c))
         goto out;
-    event_ask_user(&c);
+    if (event_ask_user(&c))
+    {
+        free(c.binary);
+        return 0; /* defer mode: fd stays open; the caller queues it */
+    }
 
 out:
     if (c.close_fd)
         close(c.fd_num);
     free(c.binary);
+    return 1;
 }
 
 /*
@@ -3044,12 +3067,15 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
  * Reads all currently available FAN_OPEN_PERM events non-blocking and
  * responds to them:
  *   - Events FROM dialog_child_pid: FAN_ALLOW (dialog needs to open files).
- *   - Events that pass the mount-mark fast-path: FAN_ALLOW.
- *   - Every other permission event: deferred to the replay queue with its
- *     event fd left open (a full queue denies fail-closed) — decided once
- *     the dialog finishes, by fanotify_process_pending in the main loop.
- *     Non-permission events are handled in place; the caller must not
- *     close fan_fd.
+ *   - Direct daemon children (hashing helpers): FAN_ALLOW.
+ *   - Everything else runs the FULL decision pipeline in defer mode: deny
+ *     stages, caches and rule grants decide immediately, so an allowlisted
+ *     or denylisted read never queues behind the open decision.  Only
+ *     events that genuinely need the user are deferred to the replay
+ *     queue with their event fd left open (a full queue denies
+ *     fail-closed) — decided once the dialog finishes by
+ *     fanotify_process_pending in the main loop.  Non-permission events
+ *     are handled in place; the caller must not close fan_fd.
  *
  * Returns number of events responded to.
  */
@@ -3059,6 +3085,13 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
  * when it was deferred to the main loop with its event fd left open.
  * Fail closed: a full pending queue denies rather than hanging the caller.
  */
+
+/* Re-entrancy guard: set while a defer-mode pipeline decision is running
+ * inside the pump.  The decision path itself pumps (hashing helper waits),
+ * and a nested pump must not recurse into the pipeline — it falls back to
+ * the cheap fast-path allow and defers the rest. */
+static int g_pump_in_pipeline = 0;
+
 static int pump_decide_permission(int fan_fd,
                                   const struct fanotify_event_metadata *ev,
                                   pid_t dialog_child_pid)
@@ -3081,41 +3114,46 @@ static int pump_decide_permission(int fan_fd,
                 fd_num, (int)ev->pid);
         allow = 1;
     }
-    else
+    else if (g_pump_in_pipeline)
     {
-        /* Fast path: allow if neither the inode nor the path is
-         * protected. */
+        /* Nested pump (a defer-mode decision is hashing or pumping right
+         * now): do not recurse into the pipeline.  Fall back to the cheap
+         * fast-path allow and defer the rest. */
         struct stat st;
         if (fstat(fd_num, &st) == 0 &&
             !inode_set_contains(st.st_dev, st.st_ino))
         {
             char tgt[PATH_MAX];
-            if (resolve_fd_path(fd_num, tgt, sizeof(tgt)) == 0)
+            if (resolve_fd_path(fd_num, tgt, sizeof(tgt)) == 0 &&
+                !is_path_under_protected(tgt))
             {
-                if (!is_path_under_protected(tgt))
-                {
-                    log_msg(LOG_DEBUG,
-                            "[pump] ALLOW fd=%d pid=%d path=%s (non-protected)",
-                            fd_num, (int)ev->pid, tgt);
-                    allow = 1;
-                }
-                else
-                {
-                    log_msg(LOG_DEBUG,
-                            "[pump] QUEUE fd=%d pid=%d path=%s (protected)",
-                            fd_num, (int)ev->pid, tgt);
-                }
-            }
-            else
-            {
-                /* Cannot resolve the path: treat it as protected and defer
-                 * to the main loop (fail closed), matching the main loop's
-                 * resolve-failure deny. */
                 log_msg(LOG_DEBUG,
-                        "[pump] QUEUE fd=%d pid=%d (path unresolvable)",
-                        fd_num, (int)ev->pid);
+                        "[pump] ALLOW fd=%d pid=%d path=%s (non-protected, "
+                        "nested)",
+                        fd_num, (int)ev->pid, tgt);
+                allow = 1;
             }
         }
+        if (!allow)
+            log_msg(LOG_DEBUG, "[pump] QUEUE fd=%d pid=%d (nested pump)",
+                    fd_num, (int)ev->pid);
+    }
+    else
+    {
+        /* Full pipeline in defer mode: everything decidable without a
+         * dialog decides right now — fast path, config denylist (with its
+         * tripwire), session/runtime denies, file cache, session and
+         * runtime grants, [unsafe_allowlist], pinned [allowlist].  Only
+         * events that genuinely need the user reach the ask stage and are
+         * deferred instead. */
+        int decided;
+        g_pump_in_pipeline = 1;
+        decided = process_open_perm(fan_fd, ev, 1);
+        g_pump_in_pipeline = 0;
+        if (decided)
+            return 1;
+        log_msg(LOG_DEBUG, "[pump] QUEUE fd=%d pid=%d (needs the user)",
+                fd_num, (int)ev->pid);
     }
 
     if (allow)
@@ -3124,6 +3162,8 @@ static int pump_decide_permission(int fan_fd,
         close(fd_num);
         return 1;
     }
+    /* Not allowed and not decided by the pipeline: defer, or deny
+     * fail-closed when the queue is full. */
     if (fanotify_defer_event(ev) == 0)
         return 0; /* deferred; event fd stays open for the main loop */
 
@@ -3315,7 +3355,7 @@ static int fanotify_process_pending(int fan_fd)
         memmove(&g_pending[0], &g_pending[1],
                 sizeof(PendingEvent) * (size_t)(g_pending_count - 1));
         g_pending_count--;
-        process_open_perm(fan_fd, &ev.meta);
+        process_open_perm(fan_fd, &ev.meta, 0);
         processed++;
     }
     return processed;
@@ -3516,7 +3556,7 @@ void fanotify_loop(int fd, int wake_fd)
                 }
                 else if (ev->mask & FAN_OPEN_PERM)
                 {
-                    process_open_perm(fd, ev);
+                    process_open_perm(fd, ev, 0);
                 }
                 else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
                 {

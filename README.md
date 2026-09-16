@@ -384,6 +384,8 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 
 Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]` → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link. For the same reason a **scoped config deny** does not fire on a hard-link open — the resolved path is the unprotected alias, and the daemon cannot tell which protected path the inode belongs to — so the attempt falls through to the always-prompt path rather than `EPERM`; a bare global deny still applies.
 
+While one decision dialog is open, every *other* open still runs the full pipeline immediately: deny rules deny, and cache/session/rule grants allow — only opens that genuinely need the user queue behind the pending decision. A rule-covered read (for example your shell's history file matching an allowlist) therefore never waits behind another secret's prompt.
+
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
 ### Always Allow — runtime dynamic allowlist (persistent)

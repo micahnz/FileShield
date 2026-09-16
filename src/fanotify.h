@@ -66,12 +66,17 @@ void fanotify_clear_marks(int fd);
 /*
  * Drain pending FAN_OPEN_PERM events without blocking.
  * Auto-allows events from the dialog process group (dialog child and its
- * children, e.g. kdialog behind timeout(1)), events from direct daemon
- * children, and non-protected opens.  Events that require a user decision
- * are copied to a deferred queue (their event fd stays open) and are
- * replayed by the main loop once the dialog finishes.  Closing such an
- * event fd instead would leave the caller's open() blocked forever and
- * leak a kernel permission event.
+ * children, e.g. kdialog behind timeout(1)) and events from direct daemon
+ * children.  Every other permission event runs the FULL decision pipeline
+ * in defer mode: deny stages, caches and rule grants decide immediately,
+ * so an allowlisted or denylisted read never queues behind the open
+ * decision.  Only events that genuinely require the user are copied to a
+ * deferred queue (their event fd stays open) and are replayed by the main
+ * loop once the dialog finishes.  Closing such an event fd instead would
+ * leave the caller's open() blocked forever and leak a kernel permission
+ * event.  A nested pump (re-entered from inside a defer-mode decision,
+ * e.g. by a hashing helper wait) falls back to the cheap fast-path allow
+ * and defers the rest instead of recursing into the pipeline.
  * Called by notify.c while waiting for the dialog child to finish.
  * Returns the number of events responded to immediately.
  */

@@ -1642,6 +1642,51 @@ static void test_verdict_stage_order(void) {
 }
 
 /*
+ * Part 0h2: the pump's defer-mode contract.  While another dialog is
+ * open, the pump runs the full pipeline and maps its verdict directly:
+ *   verdict != 0 (a deny or a grant stage decided) -> respond mid-dialog,
+ *   verdict == 0 (the event would reach the ask stage)     -> defer.
+ * Hard-link events therefore always defer (their grants are stripped, so
+ * they always prompt in the main loop), and an allowlisted read never
+ * queues behind the pending decision.  The real pump flag path
+ * (process_open_perm with defer_on_ask) needs a kernel group; this pins
+ * the mapping the pump must not drift from.
+ */
+static void test_pump_defer_contract(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.unsafe_allowlist[0].binary,
+             sizeof(cfg.unsafe_allowlist[0].binary), "/bin/tool");
+    snprintf(cfg.unsafe_allowlist[0].target_path,
+             sizeof(cfg.unsafe_allowlist[0].target_path), "/home/u/secret");
+    cfg.unsafe_allowlist_count = 1;
+    g_config = &cfg;
+    session_clear();
+
+    /* Allowlisted read: decided mid-dialog (granted), never queued. */
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0) == 2,
+           "defer mode: an allowlisted read is decided, not deferred");
+
+    /* Hard-link event: always prompts, so always defers mid-dialog. */
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1) == 0,
+           "defer mode: a hard-link event defers to the main loop");
+
+    /* Recorded session deny: decided mid-dialog (deny wins early). */
+    ASSERT(session_id_of(getpid(), &sid, &start) == 0,
+           "resolve own session");
+    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0) == 1,
+           "defer mode: a session deny decides instead of queueing");
+
+    session_clear();
+    g_config = saved;
+}
+
+/*
  * Part 0i: the dialog rate limiter bounds prompts per binary path and then
  * fails closed (deny) for a cooldown window.
  */
@@ -1667,6 +1712,7 @@ int main(void) {
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_verdict_stage_order();
+    test_pump_defer_contract();
     test_dialog_rate_limiter();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
