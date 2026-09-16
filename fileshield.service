@@ -24,11 +24,17 @@ StateDirectoryMode=0700
 UMask=0077
 RestrictSUIDSGID=yes
 ProtectProc=invisible
-# ProtectHome cannot be enabled: the daemon places fanotify marks on the real
-# /home mount. ProtectHome would create a separate bind-mount namespace, making
-# fanotify_mark() target a shadow mount that user processes never open, so all
-# home-directory marks would be silently ineffective.
-PrivateTmp=yes
+# ProtectHome cannot be enabled: the daemon resolves protected paths inside
+# the service's mount namespace, and ProtectHome=yes substitutes empty shadow
+# directories there, so marks would target shadow inodes instead of the real
+# files.  Mount-namespace sandboxing in general is fine (ProtectSystem=,
+# ProtectProc=): the daemon marks the filesystem superblock
+# (FAN_MARK_FILESYSTEM), which is shared across mount namespaces, and only
+# falls back to namespace-local mount marks where the kernel or filesystem
+# does not support it.
+#
+# PrivateTmp cannot be enabled either: it hides /tmp/.X11-unix from the
+# dialog child on X11 desktops, and the daemon never uses /tmp itself.
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
