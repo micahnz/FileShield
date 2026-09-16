@@ -25,8 +25,19 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
 void fanotify_loop(int fd);
 
-/* Non-zero when at least one file/directory or mount mark is active. */
+/* Non-zero when at least one file/directory or filesystem/mount mark is active. */
 int fanotify_any_mark_active(void);
+
+/*
+ * Scope guard: refuse a configuration whose own state directory or config
+ * file could be intercepted by the marks it would install (the
+ * self-deadlock class).  Runs against the currently published g_config;
+ * returns 0 to proceed, -1 to refuse.
+ */
+int fanotify_scope_guard(const char *config_path);
+
+/* Print the marks a config would install, without touching the kernel. */
+void fanotify_dry_run(const Config *cfg);
 
 /*
  * Event mask used for file and directory marks.  Directory-entry events

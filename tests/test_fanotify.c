@@ -1394,10 +1394,49 @@ static void test_mark_paths(void) {
     }
 }
 
+/*
+ * Part 0e: the scope guard refuses configurations whose own state or config
+ * files the installed marks would intercept (self-deadlock class).
+ */
+static void test_scope_guard(void) {
+    static Config cfg;
+    Config *saved = g_config;
+
+    /* Containment: the state directory is protected. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "%s",
+             PERSIST_STATE_DIR);
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-nonexistent.conf") == -1,
+           "scope guard refuses a protected state directory");
+
+    /* Containment: the config file is inside a protected path. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "/tmp/scope-guard-test");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-test/fileshield.conf") == -1,
+           "scope guard refuses a config under a protected path");
+
+    /* Benign: the protected path is on a different mount than the state
+     * directory and the config. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "/dev");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-test.conf") == 0,
+           "scope guard accepts a benign config");
+
+    g_config = saved;
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
+    test_scope_guard();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();

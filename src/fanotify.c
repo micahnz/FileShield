@@ -1188,6 +1188,213 @@ static int is_path_under_protected(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
+/*  scope guard and dry run                                            */
+/* ------------------------------------------------------------------ */
+/*
+ * Fail closed when the daemon's own config or state files could be
+ * intercepted by the marks it is about to install:
+ *
+ *  - Containment: the file lies under a protected path, so an inode mark
+ *    (inodes are shared across namespaces) would fire for the daemon's
+ *    own open and deadlock it.  Always checked.
+ *  - Mount: the file lies on a mount that will be mount-marked.  With the
+ *    daemon in a private mount namespace its own opens traverse
+ *    namespace-local mounts, which init-namespace marks cannot reach
+ *    (Option B), so this is checked only when mounts are shared
+ *    (unsandboxed runs and the Option A fallback).
+ */
+static int in_init_mount_ns(void)
+{
+    struct stat self_ns;
+    struct stat init_ns;
+
+    if (stat("/proc/self/ns/mnt", &self_ns) != 0 ||
+        stat("/proc/1/ns/mnt", &init_ns) != 0)
+        return 1; /* cannot tell: assume shared, apply the strict guard */
+    return self_ns.st_ino == init_ns.st_ino &&
+           self_ns.st_dev == init_ns.st_dev;
+}
+
+/* Init-namespace mount that would be marked for `path` (the nearest
+ * existing ancestor when it does not exist yet).  0 when unknown. */
+static unsigned long long mark_target_mount_id(const char *path)
+{
+    char buf[PATH_MAX];
+    struct stat st;
+
+    snprintf(buf, sizeof(buf), "%s", path);
+    if (stat(buf, &st) == 0)
+        return mount_id_of(buf);
+
+    char *slash;
+    while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
+    {
+        *slash = '\0';
+        if (stat(buf, &st) == 0)
+            return mount_id_of(buf);
+    }
+    if (stat("/", &st) == 0)
+        return mount_id_of("/");
+    return 0;
+}
+
+int fanotify_scope_guard(const char *config_path)
+{
+    if (!g_config)
+        return -1;
+
+    /* 1. Containment: inode marks reach every namespace. */
+    if (config_path && config_path[0] &&
+        is_path_under_protected(config_path))
+    {
+        log_msg(LOG_ERR,
+                "scope guard: config %s is inside a protected path; the "
+                "daemon would deadlock on its own open",
+                config_path);
+        return -1;
+    }
+    if (is_path_under_protected(PERSIST_STATE_DIR))
+    {
+        log_msg(LOG_ERR,
+                "scope guard: state directory %s is inside a protected "
+                "path; the daemon would deadlock on its own open",
+                PERSIST_STATE_DIR);
+        return -1;
+    }
+
+    /* 2. Mount collision: only possible when mounts are shared. */
+    if (!in_init_mount_ns())
+    {
+        log_msg(LOG_DEBUG,
+                "scope guard: private mount namespace; mount marks cannot "
+                "reach the daemon's own opens");
+        return 0;
+    }
+
+    unsigned long long state_id = mark_target_mount_id(PERSIST_STATE_DIR);
+    unsigned long long config_id =
+        (config_path && config_path[0]) ? mark_target_mount_id(config_path) : 0;
+
+    if (state_id == 0 && config_id == 0)
+        log_msg(LOG_WARNING,
+                "scope guard: mount IDs unavailable (statx); mount-scope "
+                "collisions could not be verified");
+
+    for (int i = 0; i < g_config->protected_count; i++)
+    {
+        const ProtectedPath *pp = &g_config->protected[i];
+        char base[PATH_MAX];
+        const char *target = pp->path;
+        unsigned long long id;
+
+        if (pp->is_exclude)
+            continue;
+        if (pp->is_glob)
+        {
+            if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
+                continue;
+            memcpy(base, pp->path, (size_t)pp->base_len);
+            base[pp->base_len] = '\0';
+            target = base;
+        }
+
+        id = mark_target_mount_id(target);
+        if (id == 0)
+            continue;
+        if (state_id != 0 && id == state_id)
+        {
+            log_msg(LOG_ERR,
+                    "scope guard: state directory %s shares mount %llu "
+                    "with protected path %s; the daemon would deadlock on "
+                    "its own open",
+                    PERSIST_STATE_DIR, id, target);
+            return -1;
+        }
+        if (config_id != 0 && id == config_id)
+        {
+            log_msg(LOG_ERR,
+                    "scope guard: config %s shares mount %llu with "
+                    "protected path %s; the daemon would deadlock on its "
+                    "own open",
+                    config_path, id, target);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Print the marks a config would install, without touching the kernel. */
+void fanotify_dry_run(const Config *cfg)
+{
+    printf("fileshield dry run: %d entries (%d exclusions)\n",
+           cfg->protected_count, cfg->exclude_count);
+
+    for (int i = 0; i < cfg->protected_count; i++)
+    {
+        const ProtectedPath *pp = &cfg->protected[i];
+        char base[PATH_MAX];
+        char ns_path[PATH_MAX];
+        const char *target = pp->path;
+        struct stat st;
+
+        if (pp->is_exclude)
+        {
+            printf("  exclusion  : %s\n", pp->path);
+            continue;
+        }
+        if (pp->is_glob)
+        {
+            if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
+            {
+                printf("  invalid    : %s (glob base too long)\n", pp->path);
+                continue;
+            }
+            memcpy(base, pp->path, (size_t)pp->base_len);
+            base[pp->base_len] = '\0';
+            target = base;
+            printf("  glob base  : %s (pattern %s)\n", base, pp->path);
+        }
+
+        if (stat(target, &st) == 0)
+        {
+            printf("  inode mark : %s\n", target);
+            if (mark_path_for(target, ns_path, sizeof(ns_path)) == 0)
+            {
+                unsigned long long id = mount_id_of(target);
+
+                printf("  mount mark : %s -> %s (mount %llu)%s\n", target,
+                       ns_path, id,
+                       id == 0 ? " [mount ID unavailable; run as root to "
+                                 "verify mount scope]"
+                               : "");
+            }
+        }
+        else
+        {
+            char buf[PATH_MAX];
+            char *slash;
+            int found = 0;
+
+            snprintf(buf, sizeof(buf), "%s", target);
+            while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
+            {
+                *slash = '\0';
+                struct stat ast;
+                if (stat(buf, &ast) == 0)
+                {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                snprintf(buf, sizeof(buf), "/");
+            printf("  mount mark : (missing %s) covered via %s\n", target,
+                   buf);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  mark bookkeeping                                                  */
 /* ------------------------------------------------------------------ */
 /*

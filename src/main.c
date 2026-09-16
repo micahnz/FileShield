@@ -42,6 +42,7 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -f, --foreground    Run in foreground (do not daemonize)\n");
     fprintf(stderr, "  -c, --config PATH   Config file path (default: %s)\n", DEFAULT_CONFIG);
     fprintf(stderr, "  -d, --debug         Log per-event debug details\n");
+    fprintf(stderr, "  -n, --dry-run       Print the marks the config would install, then exit\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
 
@@ -187,17 +188,27 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         return 0;
     }
 
+    /* Publish the new config before anything consults it: both the scope
+     * guard and the inode walk read g_config, and no event is processed
+     * until this function returns. */
+    g_config = new_cfg;
+
+    if (fanotify_scope_guard(config_path) < 0)
+    {
+        log_msg(LOG_ERR,
+                "reload rejected by the scope guard; keeping old config");
+        g_config = *cfg;
+        free(new_cfg);
+        load_persisted_state();
+        load_pin_state();
+        cache_expire();
+        return 0;
+    }
+
     /* clear_marks() removes every mark the daemon installed (including
      * auto-added directory marks) with the exact masks they were added
      * with, so the new config rebuilds the mark set from scratch. */
     fanotify_clear_marks(fan_fd);
-
-    /* Publish the new config before installing its marks: the inode walk
-     * consults the exclusion list through g_config while it records
-     * protected inodes, so a stale config would mis-record them after an
-     * exclusion changes.  No event is processed until this function
-     * returns, so the window is safe. */
-    g_config = new_cfg;
 
     int skipped = 0;
     int failures = install_marks(fan_fd, new_cfg, "reload", &skipped);
@@ -259,16 +270,18 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
 int main(int argc, char *argv[])
 {
     const char *config_path = DEFAULT_CONFIG;
+    int dry_run = 0;
 
     static struct option long_opts[] = {
         {"foreground", no_argument, 0, 'f'},
         {"config", required_argument, 0, 'c'},
         {"debug", no_argument, 0, 'd'},
+        {"dry-run", no_argument, 0, 'n'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "fc:dh", long_opts, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "fc:dhn", long_opts, NULL)) != -1)
     {
         switch (opt)
         {
@@ -280,6 +293,9 @@ int main(int argc, char *argv[])
             break;
         case 'd':
             log_set_debug(1);
+            break;
+        case 'n':
+            dry_run = 1;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -305,6 +321,18 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     g_config = cfg;
+
+    if (dry_run)
+    {
+        int guard = fanotify_scope_guard(config_path);
+
+        printf("scope guard: %s\n", guard == 0 ? "ok" : "REFUSED");
+        fanotify_dry_run(cfg);
+        config_reset(cfg);
+        free(cfg);
+        closelog();
+        return guard == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
 
     if (!g_foreground)
     {
@@ -354,6 +382,17 @@ int main(int argc, char *argv[])
         closelog();
         return EXIT_FAILURE;
     }
+    /* Refuse a config whose own state/config files the marks would
+     * intercept (self-deadlock class). */
+    if (fanotify_scope_guard(config_path) < 0)
+    {
+        close(fan_fd);
+        config_reset(cfg);
+        free(cfg);
+        closelog();
+        return EXIT_FAILURE;
+    }
+
     int mark_skipped = 0;
 
     /* Load persisted "Always Allow"/"Always Deny" entries and the hash
