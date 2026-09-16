@@ -178,6 +178,11 @@ static int test_persist_load_nonexistent(void)
     int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
     ASSERT(n == 0, "load nonexistent returns 0");
 
+    /* A directory opens read-only but cannot be read: the read error must
+     * fail the load so the caller clears the in-memory list. */
+    ASSERT(persist_load(g_test_dir, out, PERSIST_MAX_ENTRIES) == -1,
+           "directory state path fails the load");
+
     TEST_PASS("load nonexistent file");
     return 0;
 }

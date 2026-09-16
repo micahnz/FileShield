@@ -192,6 +192,13 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
      * with, so the new config rebuilds the mark set from scratch. */
     fanotify_clear_marks(fan_fd);
 
+    /* Publish the new config before installing its marks: the inode walk
+     * consults the exclusion list through g_config while it records
+     * protected inodes, so a stale config would mis-record them after an
+     * exclusion changes.  No event is processed until this function
+     * returns, so the window is safe. */
+    g_config = new_cfg;
+
     int skipped = 0;
     int failures = install_marks(fan_fd, new_cfg, "reload", &skipped);
 
@@ -211,6 +218,14 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
                 failures, new_cfg->protected_count - new_cfg->exclude_count,
                 new_cfg->exclude_count);
 
+        /* Rebuild from a clean slate: the partially installed new marks
+         * must be removed before the previous set is restored, and the
+         * old config has to be published first so the rollback walk
+         * records inodes against the old exclusion list.  g_config never
+         * points at new_cfg after it is freed below. */
+        fanotify_clear_marks(fan_fd);
+        g_config = *cfg;
+
         int rollback_skipped = 0;
         if (install_marks(fan_fd, *cfg, "rollback", &rollback_skipped) > 0)
         {
@@ -218,11 +233,6 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
             g_fatal = 1;
         }
 
-        /* Republish the old config defensively: g_config must never
-         * point at new_cfg after it is freed below.  config_load() no
-         * longer publishes, but keep this explicit so a future refactor
-         * cannot reintroduce the use-after-free. */
-        g_config = *cfg;
         free(new_cfg);
 
         load_persisted_state();
