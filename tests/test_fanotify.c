@@ -1268,6 +1268,108 @@ static void test_defer_flush_contract(void) {
 }
 
 /*
+ * Part 1c: a response the kernel refuses must be queued with its event fd
+ * kept open and delivered later — closing the fd would leave the caller's
+ * open() blocked until group close, where the kernel auto-allows it.
+ * A full non-blocking pipe reproduces the transient EAGAIN failure
+ * deterministically.
+ */
+static void test_respond_failure_retry(void) {
+    /* Warm up syslog before fd juggling (same reason as Part 1). */
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create response pipe");
+    int fl = fcntl(group[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the response pipe write end non-blocking");
+    int flr = fcntl(group[0], F_GETFL, 0);
+    ASSERT(flr >= 0 && fcntl(group[0], F_SETFL, flr | O_NONBLOCK) == 0,
+           "make the response pipe read end non-blocking");
+
+    char filler[4096];
+    memset(filler, 0, sizeof(filler));
+    char drain_buf[4096];
+
+    /* --- 1: queued response is delivered by the retry path --------- */
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    ASSERT(errno == EAGAIN, "response pipe is full");
+
+    int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd >= 0, "open event fd");
+    struct fanotify_event_metadata ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = efd;
+    ev.pid = (int)getpid();
+    ASSERT(fanotify_defer_event(&ev) == 0, "defer the event");
+
+    fanotify_flush_pending(group[1]);
+    ASSERT(fcntl(efd, F_GETFD) != -1,
+           "event fd stays open while the response is queued");
+
+    /* Free the pipe, then force the shutdown drain: the queued DENY must
+     * be delivered and the event fd closed. */
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    fanotify_drain_and_deny(group[1]);
+
+    struct fanotify_response resp;
+    ssize_t got = read(group[0], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp), "queued response was delivered");
+    ASSERT(resp.fd == efd && resp.response == FAN_DENY,
+           "delivered response is the queued DENY");
+    ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+           "event fd closed after the retry delivered the response");
+
+    /* --- 2: if the write still fails at shutdown, the event must be
+     * released (fd closed, queue emptied) rather than leaked ---------- */
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    int efd2 = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd2 >= 0, "open second event fd");
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = efd2;
+    ev.pid = (int)getpid();
+    ASSERT(fanotify_defer_event(&ev) == 0, "defer the second event");
+
+    fanotify_flush_pending(group[1]);
+    ASSERT(fcntl(efd2, F_GETFD) != -1, "second event fd stays open");
+    fanotify_drain_and_deny(group[1]); /* stored and forced DENY both fail */
+    ASSERT(fcntl(efd2, F_GETFD) == -1 && errno == EBADF,
+           "shutdown releases the event fd even when nothing can be written");
+
+    /* --- 3: delivery works again on a healthy pipe (queue is empty) -- */
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    int efd3 = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd3 >= 0, "open third event fd");
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = efd3;
+    ev.pid = (int)getpid();
+    ASSERT(fanotify_defer_event(&ev) == 0, "defer the third event");
+
+    fanotify_flush_pending(group[1]);
+    got = read(group[0], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd3 &&
+               resp.response == FAN_DENY,
+           "a healthy pipe delivers directly again");
+    ASSERT(fcntl(efd3, F_GETFD) == -1, "third event fd closed");
+
+    close(group[0]);
+    close(group[1]);
+}
+
+/*
  * Part 2: real kernel fanotify group, no FAN_UNLIMITED_QUEUE.  Open 20000
  * distinct files under one marked directory without draining; the kernel
  * default queue holds 16384 events, so saturation is guaranteed and the
@@ -1889,6 +1991,7 @@ int main(void) {
     test_cmdline_scoping();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
+    test_respond_failure_retry();
     test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
     pin_fixture_cleanup();

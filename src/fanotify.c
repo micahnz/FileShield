@@ -40,6 +40,10 @@ static const ProtectedPath *exclusion_match(const char *path);
 static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
                             unsigned int response);
 
+/* Defined with fanotify_respond; the pump and the main loop retry queued
+ * responses. */
+static void unanswered_retry(int fan_fd);
+
 /* ------------------------------------------------------------------ */
 /*  proc helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -2145,6 +2149,12 @@ typedef struct
     int fd_num;
     int close_fd; /* 0 only for FAN_NOFD: there is no descriptor to close */
 
+    /* Set when the decision response could not be written and was queued
+     * for retry: the event fd must stay open (a closed fd cannot be
+     * answered, and the kernel would auto-allow the event on group
+     * close), so the out path skips the close. */
+    int keep_event_fd;
+
     char *binary;          /* /proc/<pid>/exe, malloc'd (freed at out) */
     char target[PATH_MAX]; /* /proc/self/fd/<fd> resolved path         */
     dev_t ev_dev;
@@ -2336,6 +2346,17 @@ static const char *event_cmdline_fp(EventCtx *c)
 }
 
 /*
+ * Deliver one decision through fanotify_respond() and note when the
+ * response was queued for retry, so process_open_perm() leaves the event
+ * fd open for the retry to answer.
+ */
+static void respond_event(EventCtx *c, unsigned int response)
+{
+    if (fanotify_respond(c->fan_fd, c->ev, response) == -1)
+        c->keep_event_fd = 1;
+}
+
+/*
  * Every deciding stage funnels through here so the dedup-cache insert
  * and the kernel response always happen together, in that order.
  */
@@ -2347,7 +2368,7 @@ static void ctx_respond(EventCtx *c, unsigned int response)
     if (c->binary && c->have_pid_start && c->have_ev_stat)
         recent_cache_insert(c->ev->pid, c->pid_start, c->binary, c->ev_dev,
                             c->ev_ino, c->target, (int)response);
-    fanotify_respond(c->fan_fd, c->ev, response);
+    respond_event(c, response);
 }
 
 /*
@@ -2361,7 +2382,7 @@ static int event_resolve(EventCtx *c)
     {
         log_msg(LOG_WARNING, "[event] FAN_NOFD for pid=%d, denying",
                 (int)c->ev->pid);
-        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        respond_event(c, FAN_DENY);
         return 1;
     }
 
@@ -2370,7 +2391,7 @@ static int event_resolve(EventCtx *c)
         log_msg(LOG_WARNING,
                 "[event] resolve_fd_path failed for pid=%d fd=%d, denying",
                 (int)c->ev->pid, c->fd_num);
-        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        respond_event(c, FAN_DENY);
         return 1;
     }
     /* Compute the protected-prefix verdict once; three later stages use it. */
@@ -2410,7 +2431,7 @@ static int event_fastpath(EventCtx *c)
     {
         log_msg(LOG_DEBUG, "[fast-path] ALLOW pid=%d target=%s (mount-mark noise)",
                 (int)c->ev->pid, c->target);
-        fanotify_respond(c->fan_fd, c->ev, FAN_ALLOW);
+        respond_event(c, FAN_ALLOW);
         return 1;
     }
 
@@ -2433,7 +2454,7 @@ static int event_load_binary(EventCtx *c)
     c->binary = proc_exe_path(c->ev->pid);
     if (!c->binary)
     {
-        fanotify_respond(c->fan_fd, c->ev, FAN_DENY);
+        respond_event(c, FAN_DENY);
         return 1;
     }
 
@@ -2506,7 +2527,7 @@ static int event_dedup(EventCtx *c)
             "[dedup] reusing cached decision=%s for pid=%d binary=%s target=%s",
             cached == (int)FAN_ALLOW ? "ALLOW" : "DENY", (int)c->ev->pid,
             c->binary, c->target);
-    fanotify_respond(c->fan_fd, c->ev, (unsigned int)cached);
+    respond_event(c, (unsigned int)cached);
     return 1;
 }
 
@@ -3138,7 +3159,7 @@ static int process_open_perm(int fan_fd, const struct fanotify_event_metadata *e
     }
 
 out:
-    if (c.close_fd)
+    if (c.close_fd && !c.keep_event_fd)
         close(c.fd_num);
     free(c.binary);
     return 1;
@@ -3301,7 +3322,8 @@ static int pump_decide_permission(int fan_fd,
 
     if (allow)
     {
-        fanotify_respond(fan_fd, ev, FAN_ALLOW);
+        if (fanotify_respond(fan_fd, ev, FAN_ALLOW) == -1)
+            return 1; /* queued for retry; the event fd stays open */
         close(fd_num);
         return 1;
     }
@@ -3312,7 +3334,8 @@ static int pump_decide_permission(int fan_fd,
 
     log_msg(LOG_WARNING, "[pump] pending queue full; denying fd=%d pid=%d",
             fd_num, (int)ev->pid);
-    fanotify_respond(fan_fd, ev, FAN_DENY);
+    if (fanotify_respond(fan_fd, ev, FAN_DENY) == -1)
+        return 1; /* queued for retry; the event fd stays open */
     close(fd_num);
     return 1;
 }
@@ -3323,6 +3346,10 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
     int responded = 0;
+
+    /* Deliver any responses the queue is holding; a failed response must
+     * not wait for the main loop while a dialog blocks it. */
+    unanswered_retry(fan_fd);
 
     while (1)
     {
@@ -3442,49 +3469,172 @@ void fanotify_clear_marks(int fd)
     log_msg(LOG_INFO, "marks and inode table cleared");
 }
 
-static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
-                            unsigned int response)
+/*
+ * Responses whose kernel write failed are queued with their event fd
+ * still open: closing the fd does not answer a permission event, and
+ * close(fan_fd) would auto-ALLOW it.  The main loop and the pump retry
+ * the queue; fanotify_drain_and_deny() forces a final DENY before
+ * close(fan_fd) on shutdown.
+ */
+#define UNANSWERED_MAX 64
+
+typedef struct
+{
+    int fd;                            /* kernel event fd, kept open   */
+    struct fanotify_event_metadata ev; /* its metadata (ev.fd == fd)   */
+    unsigned int response;             /* decision still to deliver    */
+} UnansweredEvent;
+
+static UnansweredEvent g_unanswered[UNANSWERED_MAX];
+static int g_unanswered_count = 0;
+
+/* Raw response write: 0 delivered, 1 already answered, -1 failed. */
+static int write_response(int fan_fd, int event_fd, unsigned int response)
 {
     struct fanotify_response resp;
 
-    resp.fd = ev->fd;
+    resp.fd = event_fd;
     resp.response = response;
     ssize_t total = 0;
     while (total < (ssize_t)sizeof(resp))
     {
-        ssize_t w = write(fd, (char *)&resp + total, sizeof(resp) - (size_t)total);
+        ssize_t w = write(fan_fd, (char *)&resp + total,
+                          sizeof(resp) - (size_t)total);
         if (w < 0)
         {
             if (errno == EINTR)
                 continue;
+            /* "response for this fd has already been written". */
             if (errno == ENOENT)
-            {
-                /* The kernel reports "response for this fd has already
-                 * been written" when a decision was already delivered
-                 * (e.g. a duplicate deferred event); not fatal. */
-                log_msg(LOG_WARNING,
-                        "fanotify write response: already answered");
-                return -1;
-            }
-            if (errno == EAGAIN)
-            {
-                /* Transient non-blocking mode; the caller may retry. */
-                log_msg(LOG_WARNING, "fanotify write response: would block");
-                return -1;
-            }
-            log_msg(LOG_ERR, "fanotify write response: %s", strerror(errno));
-            g_fatal = 1; /* the group cannot deliver decisions; restart */
+                return 1;
             return -1;
         }
         if (w == 0)
-        {
-            log_msg(LOG_ERR, "fanotify write response: zero-length write");
-            g_fatal = 1;
             return -1;
-        }
         total += w;
     }
     return 0;
+}
+
+/* Drop one queue slot, closing its (still open) event fd. */
+static void unanswered_drop(int idx)
+{
+    close(g_unanswered[idx].fd);
+    memmove(&g_unanswered[idx], &g_unanswered[idx + 1],
+            sizeof(UnansweredEvent) *
+                (size_t)(g_unanswered_count - idx - 1));
+    g_unanswered_count--;
+}
+
+/* Queue one failed response; the caller keeps the event fd open.
+ * Returns 0 when queued, -1 when the queue is full. */
+static int unanswered_add(int event_fd,
+                          const struct fanotify_event_metadata *ev,
+                          unsigned int response)
+{
+    UnansweredEvent *u;
+
+    if (g_unanswered_count >= UNANSWERED_MAX)
+        return -1;
+    u = &g_unanswered[g_unanswered_count++];
+    u->fd = event_fd;
+    u->ev = *ev;
+    u->response = response;
+    return 0;
+}
+
+/*
+ * Deliver queued responses.  Entries whose write still fails stay queued
+ * for the next attempt; a delivered or already-answered event has its
+ * event fd closed and its slot dropped.
+ */
+static void unanswered_retry(int fan_fd)
+{
+    for (int i = 0; i < g_unanswered_count;)
+    {
+        UnansweredEvent *u = &g_unanswered[i];
+        int rc = write_response(fan_fd, u->fd, u->response);
+
+        if (rc < 0)
+        {
+            i++;
+            continue;
+        }
+        log_msg(LOG_INFO, "fanotify response retry: fd %d %s", u->fd,
+                rc == 1 ? "was already answered" : "answered");
+        unanswered_drop(i);
+    }
+}
+
+/*
+ * Shutdown: deliver everything still queued, forcing DENY when the
+ * original response cannot be written.  Runs before close(fan_fd),
+ * after which the kernel would auto-ALLOW every outstanding event.
+ */
+static void unanswered_flush(int fan_fd)
+{
+    while (g_unanswered_count > 0)
+    {
+        UnansweredEvent *u = &g_unanswered[0];
+        int rc = write_response(fan_fd, u->fd, u->response);
+
+        if (rc < 0)
+        {
+            log_msg(LOG_WARNING,
+                    "fanotify response retry failed for fd %d; forcing DENY",
+                    u->fd);
+            rc = write_response(fan_fd, u->fd, FAN_DENY);
+        }
+        if (rc < 0)
+            log_msg(LOG_ERR,
+                    "fanotify response could not be delivered for fd %d; "
+                    "the kernel will allow it when the group closes",
+                    u->fd);
+        unanswered_drop(0);
+    }
+}
+
+/*
+ * Respond to one event through the group fd.
+ * Returns 0 when the response was delivered (or already delivered), so
+ * the caller may close the event fd; -1 when the write failed and the
+ * response was queued for retry, so the caller must keep the event fd
+ * open; -2 when it could not even be queued (the caller closes the fd;
+ * the group is marked fatal and the supervisor restarts the daemon).
+ */
+static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev,
+                            unsigned int response)
+{
+    int rc = write_response(fan_fd, (int)ev->fd, response);
+
+    if (rc == 0)
+        return 0;
+    if (rc == 1)
+    {
+        /* The kernel reports "response for this fd has already been
+         * written" when a decision was already delivered (e.g. a
+         * duplicate deferred event); not fatal. */
+        log_msg(LOG_WARNING, "fanotify write response: already answered");
+        return 0;
+    }
+
+    int err = errno;
+    if (unanswered_add((int)ev->fd, ev, response) == 0)
+    {
+        log_msg(LOG_WARNING,
+                "fanotify write response: %s; response queued for retry",
+                strerror(err));
+        if (err != EAGAIN)
+            g_fatal = 1; /* the group cannot deliver decisions; restart */
+        return -1;
+    }
+
+    log_msg(LOG_ERR,
+            "fanotify write response: %s and the retry queue is full; the "
+            "event cannot be answered (the kernel auto-allows it on group "
+            "close)", strerror(err));
+    g_fatal = 1;
+    return -2;
 }
 
 /* Decide all permission events that fanotify_pump() had to defer. */
@@ -3504,17 +3654,24 @@ static int fanotify_process_pending(int fan_fd)
     return processed;
 }
 
-/* Deny and close every deferred event (reload/shutdown, fail closed). */
+/* Deny every deferred event (reload/shutdown/overflow, fail closed).  A
+ * response that cannot be written is queued for retry and its event fd
+ * stays open; the retry/flush paths answer it later. */
 void fanotify_flush_pending(int fan_fd)
 {
+    int kept = 0;
+
     for (int i = 0; i < g_pending_count; i++)
     {
-        fanotify_respond(fan_fd, &g_pending[i].meta, FAN_DENY);
-        close((int)g_pending[i].meta.fd);
+        if (fanotify_respond(fan_fd, &g_pending[i].meta, FAN_DENY) == -1)
+            kept++; /* queued for retry; the event fd stays open */
+        else
+            close((int)g_pending[i].meta.fd);
     }
     if (g_pending_count > 0)
-        log_msg(LOG_WARNING, "denied %d pending permission events",
-                g_pending_count);
+        log_msg(LOG_WARNING,
+                "denied %d pending permission events (%d queued for retry)",
+                g_pending_count - kept, kept);
     g_pending_count = 0;
 }
 
@@ -3533,6 +3690,11 @@ void fanotify_drain_and_deny(int fan_fd)
     char buf[BUF_SIZE]
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
     int denied = 0;
+
+    /* First deliver anything the retry queue is still holding, forcing
+     * DENY when the original response cannot be written: after
+     * close(fan_fd) the kernel would allow those events. */
+    unanswered_flush(fan_fd);
 
     while (1)
     {
@@ -3572,7 +3734,11 @@ void fanotify_drain_and_deny(int fan_fd)
             {
                 log_msg(LOG_DEBUG, "[drain] DENY fd=%d pid=%d (shutdown)",
                         (int)ev->fd, (int)ev->pid);
-                fanotify_respond(fan_fd, ev, FAN_DENY);
+                if (write_response(fan_fd, (int)ev->fd, FAN_DENY) < 0)
+                    log_msg(LOG_ERR,
+                            "fanotify drain: response failed for fd %d; the "
+                            "kernel will allow it when the group closes",
+                            (int)ev->fd);
                 close((int)ev->fd);
                 denied++;
             }
@@ -3617,6 +3783,10 @@ void fanotify_loop(int fd, int wake_fd)
 
     while (g_running && !g_need_reload)
     {
+        /* Retry responses whose kernel write failed earlier. */
+        if (g_unanswered_count > 0)
+            unanswered_retry(fd);
+
         /* Replay events deferred while a dialog was open. */
         if (g_pending_count > 0)
         {
@@ -3639,8 +3809,11 @@ void fanotify_loop(int fd, int wake_fd)
             nfds++;
         }
 
+        /* A queued response needs periodic retries even on an otherwise
+         * idle filesystem; the fanotify poll() does not report POLLOUT. */
+        int poll_timeout = (g_unanswered_count > 0) ? 250 : -1;
         int pr;
-        while ((pr = poll(pfds, nfds, -1)) < 0 && errno == EINTR)
+        while ((pr = poll(pfds, nfds, poll_timeout)) < 0 && errno == EINTR)
             ; /* handler-set flags are re-checked by the outer while */
         if (pr <= 0)
             continue;

@@ -91,9 +91,12 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid);
 int fanotify_defer_event(const struct fanotify_event_metadata *ev);
 
 /*
- * Deny and close every deferred permission event.  Called when the
- * kernel reports FAN_Q_OVERFLOW (saturation) and on config reload and
- * shutdown; fail closed.
+ * Deny every deferred permission event.  Called when the kernel reports
+ * FAN_Q_OVERFLOW (saturation) and on config reload and shutdown; fail
+ * closed.  A response whose write fails is queued for retry with its
+ * event fd kept open (see fanotify_respond): the retry loop or the
+ * shutdown drain answers it later, and only events that could not be
+ * written are left open; everything else is denied and closed here.
  */
 void fanotify_flush_pending(int fan_fd);
 
@@ -102,6 +105,8 @@ void fanotify_flush_pending(int fan_fd);
  * Must run before close(fan_fd) on shutdown: the kernel responds
  * FAN_ALLOW to outstanding permission events when the group fd is
  * closed, so the queue has to be drained and denied first (fail closed).
+ * Responses still held by the retry queue are delivered (or forced to
+ * DENY) before the kernel drain.
  */
 void fanotify_drain_and_deny(int fan_fd);
 
