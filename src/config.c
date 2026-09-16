@@ -720,13 +720,23 @@ int config_load(const char *path, Config *cfg)
         }
     }
 
+    if (ferror(fp))
+    {
+        log_msg(LOG_ERR, "config_load: read error on %s; refusing the config",
+                path);
+        fclose(fp);
+        return -1;
+    }
+
     fclose(fp);
     /*
      * Deliberately do NOT publish cfg through g_config here.  The caller
      * decides whether the parsed config is accepted; publishing during
      * the parse is what once left g_config dangling after a rejected
-     * reload free()d the new config.  main.c sets g_config only after the
-     * config is accepted and its marks are installed.
+     * reload free()d the new config.  main.c publishes g_config only
+     * after the parse succeeds - before the new marks are installed,
+     * because the inode walk consults it - and restores the previous
+     * config when a reload is rejected.
      */
     return 0;
 }

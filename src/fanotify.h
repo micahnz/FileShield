@@ -25,8 +25,19 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
 void fanotify_loop(int fd);
 
-/* Non-zero when at least one file/directory or mount mark is active. */
+/* Non-zero when at least one file/directory or filesystem/mount mark is active. */
 int fanotify_any_mark_active(void);
+
+/*
+ * Scope guard: refuse a configuration whose own state directory or config
+ * file could be intercepted by the marks it would install (the
+ * self-deadlock class).  Runs against the currently published g_config;
+ * returns 0 to proceed, -1 to refuse.
+ */
+int fanotify_scope_guard(const char *config_path);
+
+/* Print the marks a config would install, without touching the kernel. */
+void fanotify_dry_run(const Config *cfg);
 
 /*
  * Event mask used for file and directory marks.  Directory-entry events
@@ -70,6 +81,14 @@ int fanotify_defer_event(const struct fanotify_event_metadata *ev);
  * shutdown; fail closed.
  */
 void fanotify_flush_pending(int fan_fd);
+
+/*
+ * Deny and close every FAN_OPEN_PERM event still queued in the kernel.
+ * Must run before close(fan_fd) on shutdown: the kernel responds
+ * FAN_ALLOW to outstanding permission events when the group fd is
+ * closed, so the queue has to be drained and denied first (fail closed).
+ */
+void fanotify_drain_and_deny(int fan_fd);
 
 /*
  * Dynamic allowlist / denylist persistence: load root-only state files
@@ -177,5 +196,14 @@ int fanotify_test_resolve_path(int fd, char *out, size_t outsz);
  * same process.  Used by test_fanotify without a kernel permission event.
  */
 int fanotify_test_unsafe_first_hit(pid_t pid);
+
+/*
+ * Test seams: init-namespace mount-mark plumbing.  fanotify_test_mark_path()
+ * builds "/proc/1/root" + path (0 on success, -1 when it does not fit);
+ * fanotify_test_mount_id() returns the init-namespace mount ID of the mount
+ * containing path, or 0 when statx(STATX_MNT_ID) is unavailable.
+ */
+int fanotify_test_mark_path(const char *path, char *out, size_t outsz);
+unsigned long long fanotify_test_mount_id(const char *path);
 
 #endif

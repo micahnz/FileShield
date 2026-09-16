@@ -29,6 +29,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <sys/fanotify.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1360,9 +1361,151 @@ cleanup:
     close(fd);
 }
 
+/*
+ * Part 0d: mount marks must be placed through pid 1's mount namespace
+ * ("/proc/1/root" + path) so they attach to the mount instances user
+ * processes open through, and must be keyed by mount instance.  Inodes are
+ * shared across namespaces, so only mount marks need the prefix
+ * (MARK-SCOPE-REDESIGN.md; Phase 0 exp1/exp2/exp2p).
+ */
+static void test_mark_paths(void) {
+    char buf[PATH_MAX];
+    unsigned long long id_root, id_proc;
+
+    ASSERT(fanotify_test_mark_path("/home/u/.ssh", buf, sizeof(buf)) == 0,
+           "mark path builds");
+    ASSERT(strcmp(buf, "/proc/1/root/home/u/.ssh") == 0,
+           "mark path is prefixed with /proc/1/root");
+
+    ASSERT(fanotify_test_mark_path("/", buf, sizeof(buf)) == 0,
+           "root mark path builds");
+    ASSERT(strcmp(buf, "/proc/1/root/") == 0, "root mark path is prefixed");
+
+    ASSERT(fanotify_test_mark_path("/home/u/.ssh", buf, 8) == -1,
+           "too-small buffer is rejected");
+
+    id_root = fanotify_test_mount_id("/");
+    id_proc = fanotify_test_mount_id("/proc");
+    if (id_root == 0 || id_proc == 0) {
+        printf("SKIP: statx(STATX_MNT_ID) unavailable; mount-ID checks skipped\n");
+    } else {
+        ASSERT(fanotify_test_mount_id("/") == id_root,
+               "mount ID is stable across calls");
+        ASSERT(id_root != id_proc, "different mounts have different IDs");
+    }
+}
+
+/*
+ * Part 0e: the scope guard refuses configurations whose own state or config
+ * files the installed marks would intercept (self-deadlock class).
+ */
+static void test_scope_guard(void) {
+    static Config cfg;
+    Config *saved = g_config;
+
+    /* Containment: the state directory is protected. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "%s",
+             PERSIST_STATE_DIR);
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-nonexistent.conf") == -1,
+           "scope guard refuses a protected state directory");
+
+    /* Containment: the config file is inside a protected path. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path),
+             "/tmp/scope-guard-test");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-test/fileshield.conf") == -1,
+           "scope guard refuses a config under a protected path");
+
+    /* Benign: the protected path is on a different mount than the state
+     * directory and the config. */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "/dev");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+    ASSERT(fanotify_scope_guard("/tmp/scope-guard-test.conf") == 0,
+           "scope guard accepts a benign config");
+
+    g_config = saved;
+}
+
+/*
+ * Part 1b: the shutdown drain denies and closes every permission event the
+ * kernel still holds.  A socketpair stands in for the group fd: drain()
+ * reads event metadata from it and writes fanotify responses back, exactly
+ * like the real fd (which is both readable and writable).
+ */
+static void test_drain_and_deny(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int sv[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0,
+           "create drain socketpair");
+
+    enum { PERM_EVENTS = 3 };
+    int event_fds[PERM_EVENTS + 1] = { -1 };
+    struct fanotify_event_metadata evs[PERM_EVENTS + 1];
+    size_t total = 0;
+
+    memset(evs, 0, sizeof(evs));
+    for (int i = 0; i < PERM_EVENTS + 1; i++) {
+        int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd >= 0, "open drain event fd");
+        if (efd < 0)
+            break;
+        event_fds[i] = efd;
+
+        /* The last event is a notification: closed, never answered. */
+        evs[i].event_len = sizeof(evs[i]);
+        evs[i].vers = FANOTIFY_METADATA_VERSION;
+        evs[i].mask = (i == PERM_EVENTS) ? FAN_CLOSE_WRITE : FAN_OPEN_PERM;
+        evs[i].fd = efd;
+        evs[i].pid = (int)getpid();
+        total += sizeof(evs[i]);
+    }
+
+    ASSERT(write(sv[1], evs, total) == (ssize_t)total, "queue drain events");
+
+    fanotify_drain_and_deny(sv[0]);
+
+    /* One FAN_DENY per permission event; none for the notification event. */
+    struct fanotify_response resp[PERM_EVENTS];
+    size_t want = sizeof(resp[0]) * PERM_EVENTS;
+    size_t got = 0;
+    while (got < want) {
+        ssize_t n = read(sv[1], (char *)resp + got, want - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    ASSERT(got == want, "one response per drained permission event");
+    for (int i = 0; i < PERM_EVENTS; i++) {
+        ASSERT(resp[i].response == FAN_DENY, "drain response is FAN_DENY");
+        ASSERT(resp[i].fd == event_fds[i],
+               "drain response targets the event fd");
+    }
+    for (int i = 0; i < PERM_EVENTS + 1; i++) {
+        if (event_fds[i] >= 0)
+            ASSERT(fcntl(event_fds[i], F_GETFD) == -1 && errno == EBADF,
+                   "drained event fd was closed");
+    }
+
+    /* Empty queue: a second drain must return immediately. */
+    fanotify_drain_and_deny(sv[0]);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
+    test_mark_paths();
+    test_scope_guard();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();
@@ -1382,6 +1525,7 @@ int main(void) {
     test_cmdline_scoping();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
+    test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
     pin_fixture_cleanup();
     if (failures) {

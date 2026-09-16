@@ -46,7 +46,7 @@ Headers are the source of truth for signatures; this table is the map.
 | Module         | Owns                                                                                                                                                                                                                                                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.c`       | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state and pin-table loading                                                                                                                                                                                                                                |
-| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, dialog pump |
+| `fanotify.c/h` | fanotify init, inode marks and init-namespace mount marks via `/proc/1/root` (glob entries mark their static base), startup scope guard, protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, dialog pump |
 | `inode.c/h`    | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades)                                                                                                                                                                                                                                                         |
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                                                                          |
 | `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                                                                           |
@@ -181,11 +181,12 @@ scope as a safety-critical surface:
 - `FAN_MARK_FILESYSTEM` covers every mount and subvolume of a filesystem.
   Safe only when that filesystem is dedicated to protected data — never
   the root/home filesystem.
-- `FAN_MARK_MOUNT` is scoped to one mount instance and cannot see opens
-  from other mount namespaces.  Do not combine it with namespace-creating
-  sandboxing (`ProtectSystem=`, `ProtectProc=`, `PrivateTmp=`); choose
-  one: marks placed in the init namespace, or filesystem marks on a
-  dedicated filesystem.
+- `FAN_MARK_MOUNT` is scoped to one mount instance.  A mark placed in the
+  service's private mount namespace never sees user opens; attach marks to
+  the init-namespace mounts instead (the daemon does this through
+  `/proc/1/root`, proven by Phase 0 exp1/exp2/exp2p), or use a
+  superblock-scoped mark (`FAN_MARK_FILESYSTEM`) on a dedicated
+  filesystem — never on the root/home filesystem.
 - Before enabling a new build, record the previous known-good binary hash
   and confirm the daemon can be stopped from a TTY or serial console.
 
@@ -195,7 +196,8 @@ scope as a safety-critical surface:
 - `kdialog` required for popups; missing/failing kdialog denies access (fail closed)
 - Kernel 5.0+ for FAN_OPEN_PERM on directories; no NFS/CIFS coverage; `mmap` and bind-mount aliases are outside the threat model
 - Hard links: inodes present at startup are tracked, and an open through an unprotected path always prompts. Files created after startup, deeper than 8 directory levels, or past the inode-table cap are not inode-tracked (`FAN_REPORT_FID` is a planned follow-up)
-- Protected-path globs: `*` (one segment) and `**` (zero or more segments) only; `?`, `[`, `]` and `\` are literal. A glob entry marks its wildcard-free base directory (mount marks cover the filesystem beyond it), and a malformed pattern is rejected at load time (fail closed)
+- Protected-path globs: `*` (one segment) and `**` (zero or more segments) only; `?`, `[`, `]` and `\` are literal. A glob entry marks its wildcard-free base directory (the mount mark covers the rest of its mount), and a malformed pattern is rejected at load time (fail closed)
+- Mount marks are attached to the init-namespace mounts through `/proc/1/root` (CAP_SYS_PTRACE); mount bookkeeping uses `statx(STATX_MNT_ID)` (Linux 5.8+), falling back to device-level dedupe with a warning when unavailable, and the startup scope guard refuses a config whose own state/config files its marks would intercept
 - Protected-path exclusions (`!pattern`): deny-wins and order-independent — an excluded path is never protected, never marked, and never inode-tracked; matching is path-based
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
 - Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown

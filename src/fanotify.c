@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <dirent.h>
 #include <sys/fanotify.h>
 #include <sys/stat.h>
@@ -227,8 +228,11 @@ static const RuleEntry *denylist_match(const char *binary, const char *target)
 /*
  * Hashing forks sha512sum and runs on the event-loop critical path while
  * the requesting process is suspended, so repeat lookups of the same
- * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime); any
- * metadata change invalidates the entry.
+ * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime,
+ * ctime); any metadata change invalidates the entry.  ctime matters for
+ * the pin verdict: mtime is settable by the file's owner (utimensat), so
+ * a user-writable binary could otherwise be swapped in place and keep a
+ * stale cached digest that still matches the allowlist pin.
  *
  * Failures are remembered for a short window too: a binary that cannot
  * be hashed (helper timeout on a FUSE mount, unreadable path) would
@@ -246,6 +250,8 @@ typedef struct
     off_t size;
     time_t mtime_sec;
     long mtime_nsec;
+    time_t ct_sec;
+    long ct_nsec;
     char hex[129];
     int failed;         /* 1 = last attempt failed; retry after the window */
     time_t retry_after; /* valid when failed                                */
@@ -400,7 +406,9 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
         if (e->dev == st.st_dev && e->ino == st.st_ino &&
             e->size == st.st_size &&
             e->mtime_sec == st.st_mtim.tv_sec &&
-            e->mtime_nsec == st.st_mtim.tv_nsec)
+            e->mtime_nsec == st.st_mtim.tv_nsec &&
+            e->ct_sec == st.st_ctim.tv_sec &&
+            e->ct_nsec == st.st_ctim.tv_nsec)
         {
             if (!e->failed)
             {
@@ -441,6 +449,8 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
     e->size = st.st_size;
     e->mtime_sec = st.st_mtim.tv_sec;
     e->mtime_nsec = st.st_mtim.tv_nsec;
+    e->ct_sec = st.st_ctim.tv_sec;
+    e->ct_nsec = st.st_ctim.tv_nsec;
 
     if (r < 0)
     {
@@ -1003,15 +1013,67 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
 
 #define MAX_INODE_WALK_DEPTH 8 /* max recursion depth for protected-directory inode enumeration */
 
-/* One FAN_MARK_MOUNT per unique filesystem device */
+/* One FAN_MARK_MOUNT per unique init-namespace mount.  Mount marks must
+ * be attached to the mount instances user processes open through, and a
+ * mark placed in a private mount namespace never sees them (Phase 0 exp1,
+ * MARK-SCOPE-REDESIGN.md).  The daemon therefore marks through pid 1's
+ * namespace: "/proc/1/root" + path resolves the real mount even while the
+ * daemon itself runs sandboxed (exp2/exp2p proved delivery).  Inode marks
+ * need no prefix: inodes are shared across namespaces. */
+#define NS_ROOT_PREFIX "/proc/1/root"
 #define MAX_MOUNTS 32
 typedef struct
 {
     dev_t dev;
-    char path[PATH_MAX]; /* any path on that mount, used for mark removal */
+    unsigned long long mount_id; /* init-ns mount ID; 0 = unknown */
+    char path[PATH_MAX];         /* init-ns path, used for mark removal */
 } MountEntry;
 static MountEntry g_mounts[MAX_MOUNTS];
 static int g_mount_count = 0;
+
+/* Build the init-namespace path used for mount-mark operations.  Returns
+ * 0 on success, -1 when the result would not fit. */
+static int mark_path_for(const char *path, char *out, size_t outsz)
+{
+    int n = snprintf(out, outsz, NS_ROOT_PREFIX "%s", path);
+
+    if (n < 0 || (size_t)n >= outsz)
+    {
+        log_msg(LOG_ERR, "mark path too long: %s", path);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Mount ID of the mount containing 'path', resolved through the init
+ * namespace.  Used to dedupe marks per mount instance (st_dev is not a
+ * mount identity: btrfs subvolumes share one device).  Returns 0 when
+ * statx(STATX_MNT_ID) is unavailable; callers fall back to device dedupe.
+ */
+static unsigned long long mount_id_of(const char *path)
+{
+    char ns_path[PATH_MAX];
+    struct statx stx;
+
+    if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
+        return 0;
+    if (statx(AT_FDCWD, ns_path, 0, STATX_MNT_ID, &stx) != 0)
+        return 0;
+    return stx.stx_mnt_id;
+}
+
+/* Test seams (fanotify.h): the path builder and mount-ID lookup used for
+ * mount marks.  Unprivileged and side-effect free. */
+int fanotify_test_mark_path(const char *path, char *out, size_t outsz)
+{
+    return mark_path_for(path, out, outsz);
+}
+
+unsigned long long fanotify_test_mount_id(const char *path)
+{
+    return mount_id_of(path);
+}
 
 /* Recursively walk a directory and add inodes of regular files.
  * Stays on the same device (no cross-mount traversal).
@@ -1127,6 +1189,213 @@ static int is_path_under_protected(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
+/*  scope guard and dry run                                            */
+/* ------------------------------------------------------------------ */
+/*
+ * Fail closed when the daemon's own config or state files could be
+ * intercepted by the marks it is about to install:
+ *
+ *  - Containment: the file lies under a protected path, so an inode mark
+ *    (inodes are shared across namespaces) would fire for the daemon's
+ *    own open and deadlock it.  Always checked.
+ *  - Mount: the file lies on a mount that will be mount-marked.  With the
+ *    daemon in a private mount namespace its own opens traverse
+ *    namespace-local mounts, which init-namespace marks cannot reach
+ *    (Option B), so this is checked only when mounts are shared
+ *    (unsandboxed runs and the Option A fallback).
+ */
+static int in_init_mount_ns(void)
+{
+    struct stat self_ns;
+    struct stat init_ns;
+
+    if (stat("/proc/self/ns/mnt", &self_ns) != 0 ||
+        stat("/proc/1/ns/mnt", &init_ns) != 0)
+        return 1; /* cannot tell: assume shared, apply the strict guard */
+    return self_ns.st_ino == init_ns.st_ino &&
+           self_ns.st_dev == init_ns.st_dev;
+}
+
+/* Init-namespace mount that would be marked for `path` (the nearest
+ * existing ancestor when it does not exist yet).  0 when unknown. */
+static unsigned long long mark_target_mount_id(const char *path)
+{
+    char buf[PATH_MAX];
+    struct stat st;
+
+    snprintf(buf, sizeof(buf), "%s", path);
+    if (stat(buf, &st) == 0)
+        return mount_id_of(buf);
+
+    char *slash;
+    while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
+    {
+        *slash = '\0';
+        if (stat(buf, &st) == 0)
+            return mount_id_of(buf);
+    }
+    if (stat("/", &st) == 0)
+        return mount_id_of("/");
+    return 0;
+}
+
+int fanotify_scope_guard(const char *config_path)
+{
+    if (!g_config)
+        return -1;
+
+    /* 1. Containment: inode marks reach every namespace. */
+    if (config_path && config_path[0] &&
+        is_path_under_protected(config_path))
+    {
+        log_msg(LOG_ERR,
+                "scope guard: config %s is inside a protected path; the "
+                "daemon would deadlock on its own open",
+                config_path);
+        return -1;
+    }
+    if (is_path_under_protected(PERSIST_STATE_DIR))
+    {
+        log_msg(LOG_ERR,
+                "scope guard: state directory %s is inside a protected "
+                "path; the daemon would deadlock on its own open",
+                PERSIST_STATE_DIR);
+        return -1;
+    }
+
+    /* 2. Mount collision: only possible when mounts are shared. */
+    if (!in_init_mount_ns())
+    {
+        log_msg(LOG_DEBUG,
+                "scope guard: private mount namespace; mount marks cannot "
+                "reach the daemon's own opens");
+        return 0;
+    }
+
+    unsigned long long state_id = mark_target_mount_id(PERSIST_STATE_DIR);
+    unsigned long long config_id =
+        (config_path && config_path[0]) ? mark_target_mount_id(config_path) : 0;
+
+    if (state_id == 0 && config_id == 0)
+        log_msg(LOG_WARNING,
+                "scope guard: mount IDs unavailable (statx); mount-scope "
+                "collisions could not be verified");
+
+    for (int i = 0; i < g_config->protected_count; i++)
+    {
+        const ProtectedPath *pp = &g_config->protected[i];
+        char base[PATH_MAX];
+        const char *target = pp->path;
+        unsigned long long id;
+
+        if (pp->is_exclude)
+            continue;
+        if (pp->is_glob)
+        {
+            if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
+                continue;
+            memcpy(base, pp->path, (size_t)pp->base_len);
+            base[pp->base_len] = '\0';
+            target = base;
+        }
+
+        id = mark_target_mount_id(target);
+        if (id == 0)
+            continue;
+        if (state_id != 0 && id == state_id)
+        {
+            log_msg(LOG_ERR,
+                    "scope guard: state directory %s shares mount %llu "
+                    "with protected path %s; the daemon would deadlock on "
+                    "its own open",
+                    PERSIST_STATE_DIR, id, target);
+            return -1;
+        }
+        if (config_id != 0 && id == config_id)
+        {
+            log_msg(LOG_ERR,
+                    "scope guard: config %s shares mount %llu with "
+                    "protected path %s; the daemon would deadlock on its "
+                    "own open",
+                    config_path, id, target);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Print the marks a config would install, without touching the kernel. */
+void fanotify_dry_run(const Config *cfg)
+{
+    printf("fileshield dry run: %d entries (%d exclusions)\n",
+           cfg->protected_count, cfg->exclude_count);
+
+    for (int i = 0; i < cfg->protected_count; i++)
+    {
+        const ProtectedPath *pp = &cfg->protected[i];
+        char base[PATH_MAX];
+        char ns_path[PATH_MAX];
+        const char *target = pp->path;
+        struct stat st;
+
+        if (pp->is_exclude)
+        {
+            printf("  exclusion  : %s\n", pp->path);
+            continue;
+        }
+        if (pp->is_glob)
+        {
+            if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
+            {
+                printf("  invalid    : %s (glob base too long)\n", pp->path);
+                continue;
+            }
+            memcpy(base, pp->path, (size_t)pp->base_len);
+            base[pp->base_len] = '\0';
+            target = base;
+            printf("  glob base  : %s (pattern %s)\n", base, pp->path);
+        }
+
+        if (stat(target, &st) == 0)
+        {
+            printf("  inode mark : %s\n", target);
+            if (mark_path_for(target, ns_path, sizeof(ns_path)) == 0)
+            {
+                unsigned long long id = mount_id_of(target);
+
+                printf("  mount mark : %s -> %s (mount %llu)%s\n", target,
+                       ns_path, id,
+                       id == 0 ? " [mount ID unavailable; run as root to "
+                                 "verify mount scope]"
+                               : "");
+            }
+        }
+        else
+        {
+            char buf[PATH_MAX];
+            char *slash;
+            int found = 0;
+
+            snprintf(buf, sizeof(buf), "%s", target);
+            while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
+            {
+                *slash = '\0';
+                struct stat ast;
+                if (stat(buf, &ast) == 0)
+                {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                snprintf(buf, sizeof(buf), "/");
+            printf("  mount mark : (missing %s) covered via %s\n", target,
+                   buf);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  mark bookkeeping                                                  */
 /* ------------------------------------------------------------------ */
 /*
@@ -1212,6 +1481,22 @@ unsigned int fanotify_mark_mask(void)
 /*  public API                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * While a hash helper is blocked on a permission event this daemon has
+ * not answered yet (the helper opens /proc/<pid>/exe, which can itself
+ * be on a marked filesystem), the event loop is stuck inside the hash
+ * wait.  sha512.c calls this hook once per silent wait slice so the
+ * queue keeps being serviced: direct daemon children (the helper) and
+ * mount-mark noise are allowed, protected events are deferred.
+ */
+static int g_hash_wait_fan_fd = -1;
+
+static void hash_wait_pump(void)
+{
+    if (g_hash_wait_fan_fd >= 0)
+        fanotify_pump(g_hash_wait_fan_fd, 0);
+}
+
 int fanotify_setup(void)
 {
     /*
@@ -1232,19 +1517,36 @@ int fanotify_setup(void)
         return -1;
     }
     log_msg(LOG_INFO, "fanotify fd %d created", fd);
+    g_hash_wait_fan_fd = fd;
+    sha512_set_wait_hook(hash_wait_pump);
     return fd;
 }
 
-/* Add a FAN_MARK_MOUNT for the filesystem containing st, if not already
- * tracked.  "path" may be any existing path on that filesystem; it is
- * remembered for mark removal. */
+/* Add a FAN_MARK_MOUNT for the init-namespace mount containing st, if not
+ * already tracked.  "path" may be any existing path on that mount; the
+ * "/proc/1/root"-prefixed form is what reaches the kernel and what is
+ * remembered for mark removal.  Dedupe is per mount instance (mount ID);
+ * st_dev alone would merge distinct btrfs subvolume mounts. */
 static void add_mount_mark_if_needed(int fd, const struct stat *st,
                                      const char *path)
 {
+    char ns_path[PATH_MAX];
+    unsigned long long mnt_id = mount_id_of(path);
+
+    if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
+        return;
+
     for (int i = 0; i < g_mount_count; i++)
     {
-        if (g_mounts[i].dev == st->st_dev)
-            return;
+        if (mnt_id != 0)
+        {
+            if (g_mounts[i].mount_id == mnt_id)
+                return;
+        }
+        else if (g_mounts[i].mount_id == 0 && g_mounts[i].dev == st->st_dev)
+        {
+            return; /* statx unavailable: fall back to device dedupe */
+        }
     }
 
     if (g_mount_count >= MAX_MOUNTS)
@@ -1257,21 +1559,24 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
     }
 
     if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
-                      FAN_OPEN_PERM, AT_FDCWD, path) == 0)
+                      FAN_OPEN_PERM, AT_FDCWD, ns_path) == 0)
     {
         g_mounts[g_mount_count].dev = st->st_dev;
+        g_mounts[g_mount_count].mount_id = mnt_id;
         snprintf(g_mounts[g_mount_count].path,
-                 sizeof(g_mounts[g_mount_count].path), "%s", path);
+                 sizeof(g_mounts[g_mount_count].path), "%s", ns_path);
         g_mount_count++;
-        log_msg(LOG_INFO, "fanotify mount mark added (dev %lu) for hard-link detection",
-                (unsigned long)st->st_dev);
+        log_msg(LOG_INFO,
+                "fanotify mount mark added for %s (dev %lu, mount %llu) "
+                "for hard-link detection",
+                path, (unsigned long)st->st_dev, mnt_id);
     }
     else
     {
         log_msg(LOG_ERR,
-                "fanotify mount mark failed for %s: %s "
+                "fanotify mount mark failed for %s (init-ns path %s): %s "
                 "(hard-link detection disabled for this filesystem)",
-                path, strerror(errno));
+                path, ns_path, strerror(errno));
     }
 }
 
@@ -2750,8 +3055,10 @@ void fanotify_clear_marks(int fd)
         if (fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
                           FAN_OPEN_PERM, AT_FDCWD, g_mounts[i].path) < 0)
         {
-            log_msg(LOG_WARNING, "fanotify mount mark remove failed for dev %lu: %s",
-                    (unsigned long)g_mounts[i].dev, strerror(errno));
+            log_msg(LOG_WARNING,
+                    "fanotify mount mark remove failed for %s (dev %lu): %s",
+                    g_mounts[i].path, (unsigned long)g_mounts[i].dev,
+                    strerror(errno));
         }
     }
     g_mount_count = 0;
@@ -2774,7 +3081,29 @@ static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
         {
             if (errno == EINTR)
                 continue;
+            if (errno == ENOENT)
+            {
+                /* The kernel reports "response for this fd has already
+                 * been written" when a decision was already delivered
+                 * (e.g. a duplicate deferred event); not fatal. */
+                log_msg(LOG_WARNING,
+                        "fanotify write response: already answered");
+                return -1;
+            }
+            if (errno == EAGAIN)
+            {
+                /* Transient non-blocking mode; the caller may retry. */
+                log_msg(LOG_WARNING, "fanotify write response: would block");
+                return -1;
+            }
             log_msg(LOG_ERR, "fanotify write response: %s", strerror(errno));
+            g_fatal = 1; /* the group cannot deliver decisions; restart */
+            return -1;
+        }
+        if (w == 0)
+        {
+            log_msg(LOG_ERR, "fanotify write response: zero-length write");
+            g_fatal = 1;
             return -1;
         }
         total += w;
@@ -2811,6 +3140,69 @@ void fanotify_flush_pending(int fan_fd)
         log_msg(LOG_WARNING, "denied %d pending permission events",
                 g_pending_count);
     g_pending_count = 0;
+}
+
+/*
+ * Deny and close every FAN_OPEN_PERM event still queued in the kernel.
+ *
+ * Closing the fanotify fd makes the kernel allow outstanding permission
+ * events (fanotify(7): "Upon close(2), outstanding permission events
+ * will be set to allowed"), so shutdown must drain the queue first and
+ * respond FAN_DENY to everything.  Zero-timeout poll then read: the
+ * daemon is single-threaded, so a readable poll guarantees read() will
+ * not block.  Unrequested notification events just have their fd closed.
+ */
+void fanotify_drain_and_deny(int fan_fd)
+{
+    char buf[BUF_SIZE]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    int denied = 0;
+
+    while (1)
+    {
+        struct pollfd pfd;
+        pfd.fd = fan_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+            break;
+
+        ssize_t n = read(fan_fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+
+        const struct fanotify_event_metadata *ev =
+            (const struct fanotify_event_metadata *)buf;
+        ssize_t remaining = n;
+
+        while (FAN_EVENT_OK(ev, (size_t)remaining))
+        {
+            if (ev->vers == FANOTIFY_METADATA_VERSION &&
+                (ev->mask & FAN_OPEN_PERM) && ev->fd != FAN_NOFD)
+            {
+                log_msg(LOG_DEBUG, "[drain] DENY fd=%d pid=%d (shutdown)",
+                        (int)ev->fd, (int)ev->pid);
+                fanotify_respond(fan_fd, ev, FAN_DENY);
+                close((int)ev->fd);
+                denied++;
+            }
+            else if (ev->fd != FAN_NOFD)
+            {
+                close((int)ev->fd);
+            }
+
+            if (ev->event_len == 0)
+                break;
+            remaining -= ev->event_len;
+            ev = (const struct fanotify_event_metadata *)((const char *)ev +
+                                                          ev->event_len);
+        }
+    }
+
+    if (denied > 0)
+        log_msg(LOG_WARNING,
+                "denied %d queued permission event(s) before shutdown",
+                denied);
 }
 
 void fanotify_loop(int fd)

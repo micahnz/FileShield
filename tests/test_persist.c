@@ -178,6 +178,11 @@ static int test_persist_load_nonexistent(void)
     int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
     ASSERT(n == 0, "load nonexistent returns 0");
 
+    /* A directory opens read-only but cannot be read: the read error must
+     * fail the load so the caller clears the in-memory list. */
+    ASSERT(persist_load(g_test_dir, out, PERSIST_MAX_ENTRIES) == -1,
+           "directory state path fails the load");
+
     TEST_PASS("load nonexistent file");
     return 0;
 }
@@ -684,6 +689,29 @@ static int test_persist_json_helpers(void)
                "extract control char value");
         ASSERT(strcmp(out, ctrl) == 0, "control char roundtrip");
     }
+
+    /* Short \u escapes must advance only past the digits they consumed;
+     * an unconditional four-byte advance would scan past the closing
+     * quote into the rest of the buffer. */
+    ASSERT(persist_json_extract_string("  \"k\": \"\\u1\"", key, sizeof(key),
+                                       out, sizeof(out)) == 1,
+           "short \\u escape parses");
+    ASSERT(strcmp(out, "\x01") == 0, "short \\u escape decodes");
+    ASSERT(strcmp(key, "k") == 0, "short \\u escape returns the key");
+
+    ASSERT(persist_json_extract_string("  \"k\": \"\\u12\",", key, sizeof(key),
+                                       out, sizeof(out)) == 1,
+           "short \\u before more content parses");
+    ASSERT(strcmp(out, "\x12") == 0, "short \\u before more content decodes");
+
+    /* \u0000 cannot be represented in the decoded value; a bare \u has
+     * no digits at all.  Both are malformed. */
+    ASSERT(persist_json_extract_string("  \"k\": \"\\u0000x\"", key, sizeof(key),
+                                       out, sizeof(out)) == 0,
+           "\\u0000 is rejected");
+    ASSERT(persist_json_extract_string("  \"k\": \"\\u\"", key, sizeof(key),
+                                       out, sizeof(out)) == 0,
+           "\\u with no digits is rejected");
 
     /* Error paths: too-small escape buffer and numeric values. */
     ASSERT(persist_json_escape("abcdef", tiny, sizeof(tiny)) == -1,
