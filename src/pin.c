@@ -219,11 +219,43 @@ int pin_load(const char *filepath)
             pins_key = strstr(p, "\"pins\":");
             if (pins_key != NULL)
             {
+                char *q = pins_key + 7; /* just after the "pins": key */
+
                 saw_pins = 1;
-                if (strchr(pins_key + 7, ']') != NULL)
-                    closed_array = 1; /* "pins": [] on one line */
-                else
+                while (*q == ' ' || *q == '\t')
+                    q++;
+                if (*q != '[')
+                {
+                    ok = 0; /* "pins" must open the array */
+                    break;
+                }
+                q++;
+                while (*q == ' ' || *q == '\t')
+                    q++;
+                if (*q == ']')
+                {
+                    /* "pins": [] on one line; nothing may follow it. */
+                    q++;
+                    while (*q == ' ' || *q == '\t' || *q == '\r' ||
+                           *q == '\n')
+                        q++;
+                    if (*q != '\0')
+                        ok = 0;
+                    else
+                        closed_array = 1;
+                }
+                else if (*q == '\0' || *q == '\r' || *q == '\n')
+                {
+                    /* Array opener alone on its line. */
                     state = S_IN_PINS;
+                }
+                else
+                {
+                    /* Content on the opener line cannot be parsed by
+                     * this line-oriented reader; accepting it as an
+                     * empty array would silently drop pins. */
+                    ok = 0;
+                }
             }
             else if (*p == '{' || *p == '"')
             {
@@ -244,6 +276,11 @@ int pin_load(const char *filepath)
             if (*p == '[')
             {
                 /* Array opener on its own line. */
+                char *q = p + 1;
+                while (*q == ' ' || *q == '\t')
+                    q++;
+                if (*q != '\0' && *q != '\r' && *q != '\n')
+                    ok = 0; /* content on the opener line is unsupported */
             }
             else if (*p == '{')
             {
@@ -258,6 +295,15 @@ int pin_load(const char *filepath)
             }
             else if (*p == ']')
             {
+                char *q = p + 1;
+
+                while (*q == ' ' || *q == '\t')
+                    q++;
+                if (*q != '\0' && *q != '\r' && *q != '\n')
+                {
+                    ok = 0; /* junk after the array close */
+                    break;
+                }
                 closed_array = 1;
                 state = S_OUTSIDE;
             }
