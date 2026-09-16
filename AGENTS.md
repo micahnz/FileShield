@@ -163,6 +163,32 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 - Tests are self-contained C files linked against the module `.o` files
 - Each test returns 0 on pass, non-zero on failure. `make test` runs them all and reports aggregate.
 
+## Mark scope safety (read before touching fanotify marks or the unit)
+
+On 2026-09-16 a build that switched mount marks to `FAN_MARK_FILESYSTEM`
+froze a machine outright.  `/` and `/home` shared one btrfs filesystem, so
+the superblock-scoped mark covered every open on the system; the daemon's
+own state-file opens then blocked on permission events only it could
+answer (it is single-threaded) and no process could proceed.  Treat mark
+scope as a safety-critical surface:
+
+- Never install a build that changes mark scope or the service's mount
+  namespace without a root smoke test on a disposable, snapshot-backed
+  machine, and a way to stop the daemon that does not depend on the GUI.
+- The daemon must never open a file it marks.  Load persisted state and
+  pins before installing marks; do not read the config while marks are
+  live; answer self/child events in every wait loop (main, pump, hash).
+- `FAN_MARK_FILESYSTEM` covers every mount and subvolume of a filesystem.
+  Safe only when that filesystem is dedicated to protected data — never
+  the root/home filesystem.
+- `FAN_MARK_MOUNT` is scoped to one mount instance and cannot see opens
+  from other mount namespaces.  Do not combine it with namespace-creating
+  sandboxing (`ProtectSystem=`, `ProtectProc=`, `PrivateTmp=`); choose
+  one: marks placed in the init namespace, or filesystem marks on a
+  dedicated filesystem.
+- Before enabling a new build, record the previous known-good binary hash
+  and confirm the daemon can be stopped from a TTY or serial console.
+
 ## Limitations (see README for detail)
 
 - Root-only (CAP_SYS_ADMIN for `fanotify_init`); root processes can bypass fanotify
