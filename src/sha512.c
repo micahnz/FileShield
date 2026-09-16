@@ -297,21 +297,6 @@ static int reap_helper(pid_t pid, const char *label, int *status_out)
     return -1;
 }
 
-/* Wait-slice length: the poll in collect_digest wakes this often while
- * the helper is silent, so the wait hook can service outstanding events. */
-#define HASH_WAIT_SLICE_MS 100
-
-/*
- * Optional callback, invoked once per silent wait slice while a helper
- * is running (see sha512_set_wait_hook()).
- */
-static void (*g_wait_hook)(void) = NULL;
-
-void sha512_set_wait_hook(void (*hook)(void))
-{
-    g_wait_hook = hook;
-}
-
 /*
  * Read sha512sum's stdout until EOF (or the buffer is full), enforce the
  * deadline, reap the child and validate the digest.  Output format:
@@ -338,21 +323,11 @@ static int collect_digest(int fd, pid_t pid, const char *label,
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        /* Poll in slices: while the helper is silent, run the wait hook
-         * so a permission event held against the helper (it opens
-         * /proc/<pid>/exe, which may itself be on a marked filesystem)
-         * can be answered instead of stalling it to the deadline. */
-        if (remaining_ms > HASH_WAIT_SLICE_MS)
-            remaining_ms = HASH_WAIT_SLICE_MS;
-        int pr = poll(&pfd, 1, remaining_ms);
-        if (pr == 0 || (pr < 0 && errno == EINTR))
+        if (poll(&pfd, 1, remaining_ms) <= 0)
         {
-            if (g_wait_hook)
-                g_wait_hook();
-            continue;
-        }
-        if (pr < 0)
+            timed_out = 1;
             break;
+        }
 
         ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
         if (n <= 0)
