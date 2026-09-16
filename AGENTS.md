@@ -110,7 +110,9 @@ variables (desktop identity, Qt theme/scale, locale, cursor) read from
 session-bus, `LD_*`, `PATH` and `QT_PLUGIN_PATH`/`QT_QPA_PLATFORM*` variables
 are deliberately never forwarded: the prompt must stay on the display
 Fileshield detected, and no code-loading or platform override may come from
-the requesting process.
+the requesting process.  `QT_QPA_PLATFORMTHEME` is the one deliberate
+exception: it selects an installed theme plugin by key (Qt resolves it
+without `QT_PLUGIN_PATH`), not a platform or a code path.
 
 ### `main.c` — daemon lifecycle
 

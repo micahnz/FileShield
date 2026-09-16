@@ -118,4 +118,7 @@ int notify_test_hit_rate(int kind, const char *binary, const char *target,
                          int dedup_seconds, int max_per_window);
 void notify_test_reset_rate(void);
 
+/* Test seam: the dialog environment whitelist (see notify.c). */
+int notify_test_env_key_allowed(const char *key);
+
 #endif

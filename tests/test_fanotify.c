@@ -1541,12 +1541,52 @@ static void test_recent_decision_cache(void) {
            "clear drops every cached decision");
 }
 
+/*
+ * Part 0g: the dialog environment whitelist accepts only cosmetic keys and
+ * rejects everything that could load code or redirect the platform.
+ */
+static void test_dialog_env_whitelist(void) {
+    ASSERT(notify_test_env_key_allowed("XDG_CURRENT_DESKTOP") == 1,
+           "desktop identity key is forwarded");
+    ASSERT(notify_test_env_key_allowed("LANG") == 1, "locale key is forwarded");
+    ASSERT(notify_test_env_key_allowed("XCURSOR_THEME") == 1,
+           "cursor key is forwarded");
+
+    ASSERT(notify_test_env_key_allowed("LD_PRELOAD") == 0,
+           "LD_PRELOAD is never forwarded");
+    ASSERT(notify_test_env_key_allowed("LD_LIBRARY_PATH") == 0,
+           "LD_LIBRARY_PATH is never forwarded");
+    ASSERT(notify_test_env_key_allowed("PATH") == 0,
+           "PATH is never forwarded");
+    ASSERT(notify_test_env_key_allowed("QT_PLUGIN_PATH") == 0,
+           "QT_PLUGIN_PATH is never forwarded");
+    ASSERT(notify_test_env_key_allowed("QT_QPA_PLATFORM") == 0,
+           "QT_QPA_PLATFORM is never forwarded");
+    ASSERT(notify_test_env_key_allowed("DISPLAY") == 0,
+           "DISPLAY is never forwarded");
+    ASSERT(notify_test_env_key_allowed("WAYLAND_DISPLAY") == 0,
+           "WAYLAND_DISPLAY is never forwarded");
+    ASSERT(notify_test_env_key_allowed("DBUS_SESSION_BUS_ADDRESS") == 0,
+           "session bus is never forwarded");
+
+    /* Exact match only: no prefix or suffix tricks. */
+    ASSERT(notify_test_env_key_allowed("XLD_PRELOAD") == 0,
+           "prefixed key does not match");
+    ASSERT(notify_test_env_key_allowed("LANGX") == 0,
+           "suffixed key does not match");
+
+    /* The one documented exception. */
+    ASSERT(notify_test_env_key_allowed("QT_QPA_PLATFORMTHEME") == 1,
+           "QT_QPA_PLATFORMTHEME is the documented exception");
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
     test_scope_guard();
     test_recent_decision_cache();
+    test_dialog_env_whitelist();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();

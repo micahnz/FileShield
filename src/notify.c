@@ -47,7 +47,9 @@ static int g_fan_fd = -1;
  *     the prompt must stay on the display Fileshield detected, never one
  *     a malicious process points at.
  *   - LD_* / PATH / QT_PLUGIN_PATH / QT_QPA_PLATFORM*: no code loading or
- *     platform override.
+ *     platform override.  QT_QPA_PLATFORMTHEME is the one deliberate
+ *     exception: it names an installed theme plugin by key (Qt resolves it
+ *     without QT_PLUGIN_PATH), not a platform or a code path.
  * The forwarded values are cosmetic only and length-capped; a malicious
  * value can at worst make the dialog look wrong or fail, which still
  * fails closed.
@@ -95,6 +97,12 @@ static int dialog_env_key_allowed(const char *key)
             return 1;
     }
     return 0;
+}
+
+/* Test seam (notify.h): the dialog environment whitelist. */
+int notify_test_env_key_allowed(const char *key)
+{
+    return dialog_env_key_allowed(key);
 }
 
 static int dialog_env_collected(const DialogEnvSetting *out, int count,
@@ -172,17 +180,27 @@ static int collect_dialog_env(pid_t requester, DialogEnvSetting *out, int max)
 {
     char *buf = malloc(DIALOG_ENV_FILE_MAX);
     pid_t leader = 0;
+    unsigned long long leader_start = 0;
     int count = 0;
     int n;
 
     if (buf == NULL)
         return 0;
 
-    if (session_id_of(requester, &leader, NULL) == 0 && leader > 0)
+    if (session_id_of(requester, &leader, &leader_start) == 0 && leader > 0)
     {
-        n = read_proc_environ(leader, buf, DIALOG_ENV_FILE_MAX);
-        if (n > 0)
-            count = merge_proc_environ(buf, (size_t)n, out, count, max);
+        unsigned long long now_start = 0;
+
+        /* Read the leader's environment only while it is still the process
+         * the SID was resolved to: a recycled leader PID must not feed the
+         * dialog from an unrelated process. */
+        if (proc_stat_session(leader, NULL, &now_start) == 0 &&
+            now_start == leader_start)
+        {
+            n = read_proc_environ(leader, buf, DIALOG_ENV_FILE_MAX);
+            if (n > 0)
+                count = merge_proc_environ(buf, (size_t)n, out, count, max);
+        }
     }
 
     if (count < max && requester != leader)
@@ -408,7 +426,16 @@ static void drop_to_session_user(const DisplaySession *session)
         _exit(127);
     if (setuid(session->uid) < 0)
         _exit(127);
-    setenv("HOME", pw->pw_dir, 1);
+
+    /* The child must not inherit root's HOME/USER/PATH when the daemon was
+     * started outside systemd; PATH is a fixed trusted value so nothing
+     * from the requesting process can steer helper lookup. */
+    if (pw->pw_dir)
+        setenv("HOME", pw->pw_dir, 1);
+    setenv("USER", pw->pw_name, 1);
+    setenv("LOGNAME", pw->pw_name, 1);
+    setenv("PATH",
+           "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
 }
 
 /*
@@ -1046,22 +1073,28 @@ void notify_rule_hit(const NotifyHit *hit)
     if (!hit || hit->uid == (uid_t)-1 || hit->uid == 0)
         return;
 
+    /* Availability first: a missing notify-send must not spend the dedup
+     * or flood budget on notifications that are never shown. */
+    if (!g_notify_send_ok)
+    {
+        g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
+        if (!g_notify_send_ok)
+        {
+            if (!g_notify_send_checked)
+            {
+                g_notify_send_checked = 1;
+                log_msg(LOG_WARNING,
+                        "notify_rule_hit: %s not found; rule notifications "
+                        "disabled (see README)",
+                        NOTIFY_SEND_PATH);
+            }
+            return;
+        }
+    }
+
     if (!notify_rate_allow(hit->kind, hit->binary ? hit->binary : "",
                            hit->target ? hit->target : "",
                            hit->dedup_seconds, hit->max_per_window))
-        return;
-
-    if (!g_notify_send_checked)
-    {
-        g_notify_send_checked = 1;
-        g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
-        if (!g_notify_send_ok)
-            log_msg(LOG_WARNING,
-                    "notify_rule_hit: %s not found; rule notifications "
-                    "disabled (see README)",
-                    NOTIFY_SEND_PATH);
-    }
-    if (!g_notify_send_ok)
         return;
 
     /* Per-field sanitation: newlines inside fields must not forge lines. */
