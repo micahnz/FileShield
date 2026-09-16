@@ -100,8 +100,14 @@ int cache_lookup(pid_t pid, const char *binary, const char *target)
     return 0;
 }
 
-void cache_insert(pid_t pid, const char *binary, const char *target,
-                  int ttl_seconds)
+/*
+ * Insert (or refresh) an entry with an explicit start time.  cache_insert()
+ * fills it from /proc; the test seam injects it so PID-reuse rejection can
+ * be exercised without a recycled PID.
+ */
+static void cache_insert_starttime(pid_t pid, unsigned long long starttime,
+                                   const char *binary, const char *target,
+                                   int ttl_seconds)
 {
     time_t now;
     int i;
@@ -152,12 +158,26 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
         cache_high = free_slot + 1;
 
     cache[free_slot].pid = pid;
-    cache[free_slot].starttime = proc_start_time(pid);
+    cache[free_slot].starttime = starttime;
     strncpy(cache[free_slot].binary_path, binary, PATH_MAX - 1);
     cache[free_slot].binary_path[PATH_MAX - 1] = '\0';
     strncpy(cache[free_slot].target_path, tgt, PATH_MAX - 1);
     cache[free_slot].target_path[PATH_MAX - 1] = '\0';
     cache[free_slot].expiry_time = now + ttl_seconds;
+}
+
+void cache_insert(pid_t pid, const char *binary, const char *target,
+                  int ttl_seconds)
+{
+    cache_insert_starttime(pid, proc_start_time(pid), binary, target,
+                           ttl_seconds);
+}
+
+void cache_test_insert_with_starttime(pid_t pid, unsigned long long starttime,
+                                      const char *binary, const char *target,
+                                      int ttl_seconds)
+{
+    cache_insert_starttime(pid, starttime, binary, target, ttl_seconds);
 }
 
 void cache_expire(void)

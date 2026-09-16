@@ -229,4 +229,7 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,
                                 pid_t sid, int hardlink);
 
+/* Test seam: the per-binary dialog rate limiter. */
+int fanotify_test_dialog_rate_limited(const char *binary);
+
 #endif

@@ -86,6 +86,19 @@ static void test_pid_starttime(void) {
     cache_expire();
 }
 
+static void test_pid_reuse(void) {
+    /* A recycled PID (different start time) must be rejected and evicted. */
+    cache_test_insert_with_starttime(300, 111, "/bin/stale", "/tmp/stale", 60);
+    ASSERT(cache_lookup(300, "/bin/stale", "/tmp/stale") == 0,
+           "different start time is rejected as PID reuse");
+
+    /* Control: a fresh insert afterwards matches again. */
+    cache_insert(300, "/bin/stale", "/tmp/stale", 60);
+    ASSERT(cache_lookup(300, "/bin/stale", "/tmp/stale") > 0,
+           "fresh insert after eviction matches");
+    cache_expire();
+}
+
 static void test_ttl_clamp(void) {
     /* Absurd TTLs must be clamped so expiry arithmetic cannot overflow
      * into the past on any time_t width. */
@@ -105,6 +118,7 @@ int main(void) {
     test_overwrite();
     test_null_binary();
     test_pid_starttime();
+    test_pid_reuse();
     test_ttl_clamp();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);

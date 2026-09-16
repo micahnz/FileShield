@@ -392,12 +392,20 @@ static void test_limits_are_blocking(void)
         free(path);
     }
 
+    /* Every rule section enforces MAX_RULES, not just [allowlist]. */
+    const char *rule_sections[] = {"allowlist", "unsafe_allowlist",
+                                   "denylist"};
     const size_t rule_cap = 32 * 1024;
-    buf = malloc(rule_cap);
-    ASSERT(buf != NULL, "allocate rule overflow config");
-    if (buf)
+    for (size_t s = 0;
+         s < sizeof(rule_sections) / sizeof(rule_sections[0]); s++)
     {
-        size_t off = (size_t)snprintf(buf, rule_cap, "[allowlist]\n");
+        buf = malloc(rule_cap);
+        ASSERT(buf != NULL, "allocate rule overflow config");
+        if (!buf)
+            continue;
+
+        size_t off = (size_t)snprintf(buf, rule_cap, "[%s]\n",
+                                      rule_sections[s]);
         for (int i = 0; i < MAX_RULES + 1 && off < rule_cap; i++)
             off += (size_t)snprintf(buf + off, rule_cap - off,
                                     "/usr/bin/fslimit_%d = /tmp/fslimit_t_%d\n",

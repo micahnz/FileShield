@@ -2396,6 +2396,12 @@ static void event_gather_identity(EventCtx *c)
  * session denylist (runtime "Deny Session"), then dynamic denylist
  * (runtime "Deny Always").  Returns 1 when the event was denied.
  */
+/* Test seam (fanotify.h): the per-binary dialog rate limiter. */
+int fanotify_test_dialog_rate_limited(const char *binary)
+{
+    return dialog_rate_limited(binary);
+}
+
 static int event_runtime_denied(EventCtx *c)
 {
     if (c->have_sid &&

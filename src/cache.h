@@ -24,4 +24,13 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
 
 void cache_expire(void);
 
+/*
+ * Test seam: insert with an explicit process start time so PID-reuse
+ * rejection can be exercised without a recycled PID.  starttime == 0
+ * means "unknown".
+ */
+void cache_test_insert_with_starttime(pid_t pid, unsigned long long starttime,
+                                      const char *binary, const char *target,
+                                      int ttl_seconds);
+
 #endif

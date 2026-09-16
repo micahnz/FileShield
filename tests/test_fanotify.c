@@ -1641,6 +1641,24 @@ static void test_verdict_stage_order(void) {
     g_config = saved;
 }
 
+/*
+ * Part 0i: the dialog rate limiter bounds prompts per binary path and then
+ * fails closed (deny) for a cooldown window.
+ */
+static void test_dialog_rate_limiter(void) {
+    const char *binary = "/tmp/fileshield-rate-test-unique";
+
+    for (int i = 0; i < 20; i++)
+    {
+        ASSERT(fanotify_test_dialog_rate_limited(binary) == 0,
+               "prompts below the bound are allowed");
+    }
+    ASSERT(fanotify_test_dialog_rate_limited(binary) == 1,
+           "prompt above the bound is denied (fail closed)");
+    ASSERT(fanotify_test_dialog_rate_limited(binary) == 1,
+           "cooldown keeps denying");
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
@@ -1649,6 +1667,7 @@ int main(void) {
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_verdict_stage_order();
+    test_dialog_rate_limiter();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();
