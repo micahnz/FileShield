@@ -91,6 +91,17 @@ static void test_glob_match(void) {
     assert_glob("/**/b", "/b", 1, "leading globstar zero segments");
     assert_glob("/a/**/**/b", "/a/x/y/b", 1, "repeated globstar");
 
+    /* Multiple distinct globstars: the matcher is documented as a
+     * single-backtrack greedy algorithm, so these cases pin the current
+     * behavior (a false negative is the safe direction for protection,
+     * the wrong direction for allowlist targets). */
+    assert_glob("/a/**/b/**/c", "/a/b/c", 1, "two globstars zero filler");
+    assert_glob("/a/**/b/**/c", "/a/x/b/y/c", 1, "two globstars with filler");
+    assert_glob("/a/**/b/**/c", "/a/x/y/b/c", 1, "first globstar eats more");
+    assert_glob("/a/**/b/**/c", "/a/b/x/c", 1, "second globstar eats");
+    assert_glob("/a/**/b/**/c", "/a/x/y/z/c", 0, "missing middle segment");
+    assert_glob("/a/**/b/**/c", "/a/x/c", 0, "missing literal segment");
+
     /* Star runs collapse; '?' and '[' ']' are literal. */
     assert_glob("/a/ab**cd", "/a/abXYZcd", 1, "star run collapses");
     assert_glob("/a/ab**cd", "/a/ab/cd", 0, "star run stays in segment");
