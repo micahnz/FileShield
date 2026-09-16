@@ -101,6 +101,16 @@ make
 sudo make install
 ```
 
+`make install` installs the binary and the systemd unit, and writes `/etc/fileshield.conf` **only if it does not already exist** — upgrades and reinstalls keep your local rules. If the file is present, the installer says so and leaves it untouched.
+
+To replace `/etc/fileshield.conf` with the shipped defaults instead (this discards every local edit — back it up first):
+
+```bash
+sudo make install REPLACE_CONFIG=1
+# equivalent convenience target
+sudo make install-config
+```
+
 ### 3. Start
 
 ```bash
@@ -125,7 +135,7 @@ Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove ol
 
 ### Default Protected Paths
 
-The default `[protected_paths]` list ships in [`fileshield.conf`](fileshield.conf); `make install` copies it to `/etc/fileshield.conf`. It is the authoritative list and is maintained there rather than duplicated here. It covers common credential stores: shell histories and environment files, SSH and GPG key material, cloud CLIs (AWS, Azure, GCP, Cloudflare, and others), Kubernetes and container registries, package-manager tokens, password managers, and AI coding agents. Edit the installed copy and reload.
+The default `[protected_paths]` list ships in [`fileshield.conf`](fileshield.conf); `make install` copies it to `/etc/fileshield.conf` on first install, and later installs keep the existing file (see [Installation](#installation)). It is the authoritative list and is maintained there rather than duplicated here. It covers common credential stores: shell histories and environment files, SSH and GPG key material, cloud CLIs (AWS, Azure, GCP, Cloudflare, and others), Kubernetes and container registries, package-manager tokens, password managers, and AI coding agents. Edit the installed copy and reload.
 
 Paths listed in `[protected_paths]` that do not exist yet are skipped at startup with a warning. They remain covered by the filesystem mount mark, so opening the file after it is created is still intercepted; run `sudo systemctl reload fileshield` (or `kill -HUP`) to add a direct mark. The daemon refuses to start if any configured path that exists cannot be marked, if `[protected_paths]` is empty, or if nothing at all could be marked (fail closed).
 
@@ -170,7 +180,7 @@ Because an unsafe rule never checks the binary hash, it is only as narrow as its
 /tmp/.mount_*/openchamber = ~/.local/share/opencode/
 ```
 
-grants any binary called `openchamber` under a matching `/tmp/.mount_*` directory access to the opencode data directory. An attacker who knows or guesses that such a pattern exists can create a lookalike mount directory and binary and read the secrets through it. The configuration file is root-owned and read-only, but the *pattern* is guessable, and no hash check stands in the way.
+grants any binary called `openchamber` under a matching `/tmp/.mount_*` directory access to the opencode data directory. An attacker who knows or guesses that such a pattern exists can create a lookalike mount directory and binary and read the secrets through it. The configuration file is root-owned and read-only, but the _pattern_ is guessable, and no hash check stands in the way.
 
 Treat `[unsafe_allowlist]` as a deliberate hole: use it only when the matching binary genuinely cannot be pinned, and keep patterns as narrow as the tool allows. The mitigation is visibility — `notify_unsafe_allowlist` is **on by default**, so every matching hit raises a `critical` desktop notification naming the rule pattern, the concrete binary, its PID and the target file (subject to the [flood control](#notifications)). If a notification appears for a binary you did not launch, treat it as a security incident: read the journal, find the process, and tighten or remove the rule.
 
@@ -274,11 +284,11 @@ notify_max = 20
 
 Fileshield can raise a desktop notification through `notify-send` whenever a **config rule** resolves an access — not for user dialog decisions, which are already explicit. Three settings control it:
 
-| Setting                   | Default | Notifies on                                    |
-| ------------------------- | ------- | ---------------------------------------------- |
-| `notify_unsafe_allowlist` | `yes`   | `[unsafe_allowlist]` grant                     |
-| `notify_allowlist`        | `no`    | `[allowlist]` grant (pin match or first use)   |
-| `notify_denylist`         | `yes`   | `[denylist]` block                             |
+| Setting                   | Default | Notifies on                                  |
+| ------------------------- | ------- | -------------------------------------------- |
+| `notify_unsafe_allowlist` | `yes`   | `[unsafe_allowlist]` grant                   |
+| `notify_allowlist`        | `no`    | `[allowlist]` grant (pin match or first use) |
+| `notify_denylist`         | `yes`   | `[denylist]` block                           |
 
 The `[unsafe_allowlist]` and `[denylist]` defaults are the security tripwires: an unsafe hit is a grant that skipped hash pinning (see [Handle with caution](#handle-with-caution)), and a denylist hit is an access someone tried to make. Both use `critical` urgency; the optional allowlist notification is `normal`.
 

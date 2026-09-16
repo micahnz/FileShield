@@ -1,4 +1,4 @@
-.PHONY: all clean install test bench lint
+.PHONY: all clean install install-config test bench lint
 
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 \
@@ -15,6 +15,11 @@ ETCDIR  := /etc
 SYSDDIR := /etc/systemd/system
 
 TARGET  := fileshield
+
+# `make install` never replaces an existing /etc/fileshield.conf (upgrades
+# keep local rules). Set REPLACE_CONFIG=1, or run `make install-config`,
+# to overwrite it with the shipped defaults.
+REPLACE_CONFIG ?= 0
 
 SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/session.c $(SRCDIR)/notify.c \
@@ -115,10 +120,23 @@ bench: all $(OBJDIR)/bench_hotpath
 
 install: all
 	install -m 0755 -D $(OBJDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
-	install -m 0640 -D fileshield.conf $(DESTDIR)$(ETCDIR)/fileshield.conf
-	install -m 0644 -D fileshield.service $(DESTDIR)$(SYSDDIR)/fileshield.service
+	@if [ "$(REPLACE_CONFIG)" = "1" ]; then \
+		install -m 0640 -D fileshield.conf "$(DESTDIR)$(ETCDIR)/fileshield.conf"; \
+		echo "installed default config (overwrote $(DESTDIR)$(ETCDIR)/fileshield.conf)"; \
+	elif [ -e "$(DESTDIR)$(ETCDIR)/fileshield.conf" ]; then \
+		echo "keeping existing $(DESTDIR)$(ETCDIR)/fileshield.conf"; \
+		echo "  (set REPLACE_CONFIG=1 to overwrite it with the shipped defaults)"; \
+	else \
+		install -m 0640 -D fileshield.conf "$(DESTDIR)$(ETCDIR)/fileshield.conf"; \
+		echo "installed default config to $(DESTDIR)$(ETCDIR)/fileshield.conf"; \
+	fi
+	install -m 0644 -D fileshield.service "$(DESTDIR)$(SYSDDIR)/fileshield.service"
 	systemctl daemon-reload
 	sudo systemctl restart fileshield
+
+# Convenience alias for `make install REPLACE_CONFIG=1`.
+install-config:
+	$(MAKE) install REPLACE_CONFIG=1
 clean:
 	rm -rf $(OBJDIR)
 
