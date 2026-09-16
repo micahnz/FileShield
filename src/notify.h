@@ -105,9 +105,11 @@ typedef struct
 /*
  * Fire-and-forget notification for one config-rule hit.  Identical
  * (kind, binary, target) hits inside dedup_seconds are suppressed, as is a
- * flood of distinct keys; a missing notify-send or an undetectable desktop
- * session logs once / at DEBUG and drops the notification.  Never blocks
- * the event loop and never changes the decision.
+ * flood of distinct keys; NOTIFY_HIT_UNSAFE ignores dedup_seconds because
+ * its caller gates it once per process instead.  A missing notify-send or
+ * an undetectable desktop session logs once / at DEBUG and drops the
+ * notification.  Never blocks the event loop and never changes the
+ * decision.
  */
 void notify_rule_hit(const NotifyHit *hit);
 

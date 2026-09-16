@@ -800,16 +800,23 @@ static void test_notify_rate_windows(void)
 {
     notify_test_reset_rate();
 
-    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 1,
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_DENY, "/b", "/t", 60, 20) == 1,
            "first notification passes");
-    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 0,
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_DENY, "/b", "/t", 60, 20) == 0,
            "identical hit inside the window is suppressed");
-    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t2", 60, 20) == 1,
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_DENY, "/b", "/t2", 60, 20) == 1,
            "a different target passes");
     ASSERT(notify_test_hit_rate(NOTIFY_HIT_ALLOW, "/b", "/t", 60, 20) == 1,
            "a different kind passes");
-    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 0, 20) == 1,
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_DENY, "/b", "/t", 0, 20) == 1,
            "dedup window 0 notifies every hit");
+
+    /* Unsafe hits are gated once per process by the caller, so the
+     * per-key window must not suppress a second process using the rule. */
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 1,
+           "unsafe bypasses the per-key window (first hit)");
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 1,
+           "unsafe bypasses the per-key window (repeat)");
 
     /* Configurable global cap: 10 distinct keys, cap 5 -> 5 delivered. */
     notify_test_reset_rate();
@@ -822,6 +829,23 @@ static void test_notify_rate_windows(void)
     }
     ASSERT(allowed == 5, "notify_max caps the window at 5");
     notify_test_reset_rate();
+}
+
+/*
+ * Unsafe hits surface once per process: the first hit qualifies for the
+ * warning + notification, repeats are suppressed, and another process is
+ * a new instance.
+ */
+static void test_unsafe_hit_once_per_process(void)
+{
+    pid_t self = getpid();
+
+    ASSERT(fanotify_test_unsafe_first_hit(self) == 1,
+           "first unsafe hit for a process is surfaced");
+    ASSERT(fanotify_test_unsafe_first_hit(self) == 0,
+           "repeat unsafe hit for the same process is suppressed");
+    ASSERT(fanotify_test_unsafe_first_hit(getppid()) == 1,
+           "another process is surfaced independently");
 }
 
 /* A glob deny rule beats a glob allow rule (deny is evaluated first). */
@@ -1351,6 +1375,7 @@ int main(void) {
     test_unsafe_allowlist_skips_pins();
     test_hash_change_null_request_denies();
     test_notify_rate_windows();
+    test_unsafe_hit_once_per_process();
     test_glob_deny_beats_glob_allow();
     test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();

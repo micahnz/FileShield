@@ -171,4 +171,11 @@ int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path);
  */
 int fanotify_test_resolve_path(int fd, char *out, size_t outsz);
 
+/*
+ * Test seam: the unsafe-hit per-process gate.  Returns 1 the first time
+ * (pid, start time) is seen and records it, 0 on every later call for the
+ * same process.  Used by test_fanotify without a kernel permission event.
+ */
+int fanotify_test_unsafe_first_hit(pid_t pid);
+
 #endif

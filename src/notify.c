@@ -994,7 +994,12 @@ static int notify_rate_allow(int kind, const char *binary, const char *target,
         return 0;
     }
 
-    if (dedup_seconds > 0)
+    /*
+     * Unsafe hits are gated once per process by the caller, so the
+     * per-key window must not suppress a *different* process using the
+     * same rule; the global cap below still bounds any burst.
+     */
+    if (kind != NOTIFY_HIT_UNSAFE && dedup_seconds > 0)
     {
         for (int i = 0; i < g_notify_dedup_count; i++)
         {
@@ -1068,10 +1073,13 @@ void notify_rule_hit(const NotifyHit *hit)
 
     if (hit->kind == NOTIFY_HIT_UNSAFE)
     {
+        /* notify-send only knows low/normal/critical urgency: a warning
+         * is normal urgency with the warning icon, so it stands out
+         * without the persistence of a critical notification. */
         snprintf(title, sizeof(title),
                  "Fileshield: unsafe allowlist rule used");
-        urgency = "critical";
-        icon = "security-high";
+        urgency = "normal";
+        icon = "dialog-warning";
     }
     else if (hit->kind == NOTIFY_HIT_DENY)
     {

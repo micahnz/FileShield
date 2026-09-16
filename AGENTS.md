@@ -77,6 +77,9 @@ Headers are the source of truth for signatures; this table is the map.
    (first use pins silently, a changed hash prompts). Config-rule hits raise a
    notify-send notification when their `[settings]` toggle is on (unsafe and denylist
    default on, pinned allowlist off), bounded by `notify_dedup_ttl` and a global cap.
+   Unsafe grants log at `WARNING` and notify on the first hit per process; repeat hits log at
+   `INFO` marked `(repeat)` and skip the notification, and another process is a new instance
+   (per-process gate keyed by `(pid, start)`); other grants stay `INFO`.
 7. `event_ask_user` — dialog rate limit, kdialog stages, decision recording.
 
 ### `notify.h` decision codes

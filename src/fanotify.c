@@ -1748,6 +1748,50 @@ static void config_rule_notify(EventCtx *c, const RuleEntry *e, int kind,
 }
 
 /*
+ * Unsafe-rule hits surface once per process: the first hit logs at
+ * WARNING and notifies, later hits from the same process log at INFO
+ * without notifying.  Another process running the same rule is a new
+ * instance and surfaces again.  Keyed by (pid, start time) so PID reuse
+ * is a new process; the bounded round-robin table may evict a very old
+ * entry, which only re-surfaces a hit (extra visibility, never silence).
+ */
+#define UNSAFE_SEEN_MAX 256
+
+typedef struct
+{
+    pid_t pid;
+    unsigned long long start; /* /proc/<pid>/stat field 22; 0 = unknown */
+} UnsafeSeenEntry;
+
+static UnsafeSeenEntry g_unsafe_seen[UNSAFE_SEEN_MAX];
+static int g_unsafe_seen_count = 0;
+static int g_unsafe_seen_next = 0;
+
+static int unsafe_first_hit(pid_t pid)
+{
+    unsigned long long start = 0;
+    (void)proc_stat_session(pid, NULL, &start);
+
+    for (int i = 0; i < g_unsafe_seen_count; i++)
+    {
+        if (g_unsafe_seen[i].pid == pid && g_unsafe_seen[i].start == start)
+            return 0;
+    }
+
+    int slot;
+    if (g_unsafe_seen_count < UNSAFE_SEEN_MAX)
+        slot = g_unsafe_seen_count++;
+    else
+    {
+        slot = g_unsafe_seen_next;
+        g_unsafe_seen_next = (g_unsafe_seen_next + 1) % UNSAFE_SEEN_MAX;
+    }
+    g_unsafe_seen[slot].pid = pid;
+    g_unsafe_seen[slot].start = start;
+    return 1;
+}
+
+/*
  * Capture the requester's ancestor chain on demand.  The chain is only
  * consumed by the runtime "Always" matchers and recorders: matchers ask
  * for it through event_chain_provider() after an entry has passed every
@@ -2227,11 +2271,19 @@ static int event_runtime_allowed(EventCtx *c)
                                                          c->target);
         if (unsafe)
         {
-            log_msg(LOG_INFO, "unsafe allowlist hit: %s (pid %d) -> %s",
-                    c->binary, (int)c->ev->pid, c->target);
-            /* Unsafe hits are the ones most worth surfacing: the rule
-             * skips hash pinning, so an impersonated binary matches. */
-            config_rule_notify(c, unsafe, NOTIFY_HIT_UNSAFE, c->comm);
+            int first = unsafe_first_hit(c->ev->pid);
+
+            /* The first hit from a process stands out: WARNING severity
+             * and the matched rule, because the rule skips hash pinning
+             * and an impersonated binary is exactly what this surfaces.
+             * Repeats from the same process stay in the journal at INFO
+             * so the access audit trail remains complete. */
+            log_msg(first ? LOG_WARNING : LOG_INFO,
+                    "unsafe allowlist hit%s: %s (pid %d) -> %s (rule: %s)",
+                    first ? "" : " (repeat)", c->binary, (int)c->ev->pid,
+                    c->target, unsafe->binary);
+            if (first)
+                config_rule_notify(c, unsafe, NOTIFY_HIT_UNSAFE, c->comm);
             config_allow_grant(c, unsafe);
             return 1;
         }
@@ -2919,6 +2971,11 @@ int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path)
 int fanotify_test_resolve_path(int fd, char *out, size_t outsz)
 {
     return resolve_fd_path(fd, out, outsz);
+}
+
+int fanotify_test_unsafe_first_hit(pid_t pid)
+{
+    return unsafe_first_hit(pid);
 }
 
 /*

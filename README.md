@@ -182,7 +182,7 @@ Because an unsafe rule never checks the binary hash, it is only as narrow as its
 
 grants any binary called `openchamber` under a matching `/tmp/.mount_*` directory access to the opencode data directory. An attacker who knows or guesses that such a pattern exists can create a lookalike mount directory and binary and read the secrets through it. The configuration file is root-owned and read-only, but the _pattern_ is guessable, and no hash check stands in the way.
 
-Treat `[unsafe_allowlist]` as a deliberate hole: use it only when the matching binary genuinely cannot be pinned, and keep patterns as narrow as the tool allows. The mitigation is visibility — `notify_unsafe_allowlist` is **on by default**, so every matching hit raises a `critical` desktop notification naming the rule pattern, the concrete binary, its PID and the target file (subject to the [flood control](#notifications)). If a notification appears for a binary you did not launch, treat it as a security incident: read the journal, find the process, and tighten or remove the rule.
+Treat `[unsafe_allowlist]` as a deliberate hole: use it only when the matching binary genuinely cannot be pinned, and keep patterns as narrow as the tool allows. The mitigation is visibility — the **first** hit per process is logged at `WARNING` with the matched rule, binary, PID and target (repeats log at `INFO`), and `notify_unsafe_allowlist` is **on by default**, so it also raises a warning notification (normal urgency, warning icon, subject to the [flood control](#notifications)). If a warning or notification appears for a binary you did not launch, treat it as a security incident: find the process, and tighten or remove the rule.
 
 ### Allowlist
 
@@ -290,7 +290,7 @@ Fileshield can raise a desktop notification through `notify-send` whenever a **c
 | `notify_allowlist`        | `no`    | `[allowlist]` grant (pin match or first use) |
 | `notify_denylist`         | `yes`   | `[denylist]` block                           |
 
-The `[unsafe_allowlist]` and `[denylist]` defaults are the security tripwires: an unsafe hit is a grant that skipped hash pinning (see [Handle with caution](#handle-with-caution)), and a denylist hit is an access someone tried to make. Both use `critical` urgency; the optional allowlist notification is `normal`.
+The `[unsafe_allowlist]` and `[denylist]` defaults are the security tripwires: an unsafe hit is a grant that skipped hash pinning (see [Handle with caution](#handle-with-caution)), and a denylist hit is an access someone tried to make. The unsafe notification uses `normal` urgency with the `dialog-warning` icon (`notify-send` has no warning urgency), the denylist notification uses `critical`, and the optional allowlist notification is `normal`.
 
 A notification names the matched rule pattern, the concrete binary (PID and process name) and the target file:
 
@@ -302,6 +302,8 @@ target: /home/user/.local/share/opencode/auth.json
 ```
 
 An attacker can trigger these notifications, so delivery is bounded by two settings: identical `(list, binary, target)` hits are suppressed for `notify_dedup_ttl` seconds (default 60; `0` notifies every hit), and `notify_max` (default 20) caps how many notifications are delivered per 60-second window — a burst of distinct keys beyond the cap is logged once and dropped for the window. Notifications are best-effort: without a detectable desktop session or without `notify-send`, they are skipped and the access decision is unchanged. The journal remains the authoritative record — a notification is a heads-up, not an audit trail.
+
+`[unsafe_allowlist]` notifications are gated **once per process**: the first unsafe grant from a PID logs at `WARNING` and raises the notification, while later grants by the same process log at `INFO` marked `(repeat)` without notifying. Another process using the same rule is a new instance and surfaces again — so `notify_dedup_ttl` applies to the allowlist and denylist notifications, not to unsafe ones (the global cap still applies to all).
 
 ### Example Workflow
 
@@ -501,7 +503,7 @@ The daemon logs at the following levels:
 | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices), config allowlist first-use hash pins                                                                                                           |
 | `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug`                                                                                     |
-| `WARNING` | Failed marks (path not found), dialog timeout/failure, session detection unavailable, binary digest unavailable when a prompt is shown (the reason follows on the access line), allowlist hash-change prompts (full old/new digests) and approvals, hard-link prompts |
+| `WARNING` | `[unsafe_allowlist]` grants, first hit per process (rule, binary, PID, target), failed marks (path not found), dialog timeout/failure, session detection unavailable, binary digest unavailable when a prompt is shown (the reason follows on the access line), allowlist hash-change prompts (full old/new digests) and approvals, hard-link prompts |
 | `ERR`     | `fanotify_init` failure, config parse error or limit overflow (config refused), untrackable mark (installation fails, kernel mark removed), fork/exec failure, `sha512` helper timeout/failure (names the path and reason), damaged `allowlist-hashes.json`         |
 
 ### Follow live events
