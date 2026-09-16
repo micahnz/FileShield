@@ -58,7 +58,91 @@ static int ensure_state_dir(const char *dirpath)
     return 0;
 }
 
-static int json_escape_string(const char *src, char *dst, size_t dst_size)
+/* Derive the parent directory of filepath and ensure it exists via
+ * ensure_state_dir().  A filepath without a directory component is left
+ * to the working directory (previous persist_save() behavior). */
+static int ensure_parent_dir(const char *filepath)
+{
+    char dirpath[PATH_MAX];
+    char *slash;
+
+    snprintf(dirpath, sizeof(dirpath), "%s", filepath);
+    slash = strrchr(dirpath, '/');
+    if (slash && slash != dirpath)
+    {
+        *slash = '\0';
+        return ensure_state_dir(dirpath);
+    }
+    return 0;
+}
+
+/*
+ * Create '<filepath>.tmp.<pid>' exclusively at 0600 with O_NOFOLLOW, so a
+ * planted symlink is never followed and the file is never readable by
+ * others.  A stale temp file from a crash (EEXIST) is removed and the
+ * open retried once, matching the previous persist_save() behavior.
+ * Returns the fd, or -1 with 'tmp_file' left untouched and an error
+ * logged under the caller tag 'what'.
+ */
+static int open_atomic_temp(const char *filepath, const char *what,
+                            char *tmp_file, size_t tmp_size)
+{
+    int fd;
+
+    snprintf(tmp_file, tmp_size, "%s.tmp.%d", filepath, (int)getpid());
+
+    fd = open(tmp_file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+              0600);
+    if (fd < 0 && errno == EEXIST)
+    {
+        /* Stale temp file from a previous crash: remove and retry once. */
+        unlink(tmp_file);
+        fd = open(tmp_file,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }
+    if (fd < 0)
+        log_msg(LOG_ERR, "%s: open %s: %s", what, tmp_file, strerror(errno));
+    return fd;
+}
+
+/*
+ * Finish an atomic write: flush, fsync (a failure is only a warning, as
+ * persist_save() always treated it), close and rename the temp file over
+ * filepath.  Any failure unlinks the temp file so no partial state is
+ * left behind and returns -1; 'what' tags the log messages.
+ */
+static int commit_atomic_temp(FILE *fp, const char *tmp_file,
+                              const char *filepath, const char *what)
+{
+    if (fflush(fp) < 0)
+    {
+        log_msg(LOG_ERR, "%s: flush %s: %s", what, tmp_file, strerror(errno));
+        fclose(fp);
+        unlink(tmp_file);
+        return -1;
+    }
+    if (fsync(fileno(fp)) < 0)
+        log_msg(LOG_WARNING, "%s: fsync %s: %s", what, tmp_file,
+                strerror(errno));
+
+    if (fclose(fp) < 0)
+    {
+        log_msg(LOG_ERR, "%s: close %s: %s", what, tmp_file, strerror(errno));
+        unlink(tmp_file);
+        return -1;
+    }
+
+    if (rename(tmp_file, filepath) < 0)
+    {
+        log_msg(LOG_ERR, "%s: rename %s -> %s: %s", what, tmp_file, filepath,
+                strerror(errno));
+        unlink(tmp_file);
+        return -1;
+    }
+    return 0;
+}
+
+int persist_json_escape(const char *src, char *dst, size_t dst_size)
 {
     size_t written = 0;
 
@@ -153,8 +237,8 @@ static void copy_field(char *dst, size_t dstsz, const char *src)
  * lines contain routinely (`sh -c "..."`), so the value is decoded
  * escape-aware instead.  Returns 0 for numeric fields or malformed input.
  */
-static int json_extract_string(const char *line, char *key_out, size_t keysz,
-                               char *out, size_t outsz)
+int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
+                                char *out, size_t outsz)
 {
     char found_key[256];
     const char *p;
@@ -435,8 +519,8 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
          * through to apply_entry_number().  Patterns intentionally omit
          * the trailing comma so they match both "value", and "value". */
         char key_buf[256], val_buf[4096];
-        if (json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
-                                sizeof(val_buf)))
+        if (persist_json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
+                                        sizeof(val_buf)))
             apply_entry_field(current, key_buf, val_buf);
         else
             apply_entry_number(current, p);
@@ -447,47 +531,68 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     return count;
 }
 
+int persist_write_text(const char *filepath, const char *text)
+{
+    char tmp_file[PATH_MAX];
+    FILE *fp;
+    size_t len;
+    int fd;
+
+    if (!filepath || !text)
+        return -1;
+
+    if (ensure_parent_dir(filepath) < 0)
+        return -1;
+
+    fd = open_atomic_temp(filepath, "persist_write_text", tmp_file,
+                          sizeof(tmp_file));
+    if (fd < 0)
+        return -1;
+
+    fp = fdopen(fd, "w");
+    if (!fp)
+    {
+        log_msg(LOG_ERR, "persist_write_text: fdopen %s: %s", tmp_file,
+                strerror(errno));
+        close(fd);
+        unlink(tmp_file);
+        return -1;
+    }
+
+    len = strlen(text);
+    if (fwrite(text, 1, len, fp) != len)
+    {
+        log_msg(LOG_ERR, "persist_write_text: write %s: %s", tmp_file,
+                strerror(errno));
+        fclose(fp);
+        unlink(tmp_file);
+        return -1;
+    }
+
+    if (commit_atomic_temp(fp, tmp_file, filepath, "persist_write_text") < 0)
+        return -1;
+
+    log_msg(LOG_INFO, "persist_write_text: wrote %zu bytes to %s", len, filepath);
+    return 0;
+}
+
 int persist_save(const char *filepath, const PersistEntry *entries, int count)
 {
     FILE *fp;
     int i, j;
     char tmp_file[PATH_MAX];
     char escaped[4096];
+    int fd;
 
     if (!entries || count < 0 || count > PERSIST_MAX_ENTRIES)
         return -1;
 
-    /* Derive the parent directory from filepath and ensure it exists. */
-    {
-        char dirpath[PATH_MAX];
-        snprintf(dirpath, sizeof(dirpath), "%s", filepath);
-        char *slash = strrchr(dirpath, '/');
-        if (slash && slash != dirpath)
-        {
-            *slash = '\0';
-            if (ensure_state_dir(dirpath) < 0)
-                return -1;
-        }
-    }
-
-    snprintf(tmp_file, sizeof(tmp_file), "%s.tmp.%d", filepath, (int)getpid());
-
-    /* Create the temp file with restrictive permissions from the start
-     * (never world-readable, never following a planted symlink). */
-    int fd = open(tmp_file,
-                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0 && errno == EEXIST)
-    {
-        /* Stale temp file from a previous crash: remove and retry once. */
-        unlink(tmp_file);
-        fd = open(tmp_file,
-                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    }
-    if (fd < 0)
-    {
-        log_msg(LOG_ERR, "persist_save: open %s: %s", tmp_file, strerror(errno));
+    if (ensure_parent_dir(filepath) < 0)
         return -1;
-    }
+
+    fd = open_atomic_temp(filepath, "persist_save", tmp_file, sizeof(tmp_file));
+    if (fd < 0)
+        return -1;
 
     fp = fdopen(fd, "w");
     if (!fp)
@@ -507,27 +612,27 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
 
         fprintf(fp, "    {\n");
 
-        if (json_escape_string(e->binary, escaped, sizeof(escaped)) > 0)
+        if (persist_json_escape(e->binary, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"binary\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"binary\": \"\",\n");
 
-        if (json_escape_string(e->binary_sha512, escaped, sizeof(escaped)) > 0)
+        if (persist_json_escape(e->binary_sha512, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"binary_sha512\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"binary_sha512\": \"\",\n");
 
-        if (json_escape_string(e->target_path, escaped, sizeof(escaped)) > 0)
+        if (persist_json_escape(e->target_path, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"target_path\": \"\",\n");
 
-        if (json_escape_string(e->cmdline, escaped, sizeof(escaped)) > 0)
+        if (persist_json_escape(e->cmdline, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"cmdline\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"cmdline\": \"\",\n");
 
-        if (json_escape_string(e->cmdline_sha512, escaped, sizeof(escaped)) > 0)
+        if (persist_json_escape(e->cmdline_sha512, escaped, sizeof(escaped)) > 0)
             fprintf(fp, "      \"cmdline_sha512\": \"%s\",\n", escaped);
         else
             fprintf(fp, "      \"cmdline_sha512\": \"\",\n");
@@ -538,7 +643,7 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         /* chain_comm always gets a trailing comma: chain_sha512 fields follow. */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
-            if (json_escape_string(e->chain_comm[j], escaped, sizeof(escaped)) > 0)
+            if (persist_json_escape(e->chain_comm[j], escaped, sizeof(escaped)) > 0)
                 fprintf(fp, "      \"chain_comm[%d]\": \"%s\",\n", j, escaped);
             else
                 fprintf(fp, "      \"chain_comm[%d]\": \"\",\n", j);
@@ -547,7 +652,7 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         /* Last chain_sha512 field has no trailing comma (closes the object). */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
-            if (json_escape_string(e->chain_sha512[j], escaped, sizeof(escaped)) > 0)
+            if (persist_json_escape(e->chain_sha512[j], escaped, sizeof(escaped)) > 0)
                 fprintf(fp, "      \"chain_sha512[%d]\": \"%s\"%s\n", j, escaped,
                         j < PERSIST_CHAIN_MAX - 1 ? "," : "");
             else
@@ -561,30 +666,8 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     fprintf(fp, "  ]\n");
     fprintf(fp, "}\n");
 
-    if (fflush(fp) < 0)
-    {
-        log_msg(LOG_ERR, "persist_save: flush %s: %s", tmp_file, strerror(errno));
-        fclose(fp);
-        unlink(tmp_file);
+    if (commit_atomic_temp(fp, tmp_file, filepath, "persist_save") < 0)
         return -1;
-    }
-    if (fsync(fileno(fp)) < 0)
-        log_msg(LOG_WARNING, "persist_save: fsync %s: %s", tmp_file, strerror(errno));
-
-    if (fclose(fp) < 0)
-    {
-        log_msg(LOG_ERR, "persist_save: close %s: %s", tmp_file, strerror(errno));
-        unlink(tmp_file);
-        return -1;
-    }
-
-    if (rename(tmp_file, filepath) < 0)
-    {
-        log_msg(LOG_ERR, "persist_save: rename %s -> %s: %s", tmp_file, filepath,
-                strerror(errno));
-        unlink(tmp_file);
-        return -1;
-    }
 
     log_msg(LOG_INFO, "persist_save: saved %d entries to %s", count, filepath);
     return 0;

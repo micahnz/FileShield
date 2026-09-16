@@ -458,6 +458,300 @@ static int test_persist_remove(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: persist_write_text roundtrip + 0600 permissions             */
+/* ------------------------------------------------------------------ */
+
+/* Read a whole small file into out (NUL-terminated).  Returns the
+ * number of bytes read, or -1 when the file cannot be opened. */
+static long read_file_text(const char *path, char *out, size_t outsz)
+{
+    FILE *fp = fopen(path, "r");
+    size_t n;
+
+    if (!fp)
+        return -1;
+    n = fread(out, 1, outsz - 1, fp);
+    fclose(fp);
+    out[n] = '\0';
+    return (long)n;
+}
+
+static int test_persist_write_text_roundtrip(void)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX + 64];
+    char buf[256];
+    struct stat st;
+    const char *text = "{\n  \"pin\": \"abc123\"\n}\n";
+
+    make_test_path(path, sizeof(path), "write_text.json");
+    unlink(path);
+
+    ASSERT(persist_write_text(path, text) == 0, "persist_write_text returns 0");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == (long)strlen(text),
+           "write_text wrote the exact length");
+    ASSERT(strcmp(buf, text) == 0, "write_text wrote the exact bytes");
+
+    ASSERT(stat(path, &st) == 0, "stat written file");
+    ASSERT((st.st_mode & 0777) == 0600, "new file mode is 0600");
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    ASSERT(access(tmp, F_OK) != 0, "no temp file left after success");
+
+    unlink(path);
+    TEST_PASS("persist_write_text roundtrip + 0600 mode");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_write_text replaces an existing file                */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_write_text_overwrite(void)
+{
+    char path[PATH_MAX];
+    char buf[256];
+    struct stat st;
+    const char *first = "first-version-with-a-longer-body\n";
+    const char *second = "second\n";
+
+    make_test_path(path, sizeof(path), "write_text_overwrite.json");
+    unlink(path);
+
+    ASSERT(persist_write_text(path, first) == 0, "initial write succeeds");
+    ASSERT(persist_write_text(path, second) == 0, "overwrite succeeds");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == (long)strlen(second),
+           "overwritten file has the new length");
+    ASSERT(strcmp(buf, second) == 0, "overwritten file has the new content");
+
+    ASSERT(stat(path, &st) == 0, "stat overwritten file");
+    ASSERT((st.st_mode & 0777) == 0600, "overwritten file stays 0600");
+
+    unlink(path);
+    TEST_PASS("persist_write_text overwrite");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_write_text creates a missing parent directory 0700  */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_write_text_creates_dir(void)
+{
+    char dir[PATH_MAX];
+    char path[PATH_MAX + 32];
+    char buf[64];
+    struct stat st;
+    const char *text = "nested-state";
+
+    snprintf(dir, sizeof(dir), "%s/write_text_dir", g_test_dir);
+    snprintf(path, sizeof(path), "%s/state.json", dir);
+    unlink(path);
+    rmdir(dir);
+
+    ASSERT(persist_write_text(path, text) == 0, "write into a missing parent dir");
+    ASSERT(stat(dir, &st) == 0 && S_ISDIR(st.st_mode), "parent dir created");
+    ASSERT((st.st_mode & 0777) == 0700, "parent dir mode is 0700");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == (long)strlen(text) &&
+           strcmp(buf, text) == 0, "file inside the new dir matches");
+
+    unlink(path);
+    rmdir(dir);
+    TEST_PASS("persist_write_text creates missing parent dir");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_write_text failure paths leave no partial state     */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_write_text_failure(void)
+{
+    char blocker[PATH_MAX];
+    char path[PATH_MAX + 32];
+    char tmp[PATH_MAX + 64];
+    struct stat st;
+
+    /* A regular file where a directory is needed: creating the parent
+     * must fail before any temp file exists. */
+    make_test_path(blocker, sizeof(blocker), "write_text_blocker");
+    snprintf(path, sizeof(path), "%s/child.json", blocker);
+    unlink(path);
+    unlink(blocker);
+    ASSERT(write_raw_file(blocker, "not a directory") == 0,
+           "create blocker file");
+
+    ASSERT(persist_write_text(path, "data") == -1, "un-creatable parent fails");
+    ASSERT(stat(path, &st) != 0, "no target file left after failure");
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    ASSERT(access(tmp, F_OK) != 0, "no temp file after parent failure");
+    unlink(blocker);
+
+    /* A directory at the target path lets the temp file be written but
+     * makes the final rename fail: the temp must be cleaned up and the
+     * directory left untouched. */
+    make_test_path(path, sizeof(path), "write_text_target_dir");
+    rmdir(path);
+    ASSERT(mkdir(path, 0700) == 0, "create directory at target path");
+
+    ASSERT(persist_write_text(path, "data") == -1, "write over directory fails");
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    ASSERT(access(tmp, F_OK) != 0, "temp removed when rename fails");
+    ASSERT(stat(path, &st) == 0 && S_ISDIR(st.st_mode), "target dir untouched");
+
+    rmdir(path);
+    TEST_PASS("persist_write_text failure paths");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: a planted symlink at the temp path is never followed        */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_write_text_symlink_temp(void)
+{
+    char path[PATH_MAX];
+    char victim[PATH_MAX];
+    char tmp[PATH_MAX + 64];
+    char buf[64];
+    struct stat st;
+
+    make_test_path(path, sizeof(path), "write_text_symlink.json");
+    make_test_path(victim, sizeof(victim), "write_text_symlink_victim");
+    unlink(path);
+    unlink(victim);
+    ASSERT(write_raw_file(victim, "victim") == 0, "create symlink victim");
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    unlink(tmp);
+    ASSERT(symlink(victim, tmp) == 0, "plant symlink at the temp path");
+
+    ASSERT(persist_write_text(path, "safe") == 0,
+           "write replaces the planted symlink with a real temp file");
+    ASSERT(read_file_text(victim, buf, sizeof(buf)) == 6 &&
+               strcmp(buf, "victim") == 0,
+           "symlink target is untouched");
+    ASSERT(lstat(tmp, &st) != 0, "no temp file left after the write");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == 4 &&
+               strcmp(buf, "safe") == 0,
+           "target file holds the written text");
+
+    unlink(path);
+    unlink(victim);
+    TEST_PASS("write_text never follows a planted temp symlink");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: public JSON escape/extract helpers roundtrip                */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_json_helpers(void)
+{
+    const char *raw = "a\"b\\c\nd"; /* quote, backslash, newline */
+    const char *expected_escaped = "a\\\"b\\\\c\\nd";
+    char escaped[64];
+    char line[128];
+    char key[64];
+    char out[64];
+    char tiny[4];
+    int n;
+
+    n = persist_json_escape(raw, escaped, sizeof(escaped));
+    ASSERT(n == (int)strlen(expected_escaped), "escape returns written length");
+    ASSERT(strcmp(escaped, expected_escaped) == 0, "escape output is exact");
+
+    snprintf(line, sizeof(line), "  \"cmdline\": \"%s\",", escaped);
+    ASSERT(persist_json_extract_string(line, key, sizeof(key), out,
+                                       sizeof(out)) == 1,
+           "extract finds the string pair");
+    ASSERT(strcmp(key, "cmdline") == 0, "extract returns the key");
+    ASSERT(strcmp(out, raw) == 0, "escape/extract roundtrip");
+
+    /* Control characters decode from \uXXXX back to their byte value. */
+    {
+        const char *ctrl = "x\x01y";
+        char ctrl_escaped[32];
+        char ctrl_line[64];
+
+        ASSERT(persist_json_escape(ctrl, ctrl_escaped, sizeof(ctrl_escaped)) > 0,
+               "escape control character");
+        ASSERT(strcmp(ctrl_escaped, "x\\u0001y") == 0,
+               "control char uses \\u form");
+        snprintf(ctrl_line, sizeof(ctrl_line), "  \"v\": \"%s\"", ctrl_escaped);
+        ASSERT(persist_json_extract_string(ctrl_line, key, sizeof(key), out,
+                                           sizeof(out)) == 1,
+               "extract control char value");
+        ASSERT(strcmp(out, ctrl) == 0, "control char roundtrip");
+    }
+
+    /* Error paths: too-small escape buffer and numeric values. */
+    ASSERT(persist_json_escape("abcdef", tiny, sizeof(tiny)) == -1,
+           "escape fails when the buffer is too small");
+    ASSERT(persist_json_extract_string("  \"chain_depth\": 2,", key, sizeof(key),
+                                       out, sizeof(out)) == 0,
+           "extract rejects numeric values");
+
+    TEST_PASS("persist_json_escape/extract public helpers");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_save serialization is byte-for-byte fixed           */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_save_fixed_bytes(void)
+{
+    char path[PATH_MAX];
+    char content[2048];
+    PersistEntry in[1];
+    static const char expected[] =
+        "{\n"
+        "  \"entries\": [\n"
+        "    {\n"
+        "      \"binary\": \"/usr/bin/fixed\",\n"
+        "      \"binary_sha512\": \"abc123\",\n"
+        "      \"target_path\": \"/etc/fixed.conf\",\n"
+        "      \"cmdline\": \"fixed --run\",\n"
+        "      \"cmdline_sha512\": \"def456\",\n"
+        "      \"chain_depth\": 1,\n"
+        "      \"created_at\": 1700002000,\n"
+        "      \"chain_comm[0]\": \"bash\",\n"
+        "      \"chain_comm[1]\": \"\",\n"
+        "      \"chain_comm[2]\": \"\",\n"
+        "      \"chain_sha512[0]\": \"111\",\n"
+        "      \"chain_sha512[1]\": \"\",\n"
+        "      \"chain_sha512[2]\": \"\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n";
+
+    make_test_path(path, sizeof(path), "fixed_bytes.json");
+    unlink(path);
+
+    memset(in, 0, sizeof(in));
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/fixed");
+    snprintf(in[0].binary_sha512, sizeof(in[0].binary_sha512), "abc123");
+    snprintf(in[0].target_path, sizeof(in[0].target_path), "/etc/fixed.conf");
+    snprintf(in[0].cmdline, sizeof(in[0].cmdline), "fixed --run");
+    snprintf(in[0].cmdline_sha512, sizeof(in[0].cmdline_sha512), "def456");
+    in[0].chain_depth = 1;
+    snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "bash");
+    snprintf(in[0].chain_sha512[0], sizeof(in[0].chain_sha512[0]), "111");
+    in[0].created_at = (time_t)1700002000;
+
+    ASSERT(persist_save(path, in, 1) == 0, "persist_save fixed entry");
+    ASSERT(read_file_text(path, content, sizeof(content)) == (long)strlen(expected),
+           "fixed entry serializes to the expected length");
+    ASSERT(strcmp(content, expected) == 0,
+           "fixed entry serializes byte-for-byte unchanged");
+
+    unlink(path);
+    TEST_PASS("persist_save serialization unchanged");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -486,6 +780,13 @@ int main(void)
     failed |= test_persist_truncated();
     failed |= test_persist_over_cap();
     failed |= test_persist_remove();
+    failed |= test_persist_write_text_roundtrip();
+    failed |= test_persist_write_text_overwrite();
+    failed |= test_persist_write_text_creates_dir();
+    failed |= test_persist_write_text_failure();
+    failed |= test_persist_write_text_symlink_temp();
+    failed |= test_persist_json_helpers();
+    failed |= test_persist_save_fixed_bytes();
 
     rmdir(g_test_dir);
 

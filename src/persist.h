@@ -2,6 +2,7 @@
 #define FILESHIELD_PERSIST_H
 
 #include <sys/types.h>
+#include <stddef.h>
 #include <limits.h>
 
 #define PERSIST_MAX_ENTRIES 256
@@ -37,5 +38,38 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
 
 /* Save entries to JSON file. Returns 0 on success, -1 on error. */
 int persist_save(const char *filepath, const PersistEntry *entries, int count);
+
+/*
+ * Shared JSON and atomic-write primitives.  pin.c reuses these so every
+ * state file is escaped and committed exactly like the runtime lists.
+ */
+
+/*
+ * Escape src for embedding inside a double-quoted JSON string (quotes,
+ * backslashes and control characters).  Writes at most dst_size-1 bytes
+ * plus the terminating NUL and returns the number of bytes written, or
+ * -1 when the value does not fit or an argument is NULL.
+ */
+int persist_json_escape(const char *src, char *dst, size_t dst_size);
+
+/*
+ * Extract the first "key": "value" string pair from one JSON line,
+ * decoding escape sequences.  Returns 1 and fills key_out/out when a
+ * string pair was found, 0 for numeric values, malformed input, or when
+ * the decoded value does not fit.  out is always NUL-terminated on
+ * success (on failure it holds an empty string).
+ */
+int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
+                                char *out, size_t outsz);
+
+/*
+ * Atomically write text (a NUL-terminated string, written without its
+ * NUL) to filepath: the parent directory is created when missing (0700,
+ * root-ownership and symlink checks), the bytes go to a 0600 temp file
+ * opened O_EXCL|O_CLOEXEC|O_NOFOLLOW, and the temp file is renamed over
+ * filepath.  Returns 0 on success; -1 on any failure, with the temp
+ * file removed and any existing filepath left untouched.
+ */
+int persist_write_text(const char *filepath, const char *text);
 
 #endif
