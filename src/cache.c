@@ -42,9 +42,10 @@ static void cache_init(void)
 
 /*
  * Read the process start time (field 22 of /proc/<pid>/stat, in clock
- * ticks since boot).  Returns 0 when it cannot be determined; callers
- * treat 0 as "unknown" and only match other unknown values, so a PID
- * that cannot be verified is never silently trusted.
+ * ticks since boot).  Returns 0 when it cannot be determined.  An entry
+ * whose start time is unknown only matches a lookup whose start time is
+ * also unknown: for both sides to be 0, /proc must have been unreadable
+ * at insert and at lookup, and the entry is still pid/path/TTL-scoped.
  */
 static unsigned long long proc_start_time(pid_t pid)
 {

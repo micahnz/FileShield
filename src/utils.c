@@ -32,7 +32,9 @@ char *proc_exe_path(pid_t pid)
 
     char buf[PATH_MAX];
     ssize_t len = readlink(linkpath, buf, sizeof(buf) - 1);
-    if (len < 0)
+    /* A truncated result (a path near PATH_MAX with the " (deleted)"
+     * suffix) is unverifiable: report failure rather than a wrong path. */
+    if (len < 0 || len >= (ssize_t)sizeof(buf) - 1)
         return NULL;
     buf[len] = '\0';
     return strdup(buf);
@@ -63,6 +65,9 @@ int read_comm(pid_t pid, char *out, size_t size)
     FILE *f;
     size_t len;
 
+    if (size < 2)
+        return -1;
+
     snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
     f = fopen(path, "r");
     if (!f)
@@ -82,6 +87,9 @@ int read_comm(pid_t pid, char *out, size_t size)
 int read_cmdline(pid_t pid, char *out, size_t size)
 {
     char path[64];
+
+    if (size < 2)
+        return -1;
     snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
     int fd_c = open(path, O_RDONLY | O_CLOEXEC);
     if (fd_c < 0)

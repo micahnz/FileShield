@@ -273,9 +273,17 @@ static void kill_helper_bounded(pid_t pid, const char *label)
             label, (int)pid, REAP_KILL_TRIES * 10);
 }
 
+/* Monotonic milliseconds: wall-clock steps must not extend a deadline. */
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int reap_helper(pid_t pid, const char *label, int *status_out)
 {
-    time_t deadline = time(NULL) + REAP_DEADLINE_S;
+    long long deadline = now_ms() + REAP_DEADLINE_S * 1000;
 
     for (;;)
     {
@@ -285,7 +293,7 @@ static int reap_helper(pid_t pid, const char *label, int *status_out)
             return 0;
         if (w < 0 && errno != EINTR)
             return -1;
-        if (time(NULL) >= deadline)
+        if (now_ms() >= deadline)
             break;
         usleep(10000); /* 10 ms tick */
     }
@@ -323,11 +331,11 @@ static int collect_digest(int fd, pid_t pid, const char *label,
     char buf[200];
     ssize_t total = 0;
     int timed_out = 0;
-    time_t deadline = time(NULL) + SHA512_TIMEOUT_S;
+    long long deadline = now_ms() + SHA512_TIMEOUT_S * 1000;
 
     while (total < (ssize_t)sizeof(buf) - 1)
     {
-        int remaining_ms = (int)(difftime(deadline, time(NULL)) * 1000.0);
+        int remaining_ms = (int)(deadline - now_ms());
         if (remaining_ms <= 0)
         {
             timed_out = 1;

@@ -63,10 +63,18 @@ void inode_set_add(dev_t dev, ino_t ino)
 
     if (g_inode_count >= INODE_SET_MAX)
     {
-        log_msg(LOG_ERR,
-                "inode table full (max %d); hard-link detection is "
-                "incomplete",
-                INODE_SET_MAX);
+        /* Log once: a protected tree can overflow the cap by thousands of
+         * files, and one line per file would bury the journal. */
+        static int logged_full;
+
+        if (!logged_full)
+        {
+            logged_full = 1;
+            log_msg(LOG_ERR,
+                    "inode table full (max %d); hard-link detection is "
+                    "incomplete (further drops are not logged)",
+                    INODE_SET_MAX);
+        }
         return;
     }
     g_slots[idx].dev = dev;

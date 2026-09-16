@@ -21,6 +21,14 @@
 #include "session.h"
 #include "utils.h"
 
+/* Monotonic milliseconds: wall-clock steps must not extend a deadline. */
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /*
  * Fanotify fd stored here so run_kdialog() can pump pending events
  * while waiting for the dialog child (prevents mount-mark deadlock).
@@ -542,9 +550,9 @@ static int run_kdialog(const DisplaySession *session,
     log_msg(LOG_DEBUG, "[dialog] parent waiting for kdialog (pid=%d)", (int)pid);
     int child_exited = 0;
     int status = 0;
-    time_t deadline = time(NULL) + DIALOG_OUTER_TIMEOUT_S;
+    long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
 
-    while (!child_exited && time(NULL) < deadline)
+    while (!child_exited && now_ms() < deadline)
     {
         struct pollfd pfd;
         int nfds = 0;

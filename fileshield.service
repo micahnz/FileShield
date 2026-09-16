@@ -11,8 +11,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
-# Display settings are auto-detected from /run/user/ at runtime (Wayland and X11).
-# Override here only if auto-detection fails in your setup:
+# The Wayland session is auto-detected from /run/user/ at runtime.  X11 is
+# not auto-detected: set DISPLAY here for X11 desktops.
 # Environment=WAYLAND_DISPLAY=wayland-1
 # Environment=DISPLAY=:0
 
