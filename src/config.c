@@ -1,6 +1,8 @@
 #include "config.h"
 #include "utils.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +45,26 @@ static int parse_bool(const char *val, int *out)
         return 1;
     }
     return 0;
+}
+
+/*
+ * Parse a non-negative integer setting.  strtol is used instead of
+ * sscanf("%d"): sscanf on overflow is undefined and accepts trailing
+ * junk, and a hand-edited config must fail loudly rather than take a
+ * garbage value.  Returns 1 on success, 0 when the value is not a
+ * usable non-negative integer.
+ */
+static int parse_int_setting(const char *val, int *out)
+{
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(val, &end, 10);
+    if (end == val || *end != '\0' || errno == ERANGE || v < 0 || v > INT_MAX)
+        return 0;
+    *out = (int)v;
+    return 1;
 }
 
 /*
@@ -599,8 +621,9 @@ int config_load(const char *path, Config *cfg)
             char *val = trim(eq + 1);
             if (strcmp(key, "user_ttl") == 0)
             {
+                /* 0 disables "Allow Once" caching: each open prompts again. */
                 int ttl;
-                if (sscanf(val, "%d", &ttl) == 1 && ttl > 0)
+                if (parse_int_setting(val, &ttl))
                 {
                     if (ttl > FS_MAX_TTL_SECONDS)
                     {
@@ -619,7 +642,7 @@ int config_load(const char *path, Config *cfg)
                 /* 0 is a valid value: session decisions then live exactly
                  * as long as the session leader (the shell). */
                 int ttl;
-                if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
+                if (parse_int_setting(val, &ttl))
                 {
                     if (ttl > FS_MAX_TTL_SECONDS)
                     {
@@ -679,7 +702,7 @@ int config_load(const char *path, Config *cfg)
                 /* Seconds an identical (list, binary, target) notification is
                  * suppressed; 0 notifies on every hit. */
                 int ttl;
-                if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
+                if (parse_int_setting(val, &ttl))
                 {
                     if (ttl > FS_MAX_TTL_SECONDS)
                     {
@@ -699,7 +722,7 @@ int config_load(const char *path, Config *cfg)
                 /* Global cap per 60 s window; the dedup window bounds each
                  * key, this bounds a burst of distinct keys. */
                 int max;
-                if (sscanf(val, "%d", &max) == 1 && max >= 1)
+                if (parse_int_setting(val, &max) && max >= 1)
                     cfg->notify_max = max;
                 else
                     log_msg(LOG_ERR, "config_load: invalid notify_max (>= 1): %s",

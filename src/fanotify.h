@@ -206,4 +206,15 @@ int fanotify_test_unsafe_first_hit(pid_t pid);
 int fanotify_test_mark_path(const char *path, char *out, size_t outsz);
 unsigned long long fanotify_test_mount_id(const char *path);
 
+/*
+ * Test seams: the recent-decision dedup cache.  The key is
+ * (pid, dev, ino, resolved path); a newer decision replaces an older one
+ * for the same key, and a reload clears the cache.
+ */
+void fanotify_test_recent_insert(pid_t pid, dev_t dev, ino_t ino,
+                                 const char *target, int decision);
+int fanotify_test_recent_lookup(pid_t pid, dev_t dev, ino_t ino,
+                                const char *target);
+void fanotify_test_recent_clear(void);
+
 #endif

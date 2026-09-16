@@ -1802,7 +1802,10 @@ static void handle_notification_event(int fan_fd,
  * RECENT_CACHE_MAX events so the second identical event is resolved
  * instantly without showing a second dialog.
  *
- * Entries expire after RECENT_CACHE_TTL_MS milliseconds.
+ * Entries expire after RECENT_CACHE_TTL_MS milliseconds.  The resolved
+ * path is part of the key: a hard link reaches the same inode through a
+ * different path and must not inherit the decision.  A config reload
+ * clears the cache so a changed rule set is never replayed around.
  */
 #define RECENT_CACHE_MAX 32
 #define RECENT_CACHE_TTL_MS 2000
@@ -1812,36 +1815,58 @@ typedef struct
     pid_t pid;
     dev_t dev;
     ino_t ino;
-    int fan_decision; /* FAN_ALLOW or FAN_DENY */
+    char target[PATH_MAX]; /* resolved path: hard links share the inode */
+    int fan_decision;      /* FAN_ALLOW or FAN_DENY */
     struct timespec ts;
 } RecentDecision;
 
 static RecentDecision g_recent[RECENT_CACHE_MAX];
 static int g_recent_count = 0;
-static int g_recent_head = 0; /* ring-buffer write head */
+static unsigned int g_recent_head = 0; /* ring-buffer write head (wraps) */
 
-static void recent_cache_insert(pid_t pid, dev_t dev, ino_t ino, int decision)
+static void recent_cache_insert(pid_t pid, dev_t dev, ino_t ino,
+                                const char *target, int decision)
 {
-    int slot = g_recent_head % RECENT_CACHE_MAX;
+    unsigned int slot;
+
+    /* One entry per key: a newer decision must shadow an older one for the
+     * same (pid, inode, path) instead of living beside it in the ring. */
+    for (int i = 0; i < g_recent_count; i++)
+    {
+        RecentDecision *e = &g_recent[i];
+        if (e->pid == pid && e->dev == dev && e->ino == ino &&
+            strcmp(e->target, target) == 0)
+        {
+            e->fan_decision = decision;
+            clock_gettime(CLOCK_MONOTONIC, &e->ts);
+            return;
+        }
+    }
+
+    slot = g_recent_head % RECENT_CACHE_MAX;
     g_recent[slot].pid = pid;
     g_recent[slot].dev = dev;
     g_recent[slot].ino = ino;
+    snprintf(g_recent[slot].target, sizeof(g_recent[slot].target), "%s",
+             target);
     g_recent[slot].fan_decision = decision;
     clock_gettime(CLOCK_MONOTONIC, &g_recent[slot].ts);
-    g_recent_head++;
+    g_recent_head++; /* unsigned: wraps cleanly at 2^32 */
     if (g_recent_count < RECENT_CACHE_MAX)
         g_recent_count++;
 }
 
 /* Returns FAN_ALLOW, FAN_DENY, or -1 (not found / expired). */
-static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino)
+static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino,
+                               const char *target)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     for (int i = 0; i < g_recent_count; i++)
     {
         RecentDecision *e = &g_recent[i];
-        if (e->pid != pid || e->dev != dev || e->ino != ino)
+        if (e->pid != pid || e->dev != dev || e->ino != ino ||
+            strcmp(e->target, target) != 0)
             continue;
         long age_ms = (now.tv_sec - e->ts.tv_sec) * 1000L + (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
         if (age_ms > RECENT_CACHE_TTL_MS)
@@ -1849,6 +1874,32 @@ static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino)
         return e->fan_decision;
     }
     return -1;
+}
+
+/* Drop every cached decision (config reload: the rule set changed). */
+static void recent_cache_clear(void)
+{
+    g_recent_count = 0;
+    g_recent_head = 0;
+}
+
+/* Test seams (fanotify.h): the dedup cache, unprivileged and side-effect
+ * free beyond the cache itself. */
+void fanotify_test_recent_insert(pid_t pid, dev_t dev, ino_t ino,
+                                 const char *target, int decision)
+{
+    recent_cache_insert(pid, dev, ino, target, decision);
+}
+
+int fanotify_test_recent_lookup(pid_t pid, dev_t dev, ino_t ino,
+                                const char *target)
+{
+    return recent_cache_lookup(pid, dev, ino, target);
+}
+
+void fanotify_test_recent_clear(void)
+{
+    recent_cache_clear();
 }
 
 /* ------------------------------------------------------------------ */
@@ -2152,7 +2203,8 @@ static const char *event_cmdline_fp(EventCtx *c)
  */
 static void ctx_respond(EventCtx *c, unsigned int response)
 {
-    recent_cache_insert(c->ev->pid, c->ev_dev, c->ev_ino, (int)response);
+    recent_cache_insert(c->ev->pid, c->ev_dev, c->ev_ino, c->target,
+                        (int)response);
     fanotify_respond(c->fan_fd, c->ev, response);
 }
 
@@ -2214,7 +2266,8 @@ static int event_fastpath(EventCtx *c)
     {
         c->ev_dev = st.st_dev;
         c->ev_ino = st.st_ino;
-        int cached = recent_cache_lookup(c->ev->pid, c->ev_dev, c->ev_ino);
+        int cached = recent_cache_lookup(c->ev->pid, c->ev_dev, c->ev_ino,
+                                         c->target);
         if (cached != -1)
         {
             log_msg(LOG_DEBUG,
@@ -2920,11 +2973,12 @@ static int pump_decide_permission(int fan_fd,
             }
             else
             {
-                /* Can't resolve path; allow to avoid stalling. */
+                /* Cannot resolve the path: treat it as protected and defer
+                 * to the main loop (fail closed), matching the main loop's
+                 * resolve-failure deny. */
                 log_msg(LOG_DEBUG,
-                        "[pump] ALLOW fd=%d pid=%d (path unresolvable)",
+                        "[pump] QUEUE fd=%d pid=%d (path unresolvable)",
                         fd_num, (int)ev->pid);
-                allow = 1;
             }
         }
     }
@@ -3063,6 +3117,7 @@ void fanotify_clear_marks(int fd)
     }
     g_mount_count = 0;
     inode_set_clear();
+    recent_cache_clear(); /* a reload may change every verdict */
     log_msg(LOG_INFO, "marks and inode table cleared");
 }
 
