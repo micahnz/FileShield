@@ -10,7 +10,7 @@ int fanotify_setup(void);
 /*
  * Add a mark for a protected path.
  * Returns 0 when the path was marked directly, 1 when the path does not
- * exist yet (skipped; a filesystem-level mark is ensured so a
+ * exist yet (skipped; a mount mark for its filesystem is ensured so a
  * later-created path is still intercepted), or -1 on a real error.
  */
 int fanotify_add_mark(int fd, const char *path);
@@ -25,7 +25,7 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
 void fanotify_loop(int fd);
 
-/* Non-zero when at least one file/directory or filesystem/mount mark is active. */
+/* Non-zero when at least one file/directory or mount mark is active. */
 int fanotify_any_mark_active(void);
 
 /*
@@ -38,7 +38,7 @@ int fanotify_any_mark_active(void);
 unsigned int fanotify_mark_mask(void);
 
 /*
- * Clear filesystem/mount marks and the inode table before a config reload.
+ * Clear mount marks and inode table before a config reload.
  */
 void fanotify_clear_marks(int fd);
 

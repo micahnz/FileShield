@@ -92,7 +92,7 @@ static void daemonize(void)
  * Install a mark for every configured positive protected path
  * (exclusions are never marked; fanotify_add_protected returns 0 for
  * them).  Returns the number of real failures; paths that do not exist
- * yet (rc 1) are counted in *skipped — a filesystem mark covers
+ * yet (rc 1) are counted in *skipped — a filesystem mount mark covers
  * them if they appear later.  Callers treat any failure as fatal (fail
  * closed).
  */
@@ -243,7 +243,7 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
 
     log_msg(LOG_INFO,
             "config reloaded, watching %d paths (%d exclusions, "
-            "%d missing, covered by filesystem marks)",
+            "%d missing, covered by mount marks)",
             new_cfg->protected_count - new_cfg->exclude_count,
             new_cfg->exclude_count, skipped);
     free(*cfg);
@@ -386,7 +386,7 @@ int main(int argc, char *argv[])
     if (mark_skipped > 0)
         log_msg(LOG_WARNING,
                 "%d protected path(s) do not exist yet; they are covered by "
-                "the filesystem mark if created later (reload for a "
+                "the filesystem mount mark if created later (reload for a "
                 "direct mark)",
                 mark_skipped);
 

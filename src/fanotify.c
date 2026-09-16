@@ -1013,16 +1013,12 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
 
 #define MAX_INODE_WALK_DEPTH 8 /* max recursion depth for protected-directory inode enumeration */
 
-/* One filesystem-level mark per unique filesystem device.  The daemon
- * prefers FAN_MARK_FILESYSTEM (superblock-scoped: events are seen from
- * every mount and every mount namespace) and falls back to
- * FAN_MARK_MOUNT where the kernel or filesystem does not support it. */
+/* One FAN_MARK_MOUNT per unique filesystem device */
 #define MAX_MOUNTS 32
 typedef struct
 {
     dev_t dev;
-    unsigned int mark_flags; /* FAN_MARK_FILESYSTEM or FAN_MARK_MOUNT */
-    char path[PATH_MAX];     /* any path on that filesystem, for removal */
+    char path[PATH_MAX]; /* any path on that mount, used for mark removal */
 } MountEntry;
 static MountEntry g_mounts[MAX_MOUNTS];
 static int g_mount_count = 0;
@@ -1109,8 +1105,8 @@ static const ProtectedPath *exclusion_match(const char *path)
  * Returns 1 if `path` falls under any currently protected path and no
  * exclusion matches it.  Deny wins and config order does not matter: a
  * path is protected iff a positive matches and no '!' entry does.
- * Used to distinguish events from directory marks vs. filesystem/mount
- * marks (hard-link).
+ * Used to distinguish events from directory marks vs. mount marks
+ * (hard-link).
  */
 static int is_path_under_protected(const char *path)
 {
@@ -1249,24 +1245,12 @@ int fanotify_setup(void)
     return fd;
 }
 
-/* Add one filesystem-level mark for the filesystem containing st, if not
- * already tracked.  "path" may be any existing path on that filesystem;
- * it is remembered for mark removal.
- *
- * A FAN_MARK_FILESYSTEM mark is superblock-scoped: it sees opens through
- * every mount of the filesystem, including mounts in other mount
- * namespaces.  That matters because systemd sandboxing (ProtectSystem=,
- * PrivateTmp=, ProtectProc=) runs the daemon in a private mount
- * namespace, where a FAN_MARK_MOUNT mark would only see accesses made
- * through the daemon's own mount instances.  Mount marks remain the
- * fallback for kernels/filesystems without filesystem-mark support
- * (e.g. btrfs subvolumes, zero-fsid filesystems). */
+/* Add a FAN_MARK_MOUNT for the filesystem containing st, if not already
+ * tracked.  "path" may be any existing path on that filesystem; it is
+ * remembered for mark removal. */
 static void add_mount_mark_if_needed(int fd, const struct stat *st,
                                      const char *path)
 {
-    unsigned int mark_flags = FAN_MARK_FILESYSTEM;
-    int fs_errno;
-
     for (int i = 0; i < g_mount_count; i++)
     {
         if (g_mounts[i].dev == st->st_dev)
@@ -1282,44 +1266,30 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
         return;
     }
 
-    if (fanotify_mark(fd, FAN_MARK_ADD | mark_flags,
-                      FAN_OPEN_PERM, AT_FDCWD, path) < 0)
+    if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+                      FAN_OPEN_PERM, AT_FDCWD, path) == 0)
     {
-        fs_errno = errno;
-        mark_flags = FAN_MARK_MOUNT;
-        if (fanotify_mark(fd, FAN_MARK_ADD | mark_flags,
-                          FAN_OPEN_PERM, AT_FDCWD, path) < 0)
-        {
-            log_msg(LOG_ERR,
-                    "fanotify mark failed for %s: %s "
-                    "(hard-link detection disabled for this filesystem)",
-                    path, strerror(errno));
-            return;
-        }
-        log_msg(LOG_DEBUG,
-                "fanotify filesystem mark unsupported for %s (%s); "
-                "falling back to a mount mark",
-                path, strerror(fs_errno));
+        g_mounts[g_mount_count].dev = st->st_dev;
+        snprintf(g_mounts[g_mount_count].path,
+                 sizeof(g_mounts[g_mount_count].path), "%s", path);
+        g_mount_count++;
+        log_msg(LOG_INFO, "fanotify mount mark added (dev %lu) for hard-link detection",
+                (unsigned long)st->st_dev);
     }
-
-    g_mounts[g_mount_count].dev = st->st_dev;
-    g_mounts[g_mount_count].mark_flags = mark_flags;
-    snprintf(g_mounts[g_mount_count].path,
-             sizeof(g_mounts[g_mount_count].path), "%s", path);
-    g_mount_count++;
-    log_msg(LOG_INFO, "%s added (dev %lu) for hard-link detection",
-            mark_flags == FAN_MARK_FILESYSTEM
-                ? "fanotify filesystem mark"
-                : "fanotify mount mark",
-            (unsigned long)st->st_dev);
+    else
+    {
+        log_msg(LOG_ERR,
+                "fanotify mount mark failed for %s: %s "
+                "(hard-link detection disabled for this filesystem)",
+                path, strerror(errno));
+    }
 }
 
 /*
  * A configured path that does not exist yet cannot be marked directly.
  * Walk up to the nearest existing ancestor and make sure its filesystem
- * carries a filesystem mark (mount mark on fallback), so an open of the
- * path after it is created is still intercepted and matched by
- * is_path_under_protected().
+ * carries a mount mark, so an open of the path after it is created is
+ * still intercepted and matched by is_path_under_protected().
  */
 static void ensure_mount_mark_for_missing(int fd, const char *path)
 {
@@ -1352,7 +1322,7 @@ int fanotify_add_mark(int fd, const char *path)
         if (errno == ENOENT)
         {
             /* Not an error: the secret file simply does not exist yet.
-             * The filesystem mark keeps the path monitored once it appears. */
+             * The mount mark keeps the path monitored once it appears. */
             ensure_mount_mark_for_missing(fd, path);
             log_msg(LOG_WARNING,
                     "protected path does not exist yet, skipping direct mark: %s",
@@ -1399,7 +1369,7 @@ int fanotify_add_mark(int fd, const char *path)
  * pattern cannot be stat()ed or marked, so its canonical wildcard-free
  * base is marked instead and the pattern is enforced at match time by
  * is_path_under_protected().  A base that does not exist yet follows
- * the same contract as a missing exact path (filesystem mark up the tree,
+ * the same contract as a missing exact path (mount mark up the tree,
  * return 1/skipped).  Hard-link inode tracking for a glob base records
  * only the files the pattern matches.  Exclusion entries mark nothing
  * and return 0.
@@ -1466,7 +1436,7 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp)
     return 0;
 }
 
-/* Non-zero when at least one file/directory or filesystem/mount mark is active. */
+/* Non-zero when at least one file/directory or mount mark is active. */
 int fanotify_any_mark_active(void)
 {
     return g_mark_count > 0 || g_mount_count > 0;
@@ -2765,7 +2735,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 void fanotify_clear_marks(int fd)
 {
     /* Remove every mark this daemon installed (tracked in g_marks),
-     * including auto-added directory marks, then the filesystem/mount marks, and
+     * including auto-added directory marks, then the mount marks, and
      * clear the in-memory tables.  Called before a config reload so the
      * tables are rebuilt cleanly by the subsequent fanotify_add_mark()
      * calls.  Any deferred permission event is denied first (fail closed). */
@@ -2787,10 +2757,10 @@ void fanotify_clear_marks(int fd)
 
     for (int i = 0; i < g_mount_count; i++)
     {
-        if (fanotify_mark(fd, FAN_MARK_REMOVE | g_mounts[i].mark_flags,
+        if (fanotify_mark(fd, FAN_MARK_REMOVE | FAN_MARK_MOUNT,
                           FAN_OPEN_PERM, AT_FDCWD, g_mounts[i].path) < 0)
         {
-            log_msg(LOG_WARNING, "fanotify mark remove failed for dev %lu: %s",
+            log_msg(LOG_WARNING, "fanotify mount mark remove failed for dev %lu: %s",
                     (unsigned long)g_mounts[i].dev, strerror(errno));
         }
     }
