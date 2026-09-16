@@ -1226,6 +1226,22 @@ unsigned int fanotify_mark_mask(void)
 /*  public API                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * While a hash helper is blocked on a permission event this daemon has
+ * not answered yet (the helper opens /proc/<pid>/exe, which can itself
+ * be on a marked filesystem), the event loop is stuck inside the hash
+ * wait.  sha512.c calls this hook once per silent wait slice so the
+ * queue keeps being serviced: direct daemon children (the helper) and
+ * mount-mark noise are allowed, protected events are deferred.
+ */
+static int g_hash_wait_fan_fd = -1;
+
+static void hash_wait_pump(void)
+{
+    if (g_hash_wait_fan_fd >= 0)
+        fanotify_pump(g_hash_wait_fan_fd, 0);
+}
+
 int fanotify_setup(void)
 {
     /*
@@ -1246,6 +1262,8 @@ int fanotify_setup(void)
         return -1;
     }
     log_msg(LOG_INFO, "fanotify fd %d created", fd);
+    g_hash_wait_fan_fd = fd;
+    sha512_set_wait_hook(hash_wait_pump);
     return fd;
 }
 
