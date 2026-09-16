@@ -13,6 +13,17 @@
 #define PERSIST_DENY_STATE_FILE PERSIST_STATE_DIR "/runtime-denylist.json"
 
 /*
+ * Serialized-size bounds shared by every JSON state file (the runtime
+ * lists and the pin table).  A PATH_MAX-1 field can expand sixfold via
+ * \uXXXX escapes, so the writer's escape scratch needs 6*PATH_MAX + a
+ * wrapper margin, and the parser's line buffer the same plus the key
+ * wrapper.  One convention instead of two: a line any state writer
+ * emits always fits every state reader.
+ */
+#define JSON_ESCAPED_MAX (PATH_MAX * 6 + 8)
+#define JSON_LINE_MAX (PATH_MAX * 6 + 256)
+
+/*
  * Persistent runtime allowlist entry: mirrors a DynAllowEntry from fanotify.c
  * but is meant to be serialized to JSON and reloaded on daemon restart.
  */

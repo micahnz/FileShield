@@ -780,32 +780,39 @@ static int test_persist_save_fixed_bytes(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  test: an unescapable field fails the save instead of writing ""   */
+/*  test: the worst-case escaped field fits and round-trips            */
 /* ------------------------------------------------------------------ */
 
 static int test_persist_escape_overflow_fails(void)
 {
     char path[PATH_MAX];
-    char tmp[PATH_MAX + 32];
     PersistEntry in[1];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
 
     make_test_path(path, sizeof(path), "escape_overflow.json");
     unlink(path);
 
     memset(in, 0, sizeof(in));
-    /* Control bytes escape to six characters each; a full-length field
-     * cannot fit the 4 KB scratch buffer. */
+    /* Worst case: a full-length field of control bytes, each escaping to
+     * six characters (\uXXXX).  JSON_ESCAPED_MAX is sized for exactly
+     * this, so the save must now succeed and the field must survive a
+     * load byte-exact. */
     memset(in[0].target_path, 0x01, sizeof(in[0].target_path) - 1);
     in[0].target_path[sizeof(in[0].target_path) - 1] = '\0';
 
-    ASSERT(persist_save(path, in, 1) == -1,
-           "unencodable field fails the save");
-    ASSERT(access(path, F_OK) != 0,
-           "no state file is left behind after a failed save");
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-    ASSERT(access(tmp, F_OK) != 0, "no temp file is left behind");
+    ASSERT(persist_save(path, in, 1) == 0,
+           "worst-case escaped field fits the shared scratch buffer");
 
-    TEST_PASS("persist_save fails closed on an unencodable field");
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "the escaped full-length field round-trips");
+    ASSERT(strcmp(out[0].target_path, in[0].target_path) == 0,
+           "escaped field round-trips byte-exact");
+
+    /* A NULL entry array fails the save without leaving files behind. */
+    ASSERT(persist_save(path, NULL, 1) == -1,
+           "NULL entry array fails the save");
+
+    TEST_PASS("persist_save handles the worst-case escaped field");
     return 0;
 }
 

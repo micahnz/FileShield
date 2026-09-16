@@ -674,7 +674,8 @@ static int test_eviction_tie_break(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  a failed write keeps the in-memory entry (LOG_WARNING only)       */
+/*  a failed write restores the pre-store table (memory stays          */
+/*  consistent with disk)                                             */
 /* ------------------------------------------------------------------ */
 
 static int test_write_failure_keeps_memory(void)
@@ -698,8 +699,11 @@ static int test_write_failure_keeps_memory(void)
 
     ASSERT(pin_store("/usr/bin/kept", SHA_A) == -1,
            "store fails when the path is un-writable");
-    ASSERT(pin_check("/usr/bin/kept", SHA_A, old) == PIN_CHECK_MATCH,
-           "entry kept in memory after write failure");
+    /* The failed store must not mutate the live table: memory stays
+     * consistent with disk, so the pattern is first use again (the
+     * re-prompt is the fail-closed path, and the next store retries). */
+    ASSERT(pin_check("/usr/bin/kept", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "failed store does not keep the entry in memory");
     ASSERT(access(bad, F_OK) != 0, "no state file left after failure");
 
     /* An open error other than ENOENT is damage, not first use. */
@@ -709,7 +713,7 @@ static int test_write_failure_keeps_memory(void)
     pin_set_state_file(path);
     unlink(blocker);
     unlink(path);
-    TEST_PASS("write failure keeps the in-memory entry");
+    TEST_PASS("write failure keeps memory consistent with disk");
     return 0;
 }
 
@@ -738,8 +742,9 @@ static int test_unwritable_dir_non_root(void)
     ASSERT(pin_load(path) == 0, "missing nested file loads clean");
     ASSERT(pin_store("/usr/bin/ro", SHA_A) == -1,
            "store inside an unwritable dir fails");
-    ASSERT(pin_check("/usr/bin/ro", SHA_A, old) == PIN_CHECK_MATCH,
-           "entry kept in memory");
+    /* The failed store must not mutate the live table. */
+    ASSERT(pin_check("/usr/bin/ro", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "failed store does not keep the entry in memory");
 
     ASSERT(chmod(dir, 0700) == 0, "restore dir mode");
     rmdir(dir);

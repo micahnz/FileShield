@@ -140,6 +140,32 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
         unlink(tmp_file);
         return -1;
     }
+
+    /* Persist the rename itself: without a directory fsync a crash right
+     * after this point can leave the old file — or nothing — on disk.
+     * For the pin table a vanished file is re-read as a clean empty
+     * table, which would silently reset every rule to first-use (TOFU).
+     * Consistent with the fsync policy above, a failure is a warning. */
+    char dirbuf[PATH_MAX];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", filepath);
+    char *slash = strrchr(dirbuf, '/');
+    if (slash)
+    {
+        const char *dirpath = "/"; /* filepath at the root */
+        if (slash != dirbuf)
+        {
+            *slash = '\0';
+            dirpath = dirbuf;
+        }
+        int dirfd = open(dirpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dirfd >= 0)
+        {
+            if (fsync(dirfd) < 0)
+                log_msg(LOG_WARNING, "%s: fsync dir %s: %s", what, dirpath,
+                        strerror(errno));
+            close(dirfd);
+        }
+    }
     return 0;
 }
 
@@ -214,8 +240,12 @@ int persist_json_escape(const char *src, char *dst, size_t dst_size)
     return (int)written;
 }
 
-/* Bounded string copy with NUL termination. */
-static void copy_field(char *dst, size_t dstsz, const char *src)
+/* Bounded string copy with NUL termination.  A truncated value is a
+ * state entry that will never match at decision time (the truncated
+ * digest/path keys differ from the real ones) — log it so the silent
+ * re-prompting the truncation causes is diagnosable. */
+static void copy_field(const char *filepath, char *dst, size_t dstsz,
+                       const char *src)
 {
     size_t len;
 
@@ -223,7 +253,13 @@ static void copy_field(char *dst, size_t dstsz, const char *src)
         return;
     len = strlen(src);
     if (len >= dstsz)
+    {
+        log_msg(LOG_WARNING,
+                "persist_load: %s: value too long for a field (%zu >= %zu); "
+                "truncated — the entry will not match",
+                filepath, len, dstsz - 1);
         len = dstsz - 1;
+    }
     memcpy(dst, src, len);
     dst[len] = '\0';
 }
@@ -301,6 +337,11 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
                 }
                 if (digits == 0 || code == 0)
                     return 0; /* not a \u escape / NUL cannot be stored */
+                /* Lone surrogates (D800-DFFF) encode to invalid UTF-8:
+                 * reject them like any other malformed escape so a real
+                 * JSON consumer never chokes on the state file. */
+                if (code >= 0xD800 && code <= 0xDFFF)
+                    return 0;
                 p += digits; /* p now points at the last hex digit */
                 if (code < 0x80)
                 {
@@ -361,27 +402,30 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
  * unescaped; unknown keys are ignored so hand-edited state files stay
  * loadable.
  */
-static void apply_entry_field(PersistEntry *e, const char *key,
-                              const char *value)
+static void apply_entry_field(const char *filepath, PersistEntry *e,
+                              const char *key, const char *value)
 {
     int idx;
 
     if (strcmp(key, "binary") == 0)
-        copy_field(e->binary, sizeof(e->binary), value);
+        copy_field(filepath, e->binary, sizeof(e->binary), value);
     else if (strcmp(key, "binary_sha512") == 0)
-        copy_field(e->binary_sha512, sizeof(e->binary_sha512), value);
+        copy_field(filepath, e->binary_sha512, sizeof(e->binary_sha512), value);
     else if (strcmp(key, "target_path") == 0)
-        copy_field(e->target_path, sizeof(e->target_path), value);
+        copy_field(filepath, e->target_path, sizeof(e->target_path), value);
     else if (strcmp(key, "cmdline") == 0)
-        copy_field(e->cmdline, sizeof(e->cmdline), value);
+        copy_field(filepath, e->cmdline, sizeof(e->cmdline), value);
     else if (strcmp(key, "cmdline_sha512") == 0)
-        copy_field(e->cmdline_sha512, sizeof(e->cmdline_sha512), value);
+        copy_field(filepath, e->cmdline_sha512, sizeof(e->cmdline_sha512),
+                   value);
     else if (sscanf(key, "chain_comm[%d]", &idx) == 1 &&
              idx >= 0 && idx < PERSIST_CHAIN_MAX)
-        copy_field(e->chain_comm[idx], sizeof(e->chain_comm[idx]), value);
+        copy_field(filepath, e->chain_comm[idx], sizeof(e->chain_comm[idx]),
+                   value);
     else if (sscanf(key, "chain_sha512[%d]", &idx) == 1 &&
              idx >= 0 && idx < PERSIST_CHAIN_MAX)
-        copy_field(e->chain_sha512[idx], sizeof(e->chain_sha512[idx]), value);
+        copy_field(filepath, e->chain_sha512[idx],
+                   sizeof(e->chain_sha512[idx]), value);
 }
 
 /* Apply the numeric fields (chain_depth, created_at) of one line. */
@@ -418,7 +462,10 @@ static void apply_entry_number(PersistEntry *e, const char *line)
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
 {
     FILE *fp;
-    char line[4096];
+    /* One convention with the pin-table parser (JSON_LINE_MAX): a line
+     * this reader must handle is one the runtime-list writer can emit
+     * for a near-PATH_MAX field with escapes. */
+    char line[JSON_LINE_MAX];
     PersistEntry *current = NULL;
     int count = 0;
     int warned_truncated = 0;
@@ -533,11 +580,14 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Parse key-value pairs.  String values are decoded escape-aware
          * (command lines routinely contain quotes); numeric fields fall
          * through to apply_entry_number().  Patterns intentionally omit
-         * the trailing comma so they match both "value", and "value". */
-        char key_buf[256], val_buf[4096];
+         * the trailing comma so they match both "value", and "value".
+         * The value buffer uses the shared escape bound: a near-PATH_MAX
+         * field of escapable bytes must survive extraction, not be
+         * dropped by its own reader. */
+        char key_buf[256], val_buf[JSON_ESCAPED_MAX];
         if (persist_json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
                                         sizeof(val_buf)))
-            apply_entry_field(current, key_buf, val_buf);
+            apply_entry_field(filepath, current, key_buf, val_buf);
         else
             apply_entry_number(current, p);
     }
@@ -625,7 +675,7 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     FILE *fp;
     int i, j;
     char tmp_file[PATH_MAX];
-    char escaped[4096];
+    char escaped[JSON_ESCAPED_MAX];
     int fd;
 
     if (!entries || count < 0 || count > PERSIST_MAX_ENTRIES)

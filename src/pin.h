@@ -101,9 +101,11 @@ int pin_check(const char *pattern, const char *sha512, char old_out[129]);
  *
  * Returns 0 on success; -1 when the arguments are invalid, when the
  * table is damaged (repair the file and reload first - pin_store never
- * overwrites a damaged file), or when the write fails.  On a write
- * failure the in-memory entry is kept and a LOG_WARNING is emitted; the
- * next successful store or a restart re-reads the on-disk state.
+ * overwrites a damaged file), or when the serialize/write fails.  On a
+ * failure the live table is restored to its pre-store state so memory
+ * and disk stay consistent (an evicted pin whose file still holds it
+ * would otherwise silently re-TOFU); a LOG_WARNING is emitted and the
+ * next successful store or a restart rewrites the state.
  */
 int pin_store(const char *pattern, const char *sha512);
 

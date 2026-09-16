@@ -25,10 +25,11 @@
  * A pattern is at most PATH_MAX-1 bytes and persist_json_escape() may
  * encode one byte as six (\uXXXX), so one serialized line can reach
  * 6*PATH_MAX plus the field wrapper.  The parser needs line and value
- * buffers of that size; the writer an escaped scratch buffer.
+ * buffers of that size; the writer an escaped scratch buffer.  The
+ * bounds are shared with persist.c (persist.h).
  */
-#define PIN_LINE_MAX (PATH_MAX * 6 + 256)
-#define PIN_ESCAPED_MAX (PATH_MAX * 6 + 8)
+#define PIN_LINE_MAX JSON_LINE_MAX
+#define PIN_ESCAPED_MAX JSON_ESCAPED_MAX
 
 typedef struct
 {
@@ -572,6 +573,18 @@ int pin_store(const char *pattern, const char *sha512)
                 g_pins[idx].pattern);
     }
 
+    /*
+     * Stage on a snapshot and commit to memory only after the write
+     * succeeded: a serialize or write failure must not leave the live
+     * table diverged from disk (the eviction victim would be gone from
+     * memory while its pin still exists on disk, silently re-TOFUing a
+     * rule until the next successful store or restart).
+     */
+    static PinEntry snapshot[PIN_MAX];
+    int snap_count = g_pin_count;
+    unsigned long snap_seq = g_pin_seq;
+    memcpy(snapshot, g_pins, sizeof(g_pins));
+
     memcpy(g_pins[idx].pattern, pattern, strlen(pattern) + 1);
     memcpy(g_pins[idx].sha512, sha512, 129);
     g_pins[idx].updated_at = time(NULL);
@@ -580,19 +593,26 @@ int pin_store(const char *pattern, const char *sha512)
     if (pin_serialize(&text) < 0)
     {
         log_msg(LOG_WARNING, "pin_store: could not serialize the pin table");
-        return -1;
+        goto restore;
     }
     if (persist_write_text(g_state_file, text) < 0)
     {
         free(text);
-        log_msg(LOG_WARNING, "pin_store: could not write %s; the pin is "
-                             "kept in memory only", g_state_file);
-        return -1;
+        log_msg(LOG_WARNING, "pin_store: could not write %s; the pre-store "
+                             "table is kept in memory",
+                g_state_file);
+        goto restore;
     }
     free(text);
     log_msg(LOG_INFO, "pin_store: wrote %d pin(s) to %s", g_pin_count,
             g_state_file);
     return 0;
+
+restore:
+    memcpy(g_pins, snapshot, sizeof(g_pins));
+    g_pin_count = snap_count;
+    g_pin_seq = snap_seq;
+    return -1;
 }
 
 void pin_set_state_file(const char *path)
