@@ -16,7 +16,7 @@ typedef struct
     unsigned long long starttime; /* /proc/<pid>/stat field 22; 0 = unknown */
     char binary_path[PATH_MAX];
     char target_path[PATH_MAX];   /* "" = wildcard (any file)             */
-    time_t expiry_time;
+    time_t expiry_time;           /* mono_seconds() deadline; 0 = none    */
 } cache_entry_t;
 
 static cache_entry_t cache[CACHE_MAX_ENTRIES];
@@ -65,7 +65,7 @@ int cache_lookup(pid_t pid, const char *binary, const char *target)
     if (!cache_initialized)
         cache_init();
 
-    now = time(NULL);
+    now = mono_seconds();
 
     for (i = 0; i < cache_high; i++)
     {
@@ -129,7 +129,7 @@ static void cache_insert_starttime(pid_t pid, unsigned long long starttime,
     /* Normalise NULL and "" to the wildcard representation. */
     tgt = (target && target[0] != '\0') ? target : "";
 
-    now = time(NULL);
+    now = mono_seconds();
 
     for (i = 0; i < cache_high; i++)
     {
@@ -189,7 +189,7 @@ void cache_expire(void)
     if (!cache_initialized)
         cache_init();
 
-    now = time(NULL);
+    now = mono_seconds();
 
     for (i = 0; i < cache_high; i++)
     {

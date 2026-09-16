@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -19,6 +20,14 @@ static int g_log_debug = 0;
 void log_set_debug(int enabled)
 {
     g_log_debug = enabled ? 1 : 0;
+}
+
+time_t mono_seconds(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return time(NULL);
+    return ts.tv_sec;
 }
 
 char *proc_exe_path(pid_t pid)
@@ -95,7 +104,11 @@ int read_cmdline(pid_t pid, char *out, size_t size)
     if (fd_c < 0)
         return -1;
 
-    ssize_t n = read(fd_c, out, size - 1);
+    ssize_t n;
+    do
+    {
+        n = read(fd_c, out, size - 1);
+    } while (n < 0 && errno == EINTR); /* SIGHUP races event processing */
     close(fd_c);
     if (n <= 0)
         return -1;
@@ -332,11 +345,21 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    ssize_t n;
+    do
+    {
+        n = read(fd, buf, sizeof(buf) - 1);
+    } while (n < 0 && errno == EINTR);
     close(fd);
     if (n <= 0)
         return -1;
     buf[n] = '\0';
+    /* A truncated stat line would parse garbage start times: the line
+     * always ends with the numeric field 52, so reject anything that
+     * does not end in a digit. */
+    if (n < (ssize_t)sizeof(buf) - 1 && buf[n - 1] != '\n' &&
+        !(buf[n - 1] >= '0' && buf[n - 1] <= '9'))
+        return -1;
 
     /*
      * The comm field (field 2) may contain spaces and parentheses, so the

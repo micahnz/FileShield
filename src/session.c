@@ -22,7 +22,7 @@ typedef struct
     char binary[PATH_MAX];
     char binary_sha512[129];
     char target[PATH_MAX];
-    time_t expiry; /* 0 = valid while the session leader lives */
+    time_t expiry; /* mono_seconds() deadline; 0 = leader lifetime */
 } SessionEntry;
 
 static SessionEntry g_allow[SESSION_MAX];
@@ -115,7 +115,7 @@ static int list_match(SessionEntry *list, int count, pid_t sid,
                       const char *binary, const char *bin_sha512,
                       const char *target)
 {
-    time_t now = time(NULL);
+    time_t now = mono_seconds();
 
     for (int i = 0; i < count; i++)
     {
@@ -170,12 +170,25 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
         int slot;
         if (*count < SESSION_MAX)
         {
-            slot = (*count)++;
+            /* Reclaim a hole first: lazily-dropped dead entries (expired
+             * or dead-leader) would otherwise leave the table full of
+             * unused slots that every insert shifts or evicts past. */
+            slot = -1;
+            for (int i = 0; i < *count; i++)
+            {
+                if (!list[i].used)
+                {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0)
+                slot = (*count)++;
         }
         else
         {
-            /* Full: drop the oldest entry (same policy as the runtime
-             * allow/deny lists). */
+            /* Full: drop the oldest live entry (same policy as the
+             * runtime allow/deny lists). */
             memmove(&list[0], &list[1], sizeof(SessionEntry) * (SESSION_MAX - 1));
             slot = SESSION_MAX - 1;
         }
@@ -191,7 +204,7 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
         snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
     snprintf(e->target, sizeof(e->target), "%s", target);
     if (ttl_seconds > 0)
-        e->expiry = time(NULL) + ttl_seconds;
+        e->expiry = mono_seconds() + ttl_seconds;
 }
 
 void session_allow_add(pid_t sid, unsigned long long leader_start,

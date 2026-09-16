@@ -25,6 +25,18 @@ extern int g_foreground;
  */
 #define FS_MAX_TTL_SECONDS (365 * 24 * 60 * 60)
 
+/*
+ * mono_seconds: CLOCK_MONOTONIC seconds since boot, as time_t.  The
+ * deadline clock for every in-memory decision TTL (cache.c, session.c
+ * and the hash-failure windows): immune to wall-clock steps (NTP
+ * corrections, manual date, VM/snapshot restore), which would otherwise
+ * extend cached grants or mass-expire into prompt storms.  Stored state
+ * (pins, persisted entries) keeps wall-clock time so it survives
+ * restarts.  Falls back to time(NULL) if clock_gettime fails (it does
+ * not on Linux).
+ */
+time_t mono_seconds(void);
+
 char *proc_exe_path(pid_t pid);
 void log_msg(int priority, const char *fmt, ...);
 
