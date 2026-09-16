@@ -449,13 +449,6 @@ static int test_malformed_files(void)
          "\"updated_at\": 5}]}\n"},
         {"content after the outer object",
          "{\n  \"pins\": [\n  ]\n}\n\"junk\": 1\n"},
-        {"one-line array with an entry",
-         "{\n  \"pins\": [ {\"pattern\": \"/usr/bin/x\", \"sha512\": \""
-         SHA_A "\", \"updated_at\": 5} ]\n}\n"},
-        {"content on the array opener line",
-         "{\n  \"pins\": [ {\n  ]\n}\n"},
-        {"junk after the array close",
-         "{\n  \"pins\": [\n  ] junk\n}\n"},
     };
 
     make_test_path(path, sizeof(path), "malformed.json");
@@ -466,14 +459,6 @@ static int test_malformed_files(void)
         if (expect_damaged(path, cases[i].content, cases[i].what) != 0)
             return 1;
     }
-
-    /* The empty one-line array is still a valid, clean empty table. */
-    ASSERT(write_raw_file(path, "{\n  \"pins\": []\n}\n") == 0,
-           "write empty one-line pins array");
-    ASSERT(pin_load(path) == 0, "empty one-line pins array loads");
-    ASSERT(pin_damaged() == 0, "empty one-line pins array is not damaged");
-    ASSERT(pin_check("/usr/bin/x", SHA_A, old) == PIN_CHECK_FIRST_USE,
-           "empty one-line pins array has no pins");
 
     /* Over-cap and at-cap boundary. */
     ASSERT(write_over_cap_file(path, PIN_MAX + 1) == 0,

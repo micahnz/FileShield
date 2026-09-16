@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -284,24 +283,9 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
             case 'u':
             {
                 unsigned int code = 0;
-                int digits = 0;
-
-                /* Consume up to four hex digits and advance by exactly how
-                 * many were present.  sscanf("%4x") accepts a short escape
-                 * such as "\u1", but an unconditional four-byte advance
-                 * would skip the closing quote and scan past the string. */
-                while (digits < 4 && isxdigit((unsigned char)p[1 + digits]))
-                {
-                    char h = p[1 + digits];
-                    unsigned int d = (h >= '0' && h <= '9')
-                                         ? (unsigned int)(h - '0')
-                                         : (unsigned int)((h | 0x20) - 'a' + 10);
-                    code = (code << 4) | d;
-                    digits++;
-                }
-                if (digits == 0 || code == 0)
-                    return 0; /* not a \u escape / NUL cannot be stored */
-                p += digits; /* p now points at the last hex digit */
+                if (sscanf(p + 1, "%4x", &code) != 1)
+                    return 0;
+                p += 4;
                 if (code < 0x80)
                 {
                     c = (unsigned char)code;

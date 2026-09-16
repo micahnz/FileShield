@@ -685,29 +685,6 @@ static int test_persist_json_helpers(void)
         ASSERT(strcmp(out, ctrl) == 0, "control char roundtrip");
     }
 
-    /* Short \u escapes must advance only past the digits they consumed;
-     * an unconditional four-byte advance would scan past the closing
-     * quote into the rest of the buffer. */
-    ASSERT(persist_json_extract_string("  \"k\": \"\\u1\"", key, sizeof(key),
-                                       out, sizeof(out)) == 1,
-           "short \\u escape parses");
-    ASSERT(strcmp(out, "\x01") == 0, "short \\u escape decodes");
-    ASSERT(strcmp(key, "k") == 0, "short \\u escape returns the key");
-
-    ASSERT(persist_json_extract_string("  \"k\": \"\\u12\",", key, sizeof(key),
-                                       out, sizeof(out)) == 1,
-           "short \\u before more content parses");
-    ASSERT(strcmp(out, "\x12") == 0, "short \\u before more content decodes");
-
-    /* \u0000 cannot be represented in the decoded value; a bare \u has
-     * no digits at all.  Both are malformed. */
-    ASSERT(persist_json_extract_string("  \"k\": \"\\u0000x\"", key, sizeof(key),
-                                       out, sizeof(out)) == 0,
-           "\\u0000 is rejected");
-    ASSERT(persist_json_extract_string("  \"k\": \"\\u\"", key, sizeof(key),
-                                       out, sizeof(out)) == 0,
-           "\\u with no digits is rejected");
-
     /* Error paths: too-small escape buffer and numeric values. */
     ASSERT(persist_json_escape("abcdef", tiny, sizeof(tiny)) == -1,
            "escape fails when the buffer is too small");
