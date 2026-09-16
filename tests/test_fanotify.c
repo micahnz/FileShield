@@ -1501,11 +1501,46 @@ static void test_drain_and_deny(void) {
     close(sv[1]);
 }
 
+/*
+ * Part 0f: the recent-decision dedup cache.  The resolved path is part of
+ * the key (a hard link reaches the same inode through a different path),
+ * a newer decision shadow an older one for the same key, and a reload
+ * clears the cache.
+ */
+static void test_recent_decision_cache(void) {
+    fanotify_test_recent_clear();
+
+    fanotify_test_recent_insert(100, (dev_t)1, (ino_t)2, "/home/u/secret",
+                                FAN_ALLOW);
+    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == FAN_ALLOW,
+           "dedup cache returns the stored decision");
+    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+                                       "/home/u/link") == -1,
+           "a different path to the same inode does not reuse the decision");
+    ASSERT(fanotify_test_recent_lookup(101, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == -1,
+           "a different pid does not reuse the decision");
+
+    /* Newest decision wins for the same key. */
+    fanotify_test_recent_insert(100, (dev_t)1, (ino_t)2, "/home/u/secret",
+                                FAN_DENY);
+    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == FAN_DENY,
+           "a newer decision shadows the older one");
+
+    fanotify_test_recent_clear();
+    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == -1,
+           "clear drops every cached decision");
+}
+
 int main(void) {
     printf("=== test_fanotify ===\n");
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
     test_scope_guard();
+    test_recent_decision_cache();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
     test_glob_missing_base_is_skipped();
