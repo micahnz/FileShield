@@ -1,7 +1,19 @@
 #ifndef FILESHIELD_UTILS_H
 #define FILESHIELD_UTILS_H
 
+#include <signal.h>
 #include <sys/types.h>
+
+/*
+ * Daemon lifecycle flags, defined in main.c: g_running is cleared by
+ * SIGTERM/SIGINT, g_need_reload set by SIGHUP, g_fatal set when the
+ * fanotify group became unusable or a rollback failed.  One shared
+ * declaration so a type change in main.c cannot silently desynchronize
+ * the readers (reload.c, notify.c, fanotify.c).
+ */
+extern volatile sig_atomic_t g_running;
+extern volatile sig_atomic_t g_need_reload;
+extern volatile sig_atomic_t g_fatal;
 
 extern int g_foreground;
 

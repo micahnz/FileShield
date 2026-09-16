@@ -23,7 +23,17 @@ int fanotify_add_mark(int fd, const char *path);
  */
 int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
-void fanotify_loop(int fd);
+/*
+ * Main event loop.  Blocks in poll() on {group fd, wake pipe} until an
+ * event arrives, a signal handler writes to the wake pipe (read end;
+ * pass -1 when there is none), or g_running/g_need_reload/g_fatal are
+ * set.  The group fd must be non-blocking (FAN_NONBLOCK at init): the
+ * wake pipe closes the window in which a signal arriving just before a
+ * blocking read() would suspend shutdown/reload on an idle filesystem,
+ * which would let a supervisor SIGKILL auto-allow outstanding
+ * permission events on close(fan_fd).
+ */
+void fanotify_loop(int fd, int wake_fd);
 
 /* Non-zero when at least one file/directory or filesystem/mount mark is active. */
 int fanotify_any_mark_active(void);

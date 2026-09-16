@@ -465,7 +465,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 
 ## How It Works
 
-1. The daemon calls `fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed.
+1. The daemon calls `fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE, O_RDONLY | O_LARGEFILE)`. `FAN_UNLIMITED_QUEUE` is required for fail-closed semantics: with a bounded queue the kernel drops permission events on saturation and lets the access proceed. `FAN_NONBLOCK` keeps the group fd non-blocking so the event loop can `poll()` on `{group fd, signal-wake pipe}` — a signal arriving just before a blocking read would otherwise suspend shutdown/reload on an idle filesystem, and a supervisor SIGKILL in that window would let the kernel auto-allow every outstanding permission event.
 2. It registers `FAN_OPEN_PERM | FAN_EVENT_ON_CHILD` marks on each protected path via `fanotify_mark()` (the child flag lets directory marks report accesses to their entries).
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
 4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, `[unsafe_allowlist]`, then the hash-pinned `[allowlist]`). Config-rule hits additionally raise the bounded `notify-send` tripwires described under [Notifications](#notifications).

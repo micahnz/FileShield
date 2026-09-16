@@ -35,6 +35,7 @@ typedef struct
 static InodeKey g_slots[INODE_SLOT_COUNT];
 static unsigned char g_used[INODE_SLOT_COUNT]; /* 1 = slot holds a key */
 static int g_inode_count = 0;
+static int g_logged_full = 0; /* "table full" logged for this generation */
 
 /* FNV-1a over the two key words, folded to the table mask. */
 static uint32_t inode_hash(dev_t dev, ino_t ino)
@@ -63,13 +64,13 @@ void inode_set_add(dev_t dev, ino_t ino)
 
     if (g_inode_count >= INODE_SET_MAX)
     {
-        /* Log once: a protected tree can overflow the cap by thousands of
-         * files, and one line per file would bury the journal. */
-        static int logged_full;
-
-        if (!logged_full)
+        /* Log once per table generation: a protected tree can overflow
+         * the cap by thousands of files, and one line per file would
+         * bury the journal.  clear() resets the latch so a reload that
+         * overflows again is visible in the journal too. */
+        if (!g_logged_full)
         {
-            logged_full = 1;
+            g_logged_full = 1;
             log_msg(LOG_ERR,
                     "inode table full (max %d); hard-link detection is "
                     "incomplete (further drops are not logged)",
@@ -99,5 +100,7 @@ int inode_set_contains(dev_t dev, ino_t ino)
 void inode_set_clear(void)
 {
     memset(g_used, 0, sizeof(g_used));
+    memset(g_slots, 0, sizeof(g_slots));
     g_inode_count = 0;
+    g_logged_full = 0;
 }

@@ -6,6 +6,7 @@
 #include <syslog.h>
 #include <getopt.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 
@@ -16,22 +17,41 @@
 #include "reload.h"
 
 #define DEFAULT_CONFIG "/etc/fileshield.conf"
-#define DEFAULT_TTL 300
 
 volatile sig_atomic_t g_running = 1;
 volatile sig_atomic_t g_need_reload = 0;
 volatile sig_atomic_t g_fatal = 0;
 
+/* Signal-wake pipe: the handlers write one byte so fanotify_loop()'s
+ * poll() observes a signal that arrives even between its flag check and
+ * the poll() call.  O_NONBLOCK: the write must never block a handler;
+ * a full pipe is harmless because the flag is already set.  O_CLOEXEC:
+ * the fd must not leak into the dialog child or any helper. */
+static int g_sigwake[2] = {-1, -1};
+
+/* write() is async-signal-safe; (void)r silences the unused-result warn
+ * without branching in the handler. */
+static void sigwake(char tag)
+{
+    if (g_sigwake[1] >= 0)
+    {
+        ssize_t r = write(g_sigwake[1], &tag, 1);
+        (void)r;
+    }
+}
+
 static void sigterm_handler(int sig)
 {
     (void)sig;
     g_running = 0;
+    sigwake('S');
 }
 
 static void sighup_handler(int sig)
 {
     (void)sig;
     g_need_reload = 1;
+    sigwake('R');
 }
 
 static void print_usage(const char *prog)
@@ -49,7 +69,8 @@ static void daemonize(void)
     /* Detach from the invoking directory and tighten the file-creation
      * mask: a daemon must not pin a mount point or create world-readable
      * files when started by hand (the systemd unit also sets UMask=0077).
-     * A relative --config is resolved by the caller before this runs. */
+     * A relative --config has been resolved to an absolute path by the
+     * caller (failure is fatal there). */
     if (chdir("/") < 0)
         log_msg(LOG_WARNING, "daemonize: chdir /: %s", strerror(errno));
     umask(0077);
@@ -158,12 +179,25 @@ int main(int argc, char *argv[])
     {
         /* daemonize() chdir()s to /, so a relative --config must be made
          * absolute now: a SIGHUP reload would otherwise resolve it from
-         * the wrong directory. */
+         * the wrong directory and keep the old config forever.  The
+         * config loaded successfully, so the file exists — a realpath
+         * failure here (EACCES on a parent, ELOOP) is a known
+         * inconsistency and a silent reload breakage, hence fatal. */
         if (config_path[0] != '/')
         {
             static char config_abs[PATH_MAX];
-            if (realpath(config_path, config_abs))
-                config_path = config_abs;
+            if (!realpath(config_path, config_abs))
+            {
+                log_msg(LOG_ERR,
+                        "cannot resolve --config %s: %s (a relative path "
+                        "would break reload after daemonize)",
+                        config_path, strerror(errno));
+                config_reset(cfg);
+                free(cfg);
+                closelog();
+                return EXIT_FAILURE;
+            }
+            config_path = config_abs;
         }
         daemonize();
     }
@@ -178,6 +212,19 @@ int main(int argc, char *argv[])
     sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* The wake pipe must exist before the loop starts polling.  Failure
+     * degrades to the old behavior (poll(2) still returns EINTR for a
+     * signal delivered mid-call), so warn and continue rather than
+     * refuse to start over a pipe. */
+    if (pipe2(g_sigwake, O_CLOEXEC | O_NONBLOCK) < 0)
+    {
+        g_sigwake[0] = g_sigwake[1] = -1;
+        log_msg(LOG_WARNING,
+                "signal wake pipe unavailable: %s (shutdown may lag on an "
+                "idle filesystem)",
+                strerror(errno));
+    }
+
     int fan_fd = fanotify_setup();
     if (fan_fd < 0)
     {
@@ -190,7 +237,7 @@ int main(int argc, char *argv[])
     /* Fail closed: a security daemon must never run in a silently
      * degraded state.  Any path we could not mark would be unprotected
      * while the user believes it is watched, so startup aborts and
-     * systemd's Restart=on-failure retries it. */
+     * systemd's Restart=always retries it. */
     if (cfg->protected_count - cfg->exclude_count <= 0)
     {
         log_msg(LOG_ERR,
@@ -263,7 +310,7 @@ int main(int argc, char *argv[])
 
     while (g_running)
     {
-        fanotify_loop(fan_fd);
+        fanotify_loop(fan_fd, g_sigwake[0]);
         if (g_fatal)
             break;
         if (g_need_reload && reload_protection(fan_fd, config_path, &cfg) < 0)
@@ -277,6 +324,10 @@ int main(int argc, char *argv[])
     fanotify_flush_pending(fan_fd);
     fanotify_drain_and_deny(fan_fd);
     close(fan_fd);
+    if (g_sigwake[0] >= 0)
+        close(g_sigwake[0]);
+    if (g_sigwake[1] >= 0)
+        close(g_sigwake[1]);
     config_reset(cfg);
     free(cfg);
     closelog();

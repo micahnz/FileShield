@@ -24,12 +24,11 @@
 #include "persist.h"
 #include "pin.h"
 
-extern volatile sig_atomic_t g_running;
-extern volatile sig_atomic_t g_need_reload;
-extern volatile sig_atomic_t g_fatal;
-extern Config *g_config;
-
 #define BUF_SIZE 4096
+
+/* Fallback for a config with no [settings] user_ttl (the shipped config
+ * sets 300; config.c applies the same default at parse time). */
+#define DEFAULT_USER_TTL_S 300
 
 /* Defined later in this file; declared early for the call-chain hasher. */
 static int is_path_under_protected(const char *path);
@@ -480,7 +479,6 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
 
 typedef struct
 {
-    pid_t pid[PERSIST_CHAIN_MAX];
     char comm[PERSIST_CHAIN_MAX][256];
     char sha512[PERSIST_CHAIN_MAX][129]; /* lowercase hex SHA-512 of each ancestor exe */
     int depth;                           /* how many ancestors were captured            */
@@ -500,7 +498,6 @@ static void build_proc_chain(pid_t start_pid, ProcChain *c, int force_retry)
         pid_t p = get_ppid(cur);
         if (p <= 1)
             break;
-        c->pid[i] = p;
         read_comm(p, c->comm[i], sizeof(c->comm[i]));
         char *exe = proc_exe_path(p);
         if (exe)
@@ -912,11 +909,12 @@ static void dyn_add(DynEntry *list, int *count, const char *binary,
 }
 
 /* First 16 hex chars of a digest for log lines; the state file has the
- * full hash.  An empty digest logs as "????????????????". */
+ * full hash.  An empty or short digest logs as "????????????????" — the
+ * length check keeps a malformed digest from reading past its NUL. */
 static void sha_prefix(const char *sha512, char out[17])
 {
     memcpy(out, "????????????????", 17);
-    if (sha512[0] != '\0')
+    if (strlen(sha512) >= 16)
         memcpy(out, sha512, 16);
     out[16] = '\0';
 }
@@ -1058,7 +1056,13 @@ static unsigned long long mount_id_of(const char *path)
 
     if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
         return 0;
+    memset(&stx, 0, sizeof(stx));
     if (statx(AT_FDCWD, ns_path, 0, STATX_MNT_ID, &stx) != 0)
+        return 0;
+    /* Only trust stx_mnt_id when the kernel says it filled it in; a
+     * success-without-data quirk would otherwise poison the mount
+     * bookkeeping with garbage keys. */
+    if (!(stx.stx_mask & STATX_MNT_ID))
         return 0;
     return stx.stx_mnt_id;
 }
@@ -1471,6 +1475,15 @@ static int mark_table_add(const char *path, unsigned int mask)
  * but one or more event types specified in the mask require it").
  * Post-start files are therefore matched by canonical path; FID-based
  * create tracking is a planned follow-up.
+ *
+ * SAFETY-CRITICAL COUPLING with inode_walk_dir(): the mask deliberately
+ * does NOT include FAN_ONDIR, so open()s of directory OBJECTS generate no
+ * permission events.  The startup/reload walks opendir() directories
+ * that already carry live marks — with FAN_ONDIR added, the very first
+ * opendir() would enqueue a permission event only this single-threaded
+ * daemon could answer, and it would deadlock inside the walk.  Anyone
+ * adding FAN_ONDIR must first make the walks event-safe (defer or
+ * pre-walk before marking).
  */
 unsigned int fanotify_mark_mask(void)
 {
@@ -1508,8 +1521,17 @@ int fanotify_setup(void)
      * failure denies.  Event volume is kept down by the mount-mark fast
      * path and the bounded pending queue; FAN_Q_OVERFLOW is still handled
      * fail-closed if it ever appears.
+     *
+     * FAN_NONBLOCK keeps the group fd non-blocking so the main loop can
+     * poll() on {group fd, signal-wake pipe}: a signal arriving between
+     * the flag check and a blocking read() would otherwise suspend the
+     * daemon until the next open on an idle filesystem — and if the
+     * supervisor then escalates to SIGKILL, close(fan_fd) auto-ALLOWs
+     * every outstanding permission event.  The main loop treats the fd
+     * as edge-gated: poll() first, then read().
      */
-    int fd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE,
+    int fd = fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_CONTENT |
+                               FAN_UNLIMITED_QUEUE,
                            O_RDONLY | O_LARGEFILE);
     if (fd < 0)
     {
@@ -1547,6 +1569,17 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
         {
             return; /* statx unavailable: fall back to device dedupe */
         }
+    }
+
+    if (mnt_id == 0)
+    {
+        /* AGENTS.md promises a warning on the device-level fallback: it
+         * merges distinct btrfs subvolume mounts that share a device, so
+         * subvolume-level mark bookkeeping degrades. */
+        log_msg(LOG_WARNING,
+                "statx(STATX_MNT_ID) unavailable; mount marks for dev %lu "
+                "are deduped per device, not per mount",
+                (unsigned long)st->st_dev);
     }
 
     if (g_mount_count >= MAX_MOUNTS)
@@ -1999,10 +2032,6 @@ static int process_in_dialog_group(pid_t pid, pid_t dialog_pid)
     return (pid_t)pgrp == dialog_pid;
 }
 
-/*
- * Full decision path for a FAN_OPEN_PERM event.  Takes ownership of ev->fd:
- * every path responds and closes the event fd, or (in the pump) defers it.
- */
 /* ------------------------------------------------------------------ */
 /*  per-event decision context                                         */
 /* ------------------------------------------------------------------ */
@@ -2321,7 +2350,13 @@ static int event_load_binary(EventCtx *c)
 
     /* Config denylist: a static admin denial always wins over every
      * grant.  Checked before hashing so denied binaries never pay for
-     * binary/ancestor SHA-512 computation. */
+     * binary/ancestor SHA-512 computation.  Matching is against the
+     * resolved open path: a hard-link event (protected inode reached
+     * through an unprotected alias) therefore only matches GLOBAL deny
+     * rules — a scoped rule like "binary = /protected/path" cannot know
+     * which protected path the inode belongs to, so such an attempt
+     * falls through to the always-prompt hard-link path instead of
+     * EPERM.  Every grant stage is skipped for it (fail closed). */
     const RuleEntry *deny_rule = denylist_match(c->binary, c->target);
     if (deny_rule)
     {
@@ -2506,7 +2541,7 @@ static void config_allow_grant(EventCtx *c, const RuleEntry *e)
      * historical rule-scoped entry (NULL for a global rule = wildcard).
      */
     const char *grant;
-    int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+    int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
 
     if (e->target_is_glob)
         grant = c->target;
@@ -2626,7 +2661,7 @@ static int event_runtime_allowed(EventCtx *c)
         dyn_allow_match(c->binary, c->bin_sha512, event_chain_provider, c,
                         c->target, event_cmdline_fp(c)))
     {
-        int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+        int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
         cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
                 c->binary, (int)c->ev->pid, c->target);
@@ -2721,7 +2756,7 @@ static int event_runtime_allowed(EventCtx *c)
  */
 static unsigned int record_allow_decision(EventCtx *c, int decision)
 {
-    int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+    int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
     int session_ttl = g_config ? g_config->session_ttl_seconds : 0;
 
     if (decision == NOTIFY_ALLOW_ONCE)
@@ -2853,7 +2888,7 @@ static void event_ask_user(EventCtx *c)
     req.cmdline = c->cmdline;
     req.path = c->target;
     req.user_uid = proc_uid(c->ev->pid);
-    req.user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+    req.user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
     req.session_ttl = g_config ? g_config->session_ttl_seconds : 0;
     req.hash_unavailable = (c->bin_sha512[0] == '\0');
     req.hash_failure = c->bin_hash_failure;
@@ -2999,8 +3034,11 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
  * responds to them:
  *   - Events FROM dialog_child_pid: FAN_ALLOW (dialog needs to open files).
  *   - Events that pass the mount-mark fast-path: FAN_ALLOW.
- *   - Everything else: left for the main event loop (NOT responded to here),
- *     so the caller must not close fan_fd.
+ *   - Every other permission event: deferred to the replay queue with its
+ *     event fd left open (a full queue denies fail-closed) — decided once
+ *     the dialog finishes, by fanotify_process_pending in the main loop.
+ *     Non-permission events are handled in place; the caller must not
+ *     close fan_fd.
  *
  * Returns number of events responded to.
  */
@@ -3094,27 +3132,10 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
     while (1)
     {
-        /* Non-blocking read: set O_NONBLOCK transiently.  If the flag
-         * cannot be set, stop pumping instead of risking a blocking read
-         * that would let the dialog child (and the user's opens behind it)
-         * stall until the dialog times out: notify.c re-enters the pump
-         * whenever poll(2) reports the group fd readable. */
-        int flags = fcntl(fan_fd, F_GETFL, 0);
-        if (flags < 0)
-            break;
-        if (fcntl(fan_fd, F_SETFL, flags | O_NONBLOCK) < 0)
-        {
-            log_msg(LOG_WARNING,
-                    "[pump] cannot set non-blocking mode: %s; "
-                    "deferring to the main loop",
-                    strerror(errno));
-            break;
-        }
+        /* The group fd is permanently non-blocking (FAN_NONBLOCK at init):
+         * a read here can never stall the dialog child, and notify.c
+         * re-enters the pump whenever poll(2) reports the fd readable. */
         ssize_t n = read(fan_fd, buf, sizeof(buf));
-        if (fcntl(fan_fd, F_SETFL, flags) < 0)
-            log_msg(LOG_WARNING, "[pump] cannot restore blocking mode: %s",
-                    strerror(errno));
-
         if (n <= 0)
             break;
 
@@ -3126,15 +3147,33 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         {
             if (ev->vers != FANOTIFY_METADATA_VERSION)
             {
-                /* Defensive parity with the main loop: an event we cannot
-                 * interpret is not acted on. */
+                /* A metadata-version mismatch means the event stream
+                 * cannot be interpreted at all (fanotify(7)): abandon
+                 * the group and let the supervisor restart cleanly.
+                 * Closing a possibly-permission event fd without a
+                 * response hangs that caller, but continuing to parse
+                 * an unreadable stream is worse. */
                 if (ev->fd != FAN_NOFD)
                     close((int)ev->fd);
+                log_msg(LOG_ERR,
+                        "fanotify metadata version mismatch; stopping");
+                g_fatal = 1;
+                break;
             }
             else if ((ev->mask & FAN_OPEN_PERM) && ev->fd != FAN_NOFD)
             {
                 responded += pump_decide_permission(fan_fd, ev,
                                                     dialog_child_pid);
+            }
+            else if (ev->mask & FAN_OPEN_PERM)
+            {
+                /* FAN_NOFD (kernel fd-creation failure): there is no event
+                 * fd to close, but the requester's open() must not stay
+                 * kernel-blocked.  Respond and move on, mirroring
+                 * event_resolve() in the main loop (fail closed). */
+                log_msg(LOG_WARNING, "[pump] FAN_NOFD for pid=%d, denying",
+                        (int)ev->pid);
+                fanotify_respond(fan_fd, ev, FAN_DENY);
             }
             else if (ev->mask & (FAN_CREATE | FAN_MOVED_TO))
             {
@@ -3156,12 +3195,14 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 close((int)ev->fd);
             }
 
-            if (ev->event_len == 0)
+            if (ev->event_len == 0 || g_fatal)
                 break;
             remaining -= ev->event_len;
             ev = (const struct fanotify_event_metadata *)((const char *)ev +
                                                           ev->event_len);
         }
+        if (g_fatal)
+            break;
     }
 
     return responded;
@@ -3305,11 +3346,25 @@ void fanotify_drain_and_deny(int fan_fd)
         pfd.fd = fan_fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+        int pr;
+        while ((pr = poll(&pfd, 1, 0)) < 0 && errno == EINTR)
+            ; /* shutdown is signal-driven: retry, never abandon */
+        if (pr <= 0 || !(pfd.revents & POLLIN))
             break;
 
         ssize_t n = read(fan_fd, buf, sizeof(buf));
-        if (n <= 0)
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue; /* interrupted drain leaves events unanswered */
+            /* Readable race (event consumed elsewhere) ends the drain;
+             * anything else is logged so the early exit is visible. */
+            if (errno != EAGAIN)
+                log_msg(LOG_WARNING, "fanotify drain read: %s",
+                        strerror(errno));
+            break;
+        }
+        if (n == 0)
             break;
 
         const struct fanotify_event_metadata *ev =
@@ -3346,7 +3401,19 @@ void fanotify_drain_and_deny(int fan_fd)
                 denied);
 }
 
-void fanotify_loop(int fd)
+/*
+ * Main event loop.  Blocks in poll() on {group fd, wake pipe}; wake_fd is
+ * the read end of a non-blocking pipe that the signal handlers write a
+ * byte to (pass -1 when there is no wake pipe).  The wake pipe makes
+ * signal delivery observable even when a signal arrives between the
+ * outer flag check and poll(): otherwise an idle marked filesystem could
+ * suspend shutdown/reload until the next open, and a supervisor SIGKILL
+ * would let the kernel auto-ALLOW every outstanding permission event on
+ * close(fan_fd).  The group fd is permanently non-blocking (FAN_NONBLOCK
+ * at init), so a read only happens after poll() reports readable; EAGAIN
+ * is a spurious wake, not an error.
+ */
+void fanotify_loop(int fd, int wake_fd)
 {
     char buf[BUF_SIZE]
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
@@ -3364,11 +3431,44 @@ void fanotify_loop(int fd)
                 break;
         }
 
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
+        pfds[nfds].fd = fd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+        if (wake_fd >= 0)
+        {
+            pfds[nfds].fd = wake_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        int pr;
+        while ((pr = poll(pfds, nfds, -1)) < 0 && errno == EINTR)
+            ; /* handler-set flags are re-checked by the outer while */
+        if (pr <= 0)
+            continue;
+
+        /* Drain the wake pipe so a backlog of signal bytes cannot spin. */
+        if (wake_fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            char wake[64];
+            while (read(wake_fd, wake, sizeof(wake)) > 0)
+                ;
+        }
+
+        if (!(pfds[0].revents & POLLIN))
+            continue; /* woke for the signal only */
+
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0)
         {
             if (errno == EINTR)
                 continue;
+            if (errno == EAGAIN)
+                continue; /* spurious wake on the non-blocking group fd */
             if (errno == EOVERFLOW)
             {
                 /* Saturation reported as a read error instead of an event:
@@ -3393,9 +3493,15 @@ void fanotify_loop(int fd)
             {
                 if (ev->vers != FANOTIFY_METADATA_VERSION)
                 {
-                    /* Unknown layout: nothing can be interpreted safely. */
+                    /* A metadata-version mismatch means the event stream
+                     * cannot be interpreted at all (fanotify(7)):
+                     * abandon the group and let the supervisor restart
+                     * cleanly instead of parsing an unreadable stream. */
                     if (ev->fd != FAN_NOFD)
                         close((int)ev->fd);
+                    log_msg(LOG_ERR,
+                            "fanotify metadata version mismatch; stopping");
+                    g_fatal = 1;
                 }
                 else if (ev->mask & FAN_OPEN_PERM)
                 {
@@ -3422,7 +3528,7 @@ void fanotify_loop(int fd)
                     close((int)ev->fd);
                 }
 
-                if (ev->event_len == 0)
+                if (ev->event_len == 0 || g_fatal)
                     break;
                 remaining -= ev->event_len;
                 ev = (const struct fanotify_event_metadata *)((const char *)ev +
