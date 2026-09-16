@@ -112,6 +112,33 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
 }
 
 /*
+ * True when a supposedly canonical path still contains a "." or ".."
+ * segment.  canonicalize_path() leaves those behind only when the path
+ * (or its parent) does not exist and the raw string survives the
+ * fallback; a /proc/<pid>/fd target is always canonical, so such a
+ * pattern can never match.  Rejecting it at load time keeps a typo from
+ * silently protecting nothing.
+ */
+static int has_unresolved_dot_segment(const char *path)
+{
+    const char *p = path;
+
+    while (*p != '\0')
+    {
+        const char *end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if ((len == 1 && p[0] == '.') ||
+            (len == 2 && p[0] == '.' && p[1] == '.'))
+            return 1;
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+/*
  * rule_pattern_set: canonicalize one path-or-glob pattern into out,
  * recording whether it is a glob and the length of its wildcard-free
  * base.  Shared by [protected_paths] entries and both sides of every
@@ -155,6 +182,12 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
             return -1;
         }
         canonicalize_path(raw, out, outsz);
+        if (has_unresolved_dot_segment(out))
+        {
+            log_msg(LOG_ERR,
+                    "config_load: unresolvable '.' or '..' in path: %s", raw);
+            return -1;
+        }
         *is_glob = 0;
         *base_len = (int)strlen(out);
         return 0;
@@ -185,17 +218,17 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
     const char *suffix = raw + blen;
     /* A static base longer than "/" always ends just before a '/', so the
      * suffix starts with one.  A base of "/" (wildcard in the first
-     * segment) leaves everything after the leading '/' as the suffix,
-     * which may legitimately start with the wildcard itself. */
-    if (*suffix != '/' && !(blen == 1 && *suffix == '*'))
+     * segment) leaves that whole first segment as the suffix, which may
+     * begin with any pattern character (e.g. "/foo*"). */
+    if (blen > 1 && *suffix != '/')
     {
         log_msg(LOG_ERR, "config_load: malformed glob pattern: %s", raw);
         return -1;
     }
 
-    /* Suffix segments must be non-empty and free of "..".  When the
-     * suffix does not start with '/' (wildcard directly under root),
-     * the first suffix character is already a segment. */
+    /* Suffix segments must be non-empty and free of "." and "..".  When
+     * the suffix does not start with '/', the first suffix character is
+     * already a segment. */
     for (const char *p = (*suffix == '/') ? suffix + 1 : suffix;;)
     {
         const char *end = strchr(p, '/');
@@ -205,9 +238,13 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
             log_msg(LOG_ERR, "config_load: empty segment in glob pattern: %s", raw);
             return -1;
         }
-        if (seglen == 2 && p[0] == '.' && p[1] == '.')
+        if ((seglen == 1 && p[0] == '.') ||
+            (seglen == 2 && p[0] == '.' && p[1] == '.'))
         {
-            log_msg(LOG_ERR, "config_load: '..' not allowed in glob pattern: %s", raw);
+            log_msg(LOG_ERR,
+                    "config_load: '.' or '..' segment not allowed in glob "
+                    "pattern: %s",
+                    raw);
             return -1;
         }
         if (!end)
@@ -221,13 +258,13 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
     size_t canon_len = strlen(base_canon);
     size_t suffix_len = strlen(suffix);
 
-    /* An unresolvable ".." in the base yields a pattern no canonical
-     * target can ever match; reject it rather than match nothing. */
-    if (strstr(base_canon, "/../") != NULL ||
-        (canon_len > 3 && strcmp(base_canon + canon_len - 3, "/..") == 0) ||
-        strcmp(base_canon, "/..") == 0)
+    /* An unresolvable "." or ".." in the base yields a pattern no
+     * canonical target can ever match; reject it rather than match
+     * nothing. */
+    if (has_unresolved_dot_segment(base_canon))
     {
-        log_msg(LOG_ERR, "config_load: unresolvable '..' in glob base: %s", raw);
+        log_msg(LOG_ERR,
+                "config_load: unresolvable '.' or '..' in glob base: %s", raw);
         return -1;
     }
 
@@ -338,6 +375,17 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
     if (!b || b[0] == '\0')
     {
         log_msg(LOG_ERR, "config_load: malformed rule line: %s", line);
+        return 0;
+    }
+    /* Reject an over-long binary before it is truncated: a truncated
+     * path is a different rule (a clipped glob suffix can broaden the
+     * match), and rule_pattern_set()'s PATH_MAX guard can never fire
+     * once the copy has already clipped the value. */
+    if (strlen(b) >= sizeof(bin_raw))
+    {
+        log_msg(LOG_ERR,
+                "config_load: rule binary path too long (max %zu): %.64s",
+                sizeof(bin_raw) - 1, b);
         return 0;
     }
     snprintf(bin_raw, sizeof(bin_raw), "%s", b);
@@ -538,12 +586,16 @@ int config_load(const char *path, Config *cfg)
                 section = SECTION_DENYLIST;
             else
             {
+                /* Refuse the whole config: a typo'd section header would
+                 * silently drop every rule under it while the daemon
+                 * reports success.  Matches the malformed-header case
+                 * above (fail loud, fail closed). */
                 log_msg(LOG_ERR,
-                        "config_load: unknown section '%s': its entries are "
-                        "ignored (a typo'd section header silently drops "
-                        "every rule under it)",
+                        "config_load: unknown section '%s'; refusing the "
+                        "config (its entries would be silently ignored)",
                         s + 1);
-                section = SECTION_NONE;
+                fclose(fp);
+                return -1;
             }
             continue;
         }

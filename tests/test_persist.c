@@ -385,7 +385,9 @@ static int test_persist_truncated(void)
     make_test_path(path, sizeof(path), "truncated.json");
     unlink(path);
 
-    /* No closing braces: parser must not crash and must report 0 entries. */
+    /* No closing braces: the structural completeness check must report
+     * the file as damaged (the caller then clears the in-memory list)
+     * instead of loading a partial state as if it were complete. */
     const char *truncated =
         "{\n  \"entries\": [\n    {\n"
         "      \"binary\": \"/usr/bin/evil\",\n"
@@ -397,11 +399,80 @@ static int test_persist_truncated(void)
     ASSERT(out != NULL, "alloc truncated output");
 
     int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
-    ASSERT(n == 0, "truncated file yields 0 entries");
+    ASSERT(n == -1, "truncated file is reported as damaged");
 
     free(out);
     unlink(path);
-    TEST_PASS("truncated state file");
+    TEST_PASS("truncated state file is rejected");
+    return 0;
+}
+
+/*
+ * A structurally foreign file (no "entries" array at all) must be
+ * rejected, while a writer-produced empty file still loads cleanly.
+ */
+static int test_persist_no_structure(void)
+{
+    char path[PATH_MAX];
+    const char *foreign = "{\n  \"other\": [\n  ]\n}\n";
+
+    make_test_path(path, sizeof(path), "no_structure.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, foreign) == 0, "write foreign-state file");
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc no-structure output");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == -1,
+           "a file without an entries array is damaged");
+    free(out);
+
+    PersistEntry dummy[1];
+    memset(dummy, 0, sizeof(dummy));
+    ASSERT(persist_save(path, dummy, 0) == 0, "save empty state");
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc empty-state output");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == 0,
+           "writer-produced empty state still loads clean");
+    free(out);
+
+    unlink(path);
+    TEST_PASS("structurally foreign state is rejected");
+    return 0;
+}
+
+/*
+ * A line longer than the reader's buffer cannot come from persist_save():
+ * it must fail the load instead of being split and parsed as structure.
+ */
+static int test_persist_long_line(void)
+{
+    char path[PATH_MAX];
+    const char *head = "{\n  \"entries\": [\n";
+    size_t head_len = strlen(head);
+    size_t big = (size_t)JSON_LINE_MAX + 1024;
+    char *content;
+
+    make_test_path(path, sizeof(path), "longline.json");
+    unlink(path);
+
+    content = malloc(head_len + big + 2);
+    ASSERT(content != NULL, "alloc long-line content");
+    memcpy(content, head, head_len);
+    memset(content + head_len, 'x', big);
+    content[head_len + big] = '\n';
+    content[head_len + big + 1] = '\0';
+
+    ASSERT(write_raw_file(path, content) == 0, "write long-line file");
+    free(content);
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc long-line output");
+    ASSERT(persist_load(path, out, PERSIST_MAX_ENTRIES) == -1,
+           "a line longer than the reader buffer is damaged");
+    free(out);
+
+    unlink(path);
+    TEST_PASS("over-long state lines are rejected");
     return 0;
 }
 
@@ -647,6 +718,54 @@ static int test_persist_write_text_symlink_temp(void)
     return 0;
 }
 
+/*
+ * fsync failures must fail the write.  The injection seam makes the
+ * first fsync (file data) and the second (directory after the rename)
+ * fail on any filesystem.
+ */
+static int test_persist_fsync_failure(void)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX + 64];
+    char buf[256];
+    const char *old_text = "{\"version\":\"old\"}\n";
+    const char *new_text = "{\"version\":\"new\"}\n";
+
+    make_test_path(path, sizeof(path), "fsync_fail.json");
+    unlink(path);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+
+    ASSERT(persist_write_text(path, old_text) == 0, "initial write");
+
+    /* File-data fsync fails: the temp file is removed and the previous
+     * file is untouched. */
+    persist_test_fail_fsync_after(0);
+    ASSERT(persist_write_text(path, new_text) == -1,
+           "file fsync failure fails the write");
+    ASSERT(access(tmp, F_OK) != 0, "temp file removed after fsync failure");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == (long)strlen(old_text) &&
+               strcmp(buf, old_text) == 0,
+           "previous file untouched after fsync failure");
+
+    /* Directory fsync fails after the rename committed: the new file is
+     * live, but the write must still be reported as failed so callers do
+     * not treat it as durable. */
+    persist_test_fail_fsync_after(1);
+    ASSERT(persist_write_text(path, new_text) == -1,
+           "directory fsync failure fails the write");
+    ASSERT(read_file_text(path, buf, sizeof(buf)) == (long)strlen(new_text) &&
+               strcmp(buf, new_text) == 0,
+           "rename committed when only the directory fsync failed");
+
+    persist_test_fail_fsync_after(-1);
+    ASSERT(persist_write_text(path, old_text) == 0,
+           "injection disabled again");
+
+    unlink(path);
+    TEST_PASS("fsync failures fail the write");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  test: public JSON escape/extract helpers roundtrip                */
 /* ------------------------------------------------------------------ */
@@ -843,6 +962,9 @@ int main(void)
     failed |= test_persist_json_escaping();
     failed |= test_persist_malformed_depth();
     failed |= test_persist_truncated();
+    failed |= test_persist_no_structure();
+    failed |= test_persist_long_line();
+    failed |= test_persist_fsync_failure();
     failed |= test_persist_over_cap();
     failed |= test_persist_remove();
     failed |= test_persist_write_text_roundtrip();

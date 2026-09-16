@@ -98,6 +98,11 @@ static void test_missing_file(void)
     ASSERT(config_load("/tmp", &cfg) == -1, "unreadable directory refused");
 }
 
+/*
+ * An unknown section header must refuse the whole config: silently
+ * ignoring it would drop every rule under a typo'd header while the
+ * daemon reports success.
+ */
 static void test_unknown_section(void)
 {
     const char *conf =
@@ -114,9 +119,8 @@ static void test_unknown_section(void)
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    config_load(path, &cfg);
-    ASSERT(cfg.protected_count == 1, "ignores unknown section paths");
-    ASSERT(cfg.allowlist_count == 1, "allowlist under unknown section still parsed");
+    ASSERT(config_load(path, &cfg) == -1,
+           "unknown section refuses the whole config");
 
     config_reset(&cfg);
     unlink(path);
@@ -783,16 +787,20 @@ static void test_glob_protected_paths(void)
 static void test_glob_root_based(void)
 {
     char conf[1024];
+    char pat_first[128];
+    snprintf(pat_first, sizeof(pat_first), "/tmp_fileshield_globfirst_%d*",
+             (int)getpid());
     snprintf(conf, sizeof(conf),
              "[protected_paths]\n"
              "/**\n"
              "/**/secret\n"
              "/*.conf\n"
+             "%s\n" /* wildcard in the first segment: base is "/" */
              "\n"
              "[denylist]\n"
              "/usr/bin/curl = /**\n"
              "/tmp/glob_root_rej_%d/**/\n", /* trailing slash: malformed */
-             (int)getpid());
+             pat_first, (int)getpid());
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config for root-based globs");
@@ -802,7 +810,7 @@ static void test_glob_root_based(void)
 
     int r = config_load(path, &cfg);
     ASSERT(r == 0, "config_load survives the malformed trailing slash");
-    ASSERT(cfg.protected_count == 3, "3 root-based protected entries parsed");
+    ASSERT(cfg.protected_count == 4, "4 root-based protected entries parsed");
     ASSERT(cfg.denylist_count == 1, "1 valid denylist rule parsed");
 
     ASSERT(cfg.protected[0].is_glob == 1, "'/**' is a glob");
@@ -818,6 +826,13 @@ static void test_glob_root_based(void)
     ASSERT(strcmp(cfg.protected[2].path, "/*.conf") == 0,
            "'/*.conf' pattern preserved");
     ASSERT(cfg.protected[2].base_len == 1, "'/*.conf' static base is '/'");
+
+    ASSERT(cfg.protected[3].is_glob == 1,
+           "a wildcard in the first segment is a glob");
+    ASSERT(strcmp(cfg.protected[3].path, pat_first) == 0,
+           "first-segment partial wildcard preserved");
+    ASSERT(cfg.protected[3].base_len == 1,
+           "first-segment glob static base is '/'");
 
     ASSERT(cfg.denylist[0].target_is_glob == 1,
            "denylist '/**' target is a glob");
@@ -1428,6 +1443,72 @@ static void test_shipped_config_contract(void)
     config_reset(&cfg);
 }
 
+/*
+ * A path (or glob) whose unresolved "." or ".." survives canonicalization
+ * can never match a canonical /proc/<pid>/fd target: the entry must be
+ * rejected at load time instead of silently protecting nothing.
+ */
+static void test_unresolved_dot_segments(void)
+{
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "/tmp/fileshield_dots_ok_%d\n"
+             "/tmp/fileshield_dots_missing_%d/../secret\n"
+             "/tmp/fileshield_dots_missing_%d/./secret\n"
+             "/tmp/fileshield_dots_missing_%d/./*.json\n"
+             "/tmp/fileshield_dots_missing_%d/../*.json\n",
+             (int)getpid(), (int)getpid(), (int)getpid(), (int)getpid(),
+             (int)getpid());
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for dot segments");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives rejected dot-segment entries");
+    ASSERT(cfg.protected_count == 1,
+           "only the clean entry survives unresolved dot segments");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * An over-long rule binary must be rejected before it is copied into the
+ * PATH_MAX-sized buffer: truncation silently turns the line into a
+ * different rule (and a clipped glob suffix can broaden its match).
+ */
+static void test_overlong_rule_binary(void)
+{
+    char binary[PATH_MAX + 64];
+    char conf[PATH_MAX * 2 + 128];
+    char *path;
+    Config cfg;
+
+    memset(binary, 'b', sizeof(binary) - 1);
+    binary[0] = '/';
+    binary[sizeof(binary) - 1] = '\0';
+
+    snprintf(conf, sizeof(conf), "[unsafe_allowlist]\n%s = /tmp/x\n", binary);
+
+    path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for over-long binary");
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0,
+           "config_load survives the skipped over-long rule");
+    ASSERT(cfg.unsafe_allowlist_count == 0,
+           "over-long rule binary is rejected, not truncated");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -1450,6 +1531,8 @@ int main(void)
     test_glob_protected_paths();
     test_glob_root_based();
     test_glob_rejection();
+    test_unresolved_dot_segments();
+    test_overlong_rule_binary();
     test_exclusions_parse();
     test_exclusion_rejection();
     test_rule_rejection();

@@ -107,10 +107,38 @@ static int open_atomic_temp(const char *filepath, const char *what,
 }
 
 /*
- * Finish an atomic write: flush, fsync (a failure is only a warning, as
- * persist_save() always treated it), close and rename the temp file over
- * filepath.  Any failure unlinks the temp file so no partial state is
- * left behind and returns -1; 'what' tags the log messages.
+ * fsync with a test injection point: after persist_test_fail_fsync_after(n)
+ * the (n+1)-th fsync call fails with EIO, so the failure branches are
+ * reachable in tests on any filesystem.  Disabled by default.
+ */
+static int g_test_fail_fsync_after = -1;
+static int g_test_fsync_calls = 0;
+
+static int fsync_maybe_failing(int fd)
+{
+    g_test_fsync_calls++;
+    if (g_test_fail_fsync_after >= 0 &&
+        g_test_fsync_calls > g_test_fail_fsync_after)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(fd);
+}
+
+void persist_test_fail_fsync_after(int nth)
+{
+    g_test_fail_fsync_after = nth;
+    g_test_fsync_calls = 0;
+}
+
+/*
+ * Finish an atomic write: flush, fsync, close and rename the temp file
+ * over filepath.  Any failure — including fsync — unlinks the temp file
+ * so no partial or non-durable state is published, and returns -1; 'what'
+ * tags the log messages.  Only a directory-fsync failure after the
+ * rename cannot remove the new file; it is still reported as a failure
+ * so the caller does not treat the write as durable.
  */
 static int commit_atomic_temp(FILE *fp, const char *tmp_file,
                               const char *filepath, const char *what)
@@ -122,9 +150,14 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
         unlink(tmp_file);
         return -1;
     }
-    if (fsync(fileno(fp)) < 0)
-        log_msg(LOG_WARNING, "%s: fsync %s: %s", what, tmp_file,
-                strerror(errno));
+    if (fsync_maybe_failing(fileno(fp)) < 0)
+    {
+        log_msg(LOG_ERR, "%s: fsync %s: %s (not publishing the update)",
+                what, tmp_file, strerror(errno));
+        fclose(fp);
+        unlink(tmp_file);
+        return -1;
+    }
 
     if (fclose(fp) < 0)
     {
@@ -145,7 +178,9 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
      * after this point can leave the old file — or nothing — on disk.
      * For the pin table a vanished file is re-read as a clean empty
      * table, which would silently reset every rule to first-use (TOFU).
-     * Consistent with the fsync policy above, a failure is a warning. */
+     * The rename is already committed, so the new file cannot be
+     * removed; report the failure anyway so the caller does not treat
+     * the write as durable. */
     char dirbuf[PATH_MAX];
     snprintf(dirbuf, sizeof(dirbuf), "%s", filepath);
     char *slash = strrchr(dirbuf, '/');
@@ -160,9 +195,15 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
         int dirfd = open(dirpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (dirfd >= 0)
         {
-            if (fsync(dirfd) < 0)
-                log_msg(LOG_WARNING, "%s: fsync dir %s: %s", what, dirpath,
-                        strerror(errno));
+            if (fsync_maybe_failing(dirfd) < 0)
+            {
+                log_msg(LOG_ERR,
+                        "%s: fsync dir %s: %s (rename committed but it may "
+                        "not survive a crash)",
+                        what, dirpath, strerror(errno));
+                close(dirfd);
+                return -1;
+            }
             close(dirfd);
         }
     }
@@ -469,6 +510,9 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     PersistEntry *current = NULL;
     int count = 0;
     int warned_truncated = 0;
+    int saw_entries = 0;
+    int closed_array = 0;
+    int closed_object = 0;
 
     /*
      * Minimal line-oriented scanner: just enough JSON structure to find
@@ -502,6 +546,18 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
      * reported instead of silently dropping grants. */
     while (fgets(line, sizeof(line), fp))
     {
+        if (!strchr(line, '\n') && !feof(fp))
+        {
+            /* A line longer than any persist_save() can emit: the file
+             * was not written by the daemon or is corrupt.  Fail instead
+             * of parsing a split line as valid structure. */
+            log_msg(LOG_ERR,
+                    "persist_load: %s has a line longer than %d bytes; "
+                    "ignoring the state file",
+                    filepath, JSON_LINE_MAX - 1);
+            fclose(fp);
+            return -1;
+        }
         char *p = line;
 
         while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
@@ -513,6 +569,7 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Detect the "entries": [ array opener. */
         if (state == S_OUTSIDE && strstr(p, "\"entries\":") != NULL)
         {
+            saw_entries = 1;
             state = S_IN_ENTRIES;
             continue;
         }
@@ -570,7 +627,12 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
             (state == S_OUTSIDE && *p == '}'))
         {
             if (state == S_IN_ENTRIES)
+            {
+                closed_array = 1;
                 state = S_OUTSIDE;
+            }
+            else
+                closed_object = 1;
             continue;
         }
 
@@ -595,6 +657,19 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     if (ferror(fp))
     {
         log_msg(LOG_ERR, "persist_load: read error on %s; ignoring the "
+                "state file", filepath);
+        fclose(fp);
+        return -1; /* fail secure: the caller clears the in-memory list */
+    }
+
+    /* Structural completeness: a truncated or foreign file must not be
+     * accepted as an empty or partial state.  The caller clears the
+     * in-memory list on -1, which fails closed (re-prompt/re-hash) and
+     * is visible in the journal. */
+    if (!saw_entries || !closed_array || !closed_object || state != S_OUTSIDE)
+    {
+        log_msg(LOG_ERR,
+                "persist_load: %s is truncated or malformed; ignoring the "
                 "state file", filepath);
         fclose(fp);
         return -1; /* fail secure: the caller clears the in-memory list */

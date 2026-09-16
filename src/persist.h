@@ -78,9 +78,20 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
  * NUL) to filepath: the parent directory is created when missing (0700,
  * root-ownership and symlink checks), the bytes go to a 0600 temp file
  * opened O_EXCL|O_CLOEXEC|O_NOFOLLOW, and the temp file is renamed over
- * filepath.  Returns 0 on success; -1 on any failure, with the temp
- * file removed and any existing filepath left untouched.
+ * filepath.  Returns 0 on success; -1 on any failure.  A failure before
+ * the rename removes the temp file and leaves any existing filepath
+ * untouched; a directory-fsync failure after the rename is reported as
+ * -1 even though the new file is already in place (it may not survive a
+ * crash).
  */
 int persist_write_text(const char *filepath, const char *text);
+
+/*
+ * Test seam: make the (nth+1)-th fsync call fail with EIO (nth = 0 fails
+ * the first call, 1 the second, ...).  Any negative value disables the
+ * injection.  Used by test_persist to exercise the fsync failure
+ * branches on any filesystem.
+ */
+void persist_test_fail_fsync_after(int nth);
 
 #endif
