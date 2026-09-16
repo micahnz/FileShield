@@ -64,6 +64,21 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
 
+/*
+ * Shared startup-failure cleanup: close the group fd (when open), drop
+ * the config and close syslog.  Returns EXIT_FAILURE so call sites can
+ * `return startup_fail(...)`.
+ */
+static int startup_fail(int fan_fd, Config *cfg)
+{
+    if (fan_fd >= 0)
+        close(fan_fd);
+    config_reset(cfg);
+    free(cfg);
+    closelog();
+    return EXIT_FAILURE;
+}
+
 static void daemonize(void)
 {
     /* Detach from the invoking directory and tighten the file-creation
@@ -158,8 +173,7 @@ int main(int argc, char *argv[])
     if (config_load(config_path, cfg) < 0)
     {
         log_msg(LOG_ERR, "failed to load config: %s", config_path);
-        free(cfg);
-        return EXIT_FAILURE;
+        return startup_fail(-1, cfg);
     }
     g_config = cfg;
 
@@ -192,10 +206,7 @@ int main(int argc, char *argv[])
                         "cannot resolve --config %s: %s (a relative path "
                         "would break reload after daemonize)",
                         config_path, strerror(errno));
-                config_reset(cfg);
-                free(cfg);
-                closelog();
-                return EXIT_FAILURE;
+                return startup_fail(-1, cfg);
             }
             config_path = config_abs;
         }
@@ -229,8 +240,7 @@ int main(int argc, char *argv[])
     if (fan_fd < 0)
     {
         log_msg(LOG_ERR, "fanotify_setup failed");
-        free(cfg);
-        return EXIT_FAILURE;
+        return startup_fail(-1, cfg);
     }
     notify_set_fan_fd(fan_fd);
 
@@ -243,22 +253,12 @@ int main(int argc, char *argv[])
         log_msg(LOG_ERR,
                 "no protected paths configured (exclusions alone do not "
                 "protect); refusing to start");
-        close(fan_fd);
-        config_reset(cfg);
-        free(cfg);
-        closelog();
-        return EXIT_FAILURE;
+        return startup_fail(fan_fd, cfg);
     }
     /* Refuse a config whose own state/config files the marks would
      * intercept (self-deadlock class). */
     if (fanotify_scope_guard(config_path) < 0)
-    {
-        close(fan_fd);
-        config_reset(cfg);
-        free(cfg);
-        closelog();
-        return EXIT_FAILURE;
-    }
+        return startup_fail(fan_fd, cfg);
 
     int mark_skipped = 0;
 
@@ -277,11 +277,7 @@ int main(int argc, char *argv[])
                 "%d of %d protected paths could not be marked; refusing to "
                 "start with incomplete protection",
                 mark_failures, cfg->protected_count);
-        close(fan_fd);
-        config_reset(cfg);
-        free(cfg);
-        closelog();
-        return EXIT_FAILURE;
+        return startup_fail(fan_fd, cfg);
     }
 
     /* Fail closed if nothing at all is being watched: every configured
@@ -291,11 +287,7 @@ int main(int argc, char *argv[])
         log_msg(LOG_ERR,
                 "no protected path could be marked on any filesystem; "
                 "refusing to start");
-        close(fan_fd);
-        config_reset(cfg);
-        free(cfg);
-        closelog();
-        return EXIT_FAILURE;
+        return startup_fail(fan_fd, cfg);
     }
 
     if (mark_skipped > 0)

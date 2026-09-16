@@ -69,6 +69,18 @@ void load_pin_state(void)
     pin_load(PIN_STATE_FILE);
 }
 
+/*
+ * Re-read persisted state, pins and expire caches after any reload
+ * outcome: the state files are reloaded even on failure paths so the
+ * in-memory lists always match what is on disk.
+ */
+static void reload_refresh_state(void)
+{
+    load_persisted_state();
+    load_pin_state();
+    cache_expire();
+}
+
 int reload_protection(int fan_fd, const char *config_path, Config **cfg)
 {
     g_need_reload = 0;
@@ -78,9 +90,7 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     if (!new_cfg)
     {
         log_msg(LOG_ERR, "out of memory during reload, keeping old config");
-        load_persisted_state();
-        load_pin_state();
-        cache_expire();
+        reload_refresh_state();
         return 0;
     }
 
@@ -88,9 +98,7 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     {
         log_msg(LOG_ERR, "config reload failed, keeping old config");
         free(new_cfg);
-        load_persisted_state();
-        load_pin_state();
-        cache_expire();
+        reload_refresh_state();
         return 0;
     }
 
@@ -105,9 +113,7 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
                 "reload rejected by the scope guard; keeping old config");
         g_config = *cfg;
         free(new_cfg);
-        load_persisted_state();
-        load_pin_state();
-        cache_expire();
+        reload_refresh_state();
         return 0;
     }
 
@@ -167,9 +173,7 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
 
         free(new_cfg);
 
-        load_persisted_state();
-        load_pin_state();
-        cache_expire();
+        reload_refresh_state();
         return g_fatal ? -1 : 0;
     }
 
@@ -182,8 +186,6 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     *cfg = new_cfg;
     g_config = *cfg;
 
-    load_persisted_state();
-    load_pin_state();
-    cache_expire();
+    reload_refresh_state();
     return 0;
 }

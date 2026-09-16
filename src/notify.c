@@ -518,6 +518,20 @@ static void sanitize_text(const char *in, char *out, size_t outsz)
     out[j] = '\0';
 }
 
+/*
+ * sanitize_ellipsized: sanitize src into out (bounded) and, when content
+ * was actually cut, mark the cut by replacing the tail with "...".
+ * A value that fits exactly is left untouched.
+ */
+static void sanitize_ellipsized(const char *in, char *out, size_t outsz)
+{
+    sanitize_text(in, out, outsz);
+    if (!in || strlen(in) < outsz - 1)
+        return; /* nothing was cut */
+    if (outsz >= 4)
+        memcpy(out + outsz - 4, "...", 4);
+}
+
 /* Kill the dialog process group and reap with a bounded wait. */
 static void kill_and_reap(pid_t pid, int *status, int *child_exited)
 {
@@ -830,19 +844,13 @@ int notify_ask(const NotifyRequest *req)
      * sanitized so control characters cannot forge dialog content. */
     sanitize_text(req->comm, t.comm, sizeof(t.comm));
     sanitize_text(req->comm_parent, t.pcomm, sizeof(t.pcomm));
-    sanitize_text(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
-                  t.exe, sizeof(t.exe));
-    sanitize_text(req->path, t.path, sizeof(t.path));
-    sanitize_text(req->cmdline && req->cmdline[0] != '\0' ? req->cmdline
-                                                          : "(unknown)",
-                  t.cmd, sizeof(t.cmd));
-
-    if (req->exe && strlen(req->exe) >= sizeof(t.exe) - 1)
-        memcpy(t.exe + sizeof(t.exe) - 4, "...", 4);
-    if (req->path && strlen(req->path) >= sizeof(t.path) - 1)
-        memcpy(t.path + sizeof(t.path) - 4, "...", 4);
-    if (req->cmdline && strlen(req->cmdline) >= sizeof(t.cmd) - 1)
-        memcpy(t.cmd + sizeof(t.cmd) - 4, "...", 4);
+    sanitize_ellipsized(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
+                        t.exe, sizeof(t.exe));
+    sanitize_ellipsized(req->path, t.path, sizeof(t.path));
+    sanitize_ellipsized(req->cmdline && req->cmdline[0] != '\0'
+                            ? req->cmdline
+                            : "(unknown)",
+                        t.cmd, sizeof(t.cmd));
 
     /* An unavailable digest cannot back a persistent grant: say so before
      * the user picks, and point at the deliberate escape hatch.  The
@@ -955,27 +963,19 @@ int notify_ask_hash_change(const NotifyHashChange *req)
      * are treated as untrusted so control characters cannot forge dialog
      * lines. */
     sanitize_text(req->rule_pattern, rule, sizeof(rule));
-    sanitize_text(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
-                  exe, sizeof(exe));
-    sanitize_text(req->path, path, sizeof(path));
-    sanitize_text(req->cmdline && req->cmdline[0] != '\0' ? req->cmdline
-                                                          : "(unknown)",
-                  cmd, sizeof(cmd));
+    sanitize_ellipsized(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
+                        exe, sizeof(exe));
+    sanitize_ellipsized(req->path, path, sizeof(path));
+    sanitize_ellipsized(req->cmdline && req->cmdline[0] != '\0'
+                            ? req->cmdline
+                            : "(unknown)",
+                        cmd, sizeof(cmd));
     sanitize_text(req->old_hash && req->old_hash[0] != '\0' ? req->old_hash
                                                             : "(unknown)",
                   old_hash, sizeof(old_hash));
     sanitize_text(req->new_hash && req->new_hash[0] != '\0' ? req->new_hash
                                                             : "(unknown)",
                   new_hash, sizeof(new_hash));
-
-    if (req->rule_pattern && strlen(req->rule_pattern) >= sizeof(rule) - 1)
-        memcpy(rule + sizeof(rule) - 4, "...", 4);
-    if (req->exe && strlen(req->exe) >= sizeof(exe) - 1)
-        memcpy(exe + sizeof(exe) - 4, "...", 4);
-    if (req->path && strlen(req->path) >= sizeof(path) - 1)
-        memcpy(path + sizeof(path) - 4, "...", 4);
-    if (req->cmdline && strlen(req->cmdline) >= sizeof(cmd) - 1)
-        memcpy(cmd + sizeof(cmd) - 4, "...", 4);
 
     /* Full digests are journal-logged by the caller; the prompt shows
      * only the 16-hex prefixes a human can compare at a glance. */

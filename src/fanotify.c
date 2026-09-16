@@ -1220,27 +1220,51 @@ static int in_init_mount_ns(void)
            self_ns.st_dev == init_ns.st_dev;
 }
 
+/*
+ * Walk up to the nearest existing ancestor of path (the path itself is
+ * presumed missing; the caller stats it first).  Returns 1 and fills
+ * out — and *st_out when non-NULL — with an existing path; 0 when even
+ * "/" does not resolve (out is "/" then).  Shared by the scope guard's
+ * mount-ID lookup, the missing-path mount mark and the dry run.
+ */
+static int nearest_existing_ancestor(const char *path, char *out,
+                                     size_t outsz, struct stat *st_out)
+{
+    struct stat st;
+
+    snprintf(out, outsz, "%s", path);
+    char *slash;
+    while ((slash = strrchr(out, '/')) != NULL && slash != out)
+    {
+        *slash = '\0';
+        if (stat(out, &st) == 0)
+        {
+            if (st_out)
+                *st_out = st;
+            return 1;
+        }
+    }
+    /* The root is the last resort. */
+    snprintf(out, outsz, "/");
+    if (stat("/", &st) == 0)
+    {
+        if (st_out)
+            *st_out = st;
+        return 1;
+    }
+    return 0;
+}
+
 /* Init-namespace mount that would be marked for `path` (the nearest
  * existing ancestor when it does not exist yet).  0 when unknown. */
 static unsigned long long mark_target_mount_id(const char *path)
 {
-    char buf[PATH_MAX];
+    char ancestor[PATH_MAX];
     struct stat st;
 
-    snprintf(buf, sizeof(buf), "%s", path);
-    if (stat(buf, &st) == 0)
-        return mount_id_of(buf);
-
-    char *slash;
-    while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
-    {
-        *slash = '\0';
-        if (stat(buf, &st) == 0)
-            return mount_id_of(buf);
-    }
-    if (stat("/", &st) == 0)
-        return mount_id_of("/");
-    return 0;
+    if (!nearest_existing_ancestor(path, ancestor, sizeof(ancestor), &st))
+        return 0;
+    return mount_id_of(ancestor);
 }
 
 int fanotify_scope_guard(const char *config_path)
@@ -1376,25 +1400,12 @@ void fanotify_dry_run(const Config *cfg)
         }
         else
         {
-            char buf[PATH_MAX];
-            char *slash;
-            int found = 0;
+            char ancestor[PATH_MAX];
 
-            snprintf(buf, sizeof(buf), "%s", target);
-            while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
-            {
-                *slash = '\0';
-                struct stat ast;
-                if (stat(buf, &ast) == 0)
-                {
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found)
-                snprintf(buf, sizeof(buf), "/");
+            nearest_existing_ancestor(target, ancestor, sizeof(ancestor),
+                                      NULL);
             printf("  mount mark : (missing %s) covered via %s\n", target,
-                   buf);
+                   ancestor);
         }
     }
 }
@@ -1621,24 +1632,55 @@ static void add_mount_mark_if_needed(int fd, const struct stat *st,
  */
 static void ensure_mount_mark_for_missing(int fd, const char *path)
 {
-    char buf[PATH_MAX];
-    snprintf(buf, sizeof(buf), "%s", path);
-
-    char *slash;
-    while ((slash = strrchr(buf, '/')) != NULL && slash != buf)
-    {
-        *slash = '\0';
-        struct stat st;
-        if (stat(buf, &st) == 0)
-        {
-            add_mount_mark_if_needed(fd, &st, buf);
-            return;
-        }
-    }
-
+    char ancestor[PATH_MAX];
     struct stat st;
-    if (stat("/", &st) == 0)
-        add_mount_mark_if_needed(fd, &st, "/");
+
+    if (nearest_existing_ancestor(path, ancestor, sizeof(ancestor), &st))
+        add_mount_mark_if_needed(fd, &st, ancestor);
+}
+
+/*
+ * fanotify_mark(ADD) plus mark-table tracking, removing the kernel mark
+ * again when tracking fails: an untracked mark would survive config
+ * reloads and could never be removed.  Returns 0 on success, -1 on
+ * failure, with the log written.
+ */
+static int mark_add_tracked(int fd, const char *target, unsigned int mask)
+{
+    if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, target) < 0)
+    {
+        log_msg(LOG_ERR, "fanotify_mark ADD %s: %s", target, strerror(errno));
+        return -1;
+    }
+    if (mark_table_add(target, mask) < 0)
+    {
+        /* The kernel mark was installed before tracking: remove it so a
+         * refused load cannot leave a stale mark behind. */
+        fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, target);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Record the (dev, ino) of an installed mark for hard-link detection.
+ * An exact path records the object itself; a glob base records only
+ * files the pattern matches (pattern == NULL records everything).
+ * Directories are walked (bounded depth, same device).
+ */
+static void record_protected_inodes(const char *target, const struct stat *st,
+                                    const char *pattern)
+{
+    if (S_ISREG(st->st_mode))
+    {
+        if ((pattern == NULL || glob_match_path(pattern, target)) &&
+            exclusion_match(target) == NULL)
+            inode_set_add(st->st_dev, st->st_ino);
+    }
+    else if (S_ISDIR(st->st_mode))
+    {
+        inode_walk_dir(target, st->st_dev, 0, pattern);
+    }
 }
 
 int fanotify_add_mark(int fd, const char *path)
@@ -1661,30 +1703,11 @@ int fanotify_add_mark(int fd, const char *path)
         return -1;
     }
 
-    unsigned int mask = fanotify_mark_mask();
-    if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, path) < 0)
-    {
-        log_msg(LOG_ERR, "fanotify_mark ADD %s: %s", path, strerror(errno));
+    if (mark_add_tracked(fd, path, fanotify_mark_mask()) < 0)
         return -1;
-    }
-    if (mark_table_add(path, mask) < 0)
-    {
-        /* The kernel mark was installed before tracking: remove it so a
-         * refused load cannot leave a stale mark behind. */
-        fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, path);
-        return -1;
-    }
     log_msg(LOG_INFO, "fanotify mark added: %s", path);
 
-    if (S_ISREG(st.st_mode))
-    {
-        if (exclusion_match(path) == NULL)
-            inode_set_add(st.st_dev, st.st_ino);
-    }
-    else if (S_ISDIR(st.st_mode))
-    {
-        inode_walk_dir(path, st.st_dev, 0, NULL);
-    }
+    record_protected_inodes(path, &st, NULL);
 
     add_mount_mark_if_needed(fd, &st, path);
     return 0;
@@ -1732,33 +1755,14 @@ int fanotify_add_protected(int fd, const ProtectedPath *pp)
         return -1;
     }
 
-    unsigned int mask = fanotify_mark_mask();
-    if (fanotify_mark(fd, FAN_MARK_ADD, mask, AT_FDCWD, base) < 0)
-    {
-        log_msg(LOG_ERR, "fanotify_mark ADD %s (glob base of %s): %s",
-                base, pp->path, strerror(errno));
+    if (mark_add_tracked(fd, base, fanotify_mark_mask()) < 0)
         return -1;
-    }
-    if (mark_table_add(base, mask) < 0)
-    {
-        /* See fanotify_add_mark(): never leave an untracked kernel mark. */
-        fanotify_mark(fd, FAN_MARK_REMOVE, mask, AT_FDCWD, base);
-        return -1;
-    }
     log_msg(LOG_INFO, "fanotify mark added: %s (glob base of %s)",
             base, pp->path);
 
-    if (S_ISREG(st.st_mode))
-    {
-        /* The pattern is anchored in a regular file's name; only that
-         * file itself can be recorded. */
-        if (glob_match_path(pp->path, base) && exclusion_match(base) == NULL)
-            inode_set_add(st.st_dev, st.st_ino);
-    }
-    else if (S_ISDIR(st.st_mode))
-    {
-        inode_walk_dir(base, st.st_dev, 0, pp->path);
-    }
+    /* The pattern is anchored in the base directory; record only the
+     * files it matches. */
+    record_protected_inodes(base, &st, pp->path);
 
     add_mount_mark_if_needed(fd, &st, base);
     return 0;
