@@ -35,6 +35,16 @@ int sha512_proc_exe(pid_t pid, char hex_out[129]);
 const char *sha512_last_failure(void);
 
 /*
+ * Register a callback invoked once per silent wait slice (about every
+ * 100 ms) while a forked hash helper is running.  fanotify.c uses it to
+ * service its event queue while the helper is blocked opening
+ * /proc/<pid>/exe on a marked filesystem; the callback must not block
+ * and must not call back into sha512_file()/sha512_proc_exe().  Pass
+ * NULL to clear.
+ */
+void sha512_set_wait_hook(void (*hook)(void));
+
+/*
  * Compute the SHA-512 digest of an in-memory string (used to fingerprint
  * command lines without persisting potentially secret arguments).
  * Same return semantics as sha512_file().
