@@ -542,6 +542,14 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
             apply_entry_number(current, p);
     }
 
+    if (ferror(fp))
+    {
+        log_msg(LOG_ERR, "persist_load: read error on %s; ignoring the "
+                "state file", filepath);
+        fclose(fp);
+        return -1; /* fail secure: the caller clears the in-memory list */
+    }
+
     fclose(fp);
     log_msg(LOG_INFO, "persist_load: loaded %d entries from %s", count, filepath);
     return count;
