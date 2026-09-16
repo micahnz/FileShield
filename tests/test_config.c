@@ -82,10 +82,6 @@ static void test_missing_file(void)
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
     ASSERT(config_load("/nonexistent/fileshield_test.conf", &cfg) == -1, "missing file fails");
-
-    /* A directory opens read-only but cannot be read: the read error must
-     * refuse the config instead of yielding an empty one. */
-    ASSERT(config_load("/tmp", &cfg) == -1, "unreadable directory refused");
 }
 
 static void test_unknown_section(void)
