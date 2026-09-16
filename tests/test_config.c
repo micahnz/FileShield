@@ -223,6 +223,55 @@ static void test_settings_invalid_user_ttl(void)
 }
 
 /*
+ * Integer settings go through strtol: overflow and trailing junk are
+ * rejected instead of saturated or truncated, and user_ttl = 0 is accepted
+ * (documented as "disables caching").
+ */
+static void test_settings_int_parsing(void)
+{
+    Config cfg;
+    char *path;
+
+    /* user_ttl = 0 disables caching and must be accepted. */
+    path = write_temp("[settings]\n"
+                      "user_ttl = 0\n");
+    ASSERT(path != NULL, "write temp config for user_ttl = 0");
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load user_ttl = 0");
+    ASSERT(cfg.user_ttl_seconds == 0, "user_ttl = 0 is accepted");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    /* Trailing junk is rejected rather than accepted as 120. */
+    path = write_temp("[settings]\n"
+                      "user_ttl = 120junk\n"
+                      "notify_max = 5x\n");
+    ASSERT(path != NULL, "write temp config for trailing junk");
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load trailing junk");
+    ASSERT(cfg.user_ttl_seconds == 0, "user_ttl junk is rejected");
+    ASSERT(cfg.notify_max == NOTIFY_MAX_DEFAULT,
+           "notify_max junk keeps the default");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    /* Overflow is rejected, not saturated and clamped. */
+    path = write_temp("[settings]\n"
+                      "user_ttl = 99999999999999999999\n"
+                      "session_ttl = 30s\n");
+    ASSERT(path != NULL, "write temp config for overflow");
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load overflow");
+    ASSERT(cfg.user_ttl_seconds == 0, "user_ttl overflow is rejected");
+    ASSERT(cfg.session_ttl_seconds == 0, "session_ttl junk is rejected");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
  * Notification toggles: unsafe_allowlist and denylist on by default,
  * allowlist off; notify_dedup_ttl defaults to 60 s.  Explicit values use
  * the same yes/no/true/false/1/0 spellings as debug; invalid values are
@@ -1252,6 +1301,7 @@ int main(void)
     test_settings_session_ttl_value();
     test_settings_invalid_session_ttl();
     test_settings_invalid_user_ttl();
+    test_settings_int_parsing();
     test_settings_notifications();
     test_limits_are_blocking();
     test_ttl_clamping();
