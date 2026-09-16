@@ -762,8 +762,8 @@ static void test_unsafe_allowlist_skips_pins(void)
      * The same binary pattern is deliberately present in both sections.
      * This pins the matcher invariant that the unsafe path is independent
      * of the safe section and never reads or writes a pin; the pipeline's
-     * unsafe-first order is enforced in event_runtime_allowed() and
-     * covered by the verdict seam tests.
+     * unsafe-first order is exercised by
+     * test_unsafe_allowlist_wins_over_pinned.
      */
     set_rule(&cfg.unsafe_allowlist[0], pattern, "/home/u/.local");
     cfg.unsafe_allowlist_count = 1;
@@ -850,8 +850,13 @@ static void test_unsafe_hit_once_per_process(void)
            "another process is surfaced independently");
 }
 
-/* A glob deny rule beats a glob allow rule (deny is evaluated first). */
-static void test_glob_deny_beats_glob_allow(void)
+/*
+ * Both matchers accept the same access.  The pipeline's deny-before-grant
+ * order is enforced in event_load_binary()/process_open_perm() and is
+ * exercised by the root canary; this seam test pins only that the deny
+ * and allow matchers agree on the tuple.
+ */
+static void test_glob_deny_and_allow_matchers(void)
 {
     static Config cfg;
     Config *saved = g_config;
@@ -870,8 +875,9 @@ static void test_glob_deny_beats_glob_allow(void)
            "glob deny rule matches the access");
     ASSERT(fanotify_test_config_allow_match(binary, target, &grant) != NULL,
            "glob allow rule also matches the same access");
-    /* event_load_binary() runs the deny match before every grant stage
-     * and before hashing, so the deny wins and no pin work is done. */
+    /* In production the deny match runs before every grant stage, so the
+     * deny wins; that ordering is not observable through these two
+     * independent matcher seams. */
 
     g_config = saved;
 }
@@ -1629,6 +1635,17 @@ static void test_dialog_env_whitelist(void) {
     /* The one documented exception. */
     ASSERT(notify_test_env_key_allowed("QT_QPA_PLATFORMTHEME") == 1,
            "QT_QPA_PLATFORMTHEME is the documented exception");
+
+    /* Prompt-text sanitizing: control characters become '?', a value
+     * that fits exactly is untouched, and a cut tail gets "...". */
+    char san[8];
+    notify_test_sanitize_ellipsized("abc\x01" "def", san, sizeof(san));
+    ASSERT(strcmp(san, "abc?def") == 0, "control characters are replaced");
+    notify_test_sanitize_ellipsized("1234567", san, sizeof(san));
+    ASSERT(strcmp(san, "1234567") == 0,
+           "an exactly fitting value is not ellipsized");
+    notify_test_sanitize_ellipsized("12345678", san, sizeof(san));
+    ASSERT(strcmp(san, "1234...") == 0, "a cut value gets the ellipsis marker");
 }
 
 /*
@@ -1790,6 +1807,40 @@ static void test_pin_change_defers_in_pump(void) {
 }
 
 /*
+ * Part 0h4: [unsafe_allowlist] is evaluated before the hash-pinned
+ * [allowlist] for the same access.  In defer mode a changed pin would
+ * queue (0); the unsafe grant must decide first (2).
+ */
+static void test_unsafe_allowlist_wins_over_pinned(void) {
+    static Config cfg;
+    Config *saved = g_config;
+
+    ASSERT(pin_fixture_reset() == 0, "pin fixture reset");
+    ASSERT(pin_store("/bin/pintool2", PIN_SHA_A) == 0, "seed the pinned rule");
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.allowlist[0].binary, sizeof(cfg.allowlist[0].binary), "%s",
+             "/bin/pintool2");
+    snprintf(cfg.allowlist[0].target_path,
+             sizeof(cfg.allowlist[0].target_path), "%s", "/home/u/secret");
+    cfg.allowlist_count = 1;
+    snprintf(cfg.unsafe_allowlist[0].binary,
+             sizeof(cfg.unsafe_allowlist[0].binary), "%s", "/bin/pintool2");
+    snprintf(cfg.unsafe_allowlist[0].target_path,
+             sizeof(cfg.unsafe_allowlist[0].target_path), "%s",
+             "/home/u/secret");
+    cfg.unsafe_allowlist_count = 1;
+    g_config = &cfg;
+
+    ASSERT(child_verdict("/bin/pintool2", PIN_SHA_B, "/home/u/secret", 0, 0,
+                         1) == 2,
+           "unsafe rule decides before a changed pin would queue");
+
+    pin_fixture_cleanup();
+    g_config = saved;
+}
+
+/*
  * Part 0i: the dialog rate limiter bounds prompts per binary path and then
  * fails closed (deny) for a cooldown window.
  */
@@ -1817,6 +1868,7 @@ int main(void) {
     test_verdict_stage_order();
     test_pump_defer_contract();
     test_pin_change_defers_in_pump();
+    test_unsafe_allowlist_wins_over_pinned();
     test_dialog_rate_limiter();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();
@@ -1831,7 +1883,7 @@ int main(void) {
     test_hash_change_null_request_denies();
     test_notify_rate_windows();
     test_unsafe_hit_once_per_process();
-    test_glob_deny_beats_glob_allow();
+    test_glob_deny_and_allow_matchers();
     test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();

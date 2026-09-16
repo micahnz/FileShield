@@ -65,14 +65,20 @@ static void print_usage(const char *prog)
 }
 
 /*
- * Shared startup-failure cleanup: close the group fd (when open), drop
- * the config and close syslog.  Returns EXIT_FAILURE so call sites can
+ * Shared startup-failure cleanup: deny whatever the partially installed
+ * marks already queued (the kernel would auto-allow outstanding
+ * permission events on close), then close the group fd, drop the config
+ * and close syslog.  Returns EXIT_FAILURE so call sites can
  * `return startup_fail(...)`.
  */
 static int startup_fail(int fan_fd, Config *cfg)
 {
     if (fan_fd >= 0)
+    {
+        fanotify_flush_pending(fan_fd);
+        fanotify_drain_and_deny(fan_fd);
         close(fan_fd);
+    }
     config_reset(cfg);
     free(cfg);
     closelog();
@@ -316,10 +322,19 @@ int main(int argc, char *argv[])
     fanotify_flush_pending(fan_fd);
     fanotify_drain_and_deny(fan_fd);
     close(fan_fd);
-    if (g_sigwake[0] >= 0)
-        close(g_sigwake[0]);
-    if (g_sigwake[1] >= 0)
-        close(g_sigwake[1]);
+    /* Clear the globals before closing: a signal landing after the close
+     * must not make the handler write into a recycled descriptor. */
+    if (g_sigwake[0] >= 0 || g_sigwake[1] >= 0)
+    {
+        int rfd = g_sigwake[0];
+        int wfd = g_sigwake[1];
+        g_sigwake[0] = -1;
+        g_sigwake[1] = -1;
+        if (rfd >= 0)
+            close(rfd);
+        if (wfd >= 0)
+            close(wfd);
+    }
     config_reset(cfg);
     free(cfg);
     closelog();

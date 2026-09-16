@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <linux/limits.h>
+#include <pwd.h>
 
 #include "../src/utils.h"
 
@@ -31,6 +32,8 @@ static void test_path_under_len(void) {
     ASSERT(path_under_len("/a/bc", "/a/b", 4) == 0, "boundary with explicit length");
     ASSERT(path_under_len("/a/b", "/a/b", 4) == 1, "equal with explicit length");
     ASSERT(path_under_len("/x/y", "/a/b", 4) == 0, "different prefix");
+    ASSERT(path_under_len("/etc/passwd", "", 0) == 0,
+           "an empty directory matches nothing");
 }
 
 static void assert_glob_base(const char *pattern, const char *want, const char *msg) {
@@ -150,6 +153,57 @@ static void test_proc_helpers(void) {
            "invalid pid cmdline fails");
 }
 
+static void test_expand_home(void) {
+    char **r;
+
+    /* A path that is not a ~/... pattern: one copy, unchanged. */
+    r = expand_home_all_users("/etc/ssh/ssh_config");
+    ASSERT(r != NULL, "non-home expansion succeeds");
+    if (r) {
+        ASSERT(r[0] != NULL &&
+                   strcmp(r[0], "/etc/ssh/ssh_config") == 0,
+               "non-home path returns a single unchanged copy");
+        ASSERT(r[1] == NULL, "non-home array is NULL-terminated");
+    }
+    free_string_array(r);
+
+    /* ~/sub expands once per real user (uid 1000..65533), mirroring the
+     * filter expand_home_all_users() applies to /etc/passwd. */
+    int expected = 0;
+    struct passwd *pw;
+    setpwent();
+    while ((pw = getpwent()) != NULL) {
+        if (pw->pw_uid >= 1000 && pw->pw_uid < 65534 &&
+            pw->pw_dir && pw->pw_dir[0] != '\0')
+            expected++;
+    }
+    endpwent();
+
+    r = expand_home_all_users("~/sub");
+    ASSERT(r != NULL, "home expansion succeeds");
+    if (r) {
+        if (expected == 0) {
+            ASSERT(strcmp(r[0], "~/sub") == 0 && r[1] == NULL,
+                   "no real users: the original pattern is returned");
+        } else {
+            int n = 0;
+            while (r[n] != NULL)
+                n++;
+            ASSERT(n == expected, "one entry per real user");
+            for (int i = 0; i < n; i++) {
+                size_t len = strlen(r[i]);
+                ASSERT(r[i][0] == '/', "expanded path is absolute");
+                ASSERT(len >= 4 && strcmp(r[i] + len - 4, "/sub") == 0,
+                       "expanded path keeps the subpath");
+            }
+        }
+    }
+    free_string_array(r);
+
+    /* The freer accepts NULL. */
+    free_string_array(NULL);
+}
+
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
@@ -158,6 +212,7 @@ int main(void) {
     test_glob_match();
     test_proc_exe();
     test_proc_helpers();
+    test_expand_home();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

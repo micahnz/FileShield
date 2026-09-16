@@ -292,7 +292,10 @@ static int reap_helper(pid_t pid, const char *label, int *status_out)
         if (w == pid)
             return 0;
         if (w < 0 && errno != EINTR)
+        {
+            set_failure("sha512sum wait failed");
             return -1;
+        }
         if (now_ms() >= deadline)
             break;
         usleep(10000); /* 10 ms tick */
@@ -363,6 +366,8 @@ static int collect_digest(int fd, pid_t pid, const char *label,
             break;
 
         ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0)
             break;
         total += n;

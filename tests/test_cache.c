@@ -58,6 +58,25 @@ static void test_ttl_expiry(void) {
     ASSERT(cache_lookup(100, "/bin/ls", "/tmp/a") == 0, "lookup after expiry");
 }
 
+/*
+ * An expired file-scoped entry must not shadow a live wildcard entry for
+ * the same (pid, binary): the lookup has to keep scanning instead of
+ * reporting a miss on the first expired match.
+ */
+static void test_expired_scoped_falls_through(void) {
+    pid_t pid = getpid();
+    const char *bin = "/bin/fallthrough";
+
+    cache_insert(pid, bin, "/tmp/fallthrough", 1);
+    cache_insert(pid, bin, NULL, 60);
+    sleep(2);
+    ASSERT(cache_lookup(pid, bin, "/tmp/fallthrough") > 0,
+           "expired scoped entry falls through to the live wildcard");
+    ASSERT(cache_lookup(pid, bin, "/tmp/other") > 0,
+           "the wildcard still covers other targets");
+    cache_expire();
+}
+
 static void test_overwrite(void) {
     cache_insert(200, "/bin/a", "/tmp/a", 60);
     cache_insert(200, "/bin/a", "/tmp/a", 120);
@@ -115,6 +134,7 @@ int main(void) {
     test_target_scoping();
     test_wildcard();
     test_ttl_expiry();
+    test_expired_scoped_falls_through();
     test_overwrite();
     test_null_binary();
     test_pid_starttime();

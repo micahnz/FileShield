@@ -526,10 +526,17 @@ static void sanitize_text(const char *in, char *out, size_t outsz)
 static void sanitize_ellipsized(const char *in, char *out, size_t outsz)
 {
     sanitize_text(in, out, outsz);
-    if (!in || strlen(in) < outsz - 1)
+    if (!in || strlen(in) <= outsz - 1)
         return; /* nothing was cut */
     if (outsz >= 4)
         memcpy(out + outsz - 4, "...", 4);
+}
+
+/* Test seam (notify.h): bounded prompt-text sanitizing with the cut
+ * marker, shared with the real prompt builder. */
+void notify_test_sanitize_ellipsized(const char *in, char *out, size_t outsz)
+{
+    sanitize_ellipsized(in, out, outsz);
 }
 
 /* Kill the dialog process group and reap with a bounded wait. */
@@ -598,6 +605,10 @@ static int run_kdialog(const DisplaySession *session,
         /* Let kdialog see the user's theme/font/scale/locale settings. */
         apply_dialog_env(env, env_count);
         close_fds_from(3);
+
+        /* exec resets only caught/default dispositions, so the daemon's
+         * SIG_IGN would leak into kdialog/timeout as ignored SIGPIPE. */
+        signal(SIGPIPE, SIG_DFL);
 
         execl("/usr/bin/timeout", "timeout", "30",
               "/usr/bin/kdialog", "kdialog",

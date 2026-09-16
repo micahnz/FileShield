@@ -153,8 +153,8 @@ int path_under_len(const char *path, const char *dir, size_t dlen)
 {
     size_t plen = strlen(path);
 
-    if (plen == 0)
-        return 0;
+    if (plen == 0 || dlen == 0)
+        return 0; /* an empty directory matches nothing */
 
     while (dlen > 1 && dir[dlen - 1] == '/')
         dlen--;
@@ -354,11 +354,13 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
     if (n <= 0)
         return -1;
     buf[n] = '\0';
-    /* A truncated stat line would parse garbage start times: the line
-     * always ends with the numeric field 52, so reject anything that
-     * does not end in a digit. */
-    if (n < (ssize_t)sizeof(buf) - 1 && buf[n - 1] != '\n' &&
-        !(buf[n - 1] >= '0' && buf[n - 1] <= '9'))
+    /* A full buffer means the line did not fit and was truncated;
+     * reject it before it can parse garbage start times. */
+    if (n >= (ssize_t)sizeof(buf) - 1)
+        return -1;
+    /* The line always ends with the numeric field 52, so reject
+     * anything that does not end in a digit (or the newline). */
+    if (buf[n - 1] != '\n' && !(buf[n - 1] >= '0' && buf[n - 1] <= '9'))
         return -1;
 
     /*

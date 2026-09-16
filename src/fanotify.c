@@ -609,6 +609,11 @@ static int dialog_rate_limited(const char *binary)
     if (++e->prompts > DIALOG_RATE_PROMPTS)
     {
         e->blocked_until = now + DIALOG_RATE_COOLDOWN_S;
+        /* A fresh window starts when the cooldown ends: without this the
+         * still-old window immediately re-triggers the block and extends
+         * the lockout toward twice the documented cooldown. */
+        e->window_start = e->blocked_until;
+        e->prompts = 0;
         log_msg(LOG_WARNING,
                 "dialog rate limit: %s exceeded %d prompts in %ds; "
                 "denying further prompts for %ds",
@@ -2925,24 +2930,31 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
     else /* NOTIFY_ALLOW_ALWAYS */
     {
         const char *cmdline_fp = event_cmdline_fp(c);
-        if (cmdline_fp[0] != '\0')
+
+        /* dyn_allow_add() refuses an entry without a binary digest (it
+         * could never be matched) and logs "one-time access", so degrade
+         * to the cached one-time grant here instead of handing the user
+         * a grant the next open ignores.  The same fallback covers an
+         * unfingerprintable command line, whose persistent entry would
+         * otherwise cover every invocation of the binary. */
+        if (cmdline_fp[0] == '\0' || c->bin_sha512[0] == '\0')
+        {
+            log_msg(LOG_WARNING,
+                    "cannot persist Allow Always for %s (%s); "
+                    "degrading to Allow Once",
+                    c->binary,
+                    c->bin_sha512[0] == '\0'
+                        ? "binary SHA-512 unavailable"
+                        : "command line could not be fingerprinted");
+            cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
+        }
+        else
         {
             /* Defensive: the prompt path built it already, but a future
              * recorder must never persist an empty chain by accident. */
             event_build_chain(c, 0);
             dyn_allow_add(c->binary, c->bin_sha512, &c->chain, c->target,
                           c->cmdline, cmdline_fp);
-        }
-        else
-        {
-            /* Without the exact invocation the persistent entry would
-             * cover every command of this binary; degrade to a
-             * one-time cached grant instead. */
-            log_msg(LOG_WARNING,
-                    "cannot fingerprint the command line for %s; "
-                    "degrading Allow Always to Allow Once",
-                    c->binary);
-            cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         }
     }
     return FAN_ALLOW;
@@ -3641,6 +3653,15 @@ void fanotify_loop(int fd, int wake_fd)
                 ;
         }
 
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        {
+            /* A broken group fd otherwise spins this loop at 100% CPU. */
+            log_msg(LOG_ERR,
+                    "fanotify group fd poll error (revents=0x%x); restarting",
+                    (unsigned)pfds[0].revents);
+            g_fatal = 1;
+            break;
+        }
         if (!(pfds[0].revents & POLLIN))
             continue; /* woke for the signal only */
 

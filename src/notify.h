@@ -121,4 +121,11 @@ void notify_test_reset_rate(void);
 /* Test seam: the dialog environment whitelist (see notify.c). */
 int notify_test_env_key_allowed(const char *key);
 
+/*
+ * Test seam: sanitize one dialog-body value exactly like the prompt
+ * builder (control characters become '?', an over-long value gets its
+ * tail replaced by "...").  Writes at most outsz-1 bytes plus the NUL.
+ */
+void notify_test_sanitize_ellipsized(const char *in, char *out, size_t outsz);
+
 #endif

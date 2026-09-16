@@ -82,17 +82,20 @@ int cache_lookup(pid_t pid, const char *binary, const char *target)
             (!target || strcmp(cache[i].target_path, target) != 0))
             continue;
 
-        /* Reject a different process that reused the same PID. */
+        /* Reject a different process that reused the same PID, and drop
+         * an expired entry: later entries for the same (pid, binary) may
+         * still cover the request (file-scoped vs wildcard), so keep
+         * scanning instead of reporting a miss. */
         if (cache[i].starttime != proc_start_time(pid))
         {
             cache[i].pid = 0;
-            return 0;
+            continue;
         }
 
         if (cache[i].expiry_time < now)
         {
             cache[i].pid = 0;
-            return 0;
+            continue;
         }
 
         return (int)(cache[i].expiry_time - now);

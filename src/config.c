@@ -17,12 +17,10 @@ static char *trim(char *s)
     while (*s == ' ' || *s == '\t')
         s++;
     size_t len = strlen(s);
-    if (len == 0)
-        return s;
-    char *end = s + len - 1;
-    while (end >= s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
-        end--;
-    *(end + 1) = '\0';
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\n' || s[len - 1] == '\r'))
+        len--;
+    s[len] = '\0';
     return s;
 }
 

@@ -165,7 +165,7 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 - **`test_pin`**: strict load/save roundtrip, missing vs damaged file, escaping, 256-entry eviction (oldest `updated_at`, tie-breaks), write-failure behavior
 - **`test_sha512`**: FIPS 180-4 known-answer vectors, differential tests vs `sha512sum`, NUL-safe buffer hashing
 - **`test_inode`**: exact-key lookup, device separation, duplicates, clear, overflow degradation
-- **`test_reload`**: parse failure keeps the old config, a rejected reload restores the previous mark set, a failed rollback requests shutdown (runs unprivileged with `fan_fd = -1`)
+- **`test_reload`**: parse failure keeps the old config, a rejected reload keeps the old config published (unprivileged runs with `fan_fd = -1` cannot install marks, so the mark-set restoration itself is covered by the root canary), a failed rollback requests shutdown
 - **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, kernel queue saturation (root)
 - **`test_utils`**: `proc_exe_path`, `/proc` readers, home expansion, `path_under`
 - **`bench_hotpath`**: cache, path matching, SHA-512, runtime matchers, inode set, fast-path verdict, path resolution (`make bench`; kept only when a change wins)
@@ -210,6 +210,9 @@ scope as a safety-critical surface:
 - Protected-path exclusions (`!pattern`): deny-wins and order-independent — an excluded path is never protected, never marked, and never inode-tracked; matching is path-based
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
 - Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
+- Config reload is not atomic: marks are cleared before the new set is installed, so there is a short unmediated window during an administrator-triggered reload (delta reload is a possible follow-up; it needs the root smoke test because it changes mark bookkeeping)
+- GUI prompts are session-scoped, not process-scoped: a same-uid process can in principle forge GUI input (X11 synthetic events, planted Wayland socket), so GUI consent is not a defense against a fully compromised session
+- The shipped `~/...`-based protected list expands once per real user, so it exceeds `MAX_PATHS` at 12 real users (trim it on shared hosts)
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt
 - Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the prompt names the failure reason and points at `[unsafe_allowlist]` for a permanent grant, failed hashes are retried at most once per 60 s, and ancestor hashing is skipped while no runtime _Always_ entries exist; the table is capped at 256 entries (oldest evicted)
 - Denylist rules are never hash-checked, and there is no CLI for pins: updates go through the change dialog, or root edits `/var/lib/fileshield/allowlist-hashes.json` and reloads
