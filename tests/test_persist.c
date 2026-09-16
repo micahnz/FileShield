@@ -780,6 +780,36 @@ static int test_persist_save_fixed_bytes(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: an unescapable field fails the save instead of writing ""   */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_escape_overflow_fails(void)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX + 32];
+    PersistEntry in[1];
+
+    make_test_path(path, sizeof(path), "escape_overflow.json");
+    unlink(path);
+
+    memset(in, 0, sizeof(in));
+    /* Control bytes escape to six characters each; a full-length field
+     * cannot fit the 4 KB scratch buffer. */
+    memset(in[0].target_path, 0x01, sizeof(in[0].target_path) - 1);
+    in[0].target_path[sizeof(in[0].target_path) - 1] = '\0';
+
+    ASSERT(persist_save(path, in, 1) == -1,
+           "unencodable field fails the save");
+    ASSERT(access(path, F_OK) != 0,
+           "no state file is left behind after a failed save");
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    ASSERT(access(tmp, F_OK) != 0, "no temp file is left behind");
+
+    TEST_PASS("persist_save fails closed on an unencodable field");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -815,6 +845,7 @@ int main(void)
     failed |= test_persist_write_text_symlink_temp();
     failed |= test_persist_json_helpers();
     failed |= test_persist_save_fixed_bytes();
+    failed |= test_persist_escape_overflow_fails();
 
     rmdir(g_test_dir);
 

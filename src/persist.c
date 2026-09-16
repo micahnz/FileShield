@@ -600,6 +600,26 @@ int persist_write_text(const char *filepath, const char *text)
     return 0;
 }
 
+/*
+ * Escape one field into the scratch buffer, or fail the save.  Writing an
+ * empty string on overflow (previous behavior) silently dropped the entry
+ * on the next load; failing keeps the previous state file intact and makes
+ * the refusal visible in the journal.
+ */
+#define SAVE_ESCAPED(field, value)                                            \
+    do                                                                        \
+    {                                                                         \
+        if (persist_json_escape((value), escaped, sizeof(escaped)) < 0)       \
+        {                                                                     \
+            log_msg(LOG_ERR,                                                  \
+                    "persist_save: %s does not fit the escape buffer; "       \
+                    "not saving", (field));                                   \
+            fclose(fp);                                                       \
+            unlink(tmp_file);                                                 \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+
 int persist_save(const char *filepath, const PersistEntry *entries, int count)
 {
     FILE *fp;
@@ -636,30 +656,20 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
 
         fprintf(fp, "    {\n");
 
-        if (persist_json_escape(e->binary, escaped, sizeof(escaped)) > 0)
-            fprintf(fp, "      \"binary\": \"%s\",\n", escaped);
-        else
-            fprintf(fp, "      \"binary\": \"\",\n");
+        SAVE_ESCAPED("binary", e->binary);
+        fprintf(fp, "      \"binary\": \"%s\",\n", escaped);
 
-        if (persist_json_escape(e->binary_sha512, escaped, sizeof(escaped)) > 0)
-            fprintf(fp, "      \"binary_sha512\": \"%s\",\n", escaped);
-        else
-            fprintf(fp, "      \"binary_sha512\": \"\",\n");
+        SAVE_ESCAPED("binary_sha512", e->binary_sha512);
+        fprintf(fp, "      \"binary_sha512\": \"%s\",\n", escaped);
 
-        if (persist_json_escape(e->target_path, escaped, sizeof(escaped)) > 0)
-            fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
-        else
-            fprintf(fp, "      \"target_path\": \"\",\n");
+        SAVE_ESCAPED("target_path", e->target_path);
+        fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
 
-        if (persist_json_escape(e->cmdline, escaped, sizeof(escaped)) > 0)
-            fprintf(fp, "      \"cmdline\": \"%s\",\n", escaped);
-        else
-            fprintf(fp, "      \"cmdline\": \"\",\n");
+        SAVE_ESCAPED("cmdline", e->cmdline);
+        fprintf(fp, "      \"cmdline\": \"%s\",\n", escaped);
 
-        if (persist_json_escape(e->cmdline_sha512, escaped, sizeof(escaped)) > 0)
-            fprintf(fp, "      \"cmdline_sha512\": \"%s\",\n", escaped);
-        else
-            fprintf(fp, "      \"cmdline_sha512\": \"\",\n");
+        SAVE_ESCAPED("cmdline_sha512", e->cmdline_sha512);
+        fprintf(fp, "      \"cmdline_sha512\": \"%s\",\n", escaped);
 
         fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
         fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);
@@ -667,21 +677,16 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         /* chain_comm always gets a trailing comma: chain_sha512 fields follow. */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
-            if (persist_json_escape(e->chain_comm[j], escaped, sizeof(escaped)) > 0)
-                fprintf(fp, "      \"chain_comm[%d]\": \"%s\",\n", j, escaped);
-            else
-                fprintf(fp, "      \"chain_comm[%d]\": \"\",\n", j);
+            SAVE_ESCAPED("chain_comm", e->chain_comm[j]);
+            fprintf(fp, "      \"chain_comm[%d]\": \"%s\",\n", j, escaped);
         }
 
         /* Last chain_sha512 field has no trailing comma (closes the object). */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
-            if (persist_json_escape(e->chain_sha512[j], escaped, sizeof(escaped)) > 0)
-                fprintf(fp, "      \"chain_sha512[%d]\": \"%s\"%s\n", j, escaped,
-                        j < PERSIST_CHAIN_MAX - 1 ? "," : "");
-            else
-                fprintf(fp, "      \"chain_sha512[%d]\": \"\"%s\n", j,
-                        j < PERSIST_CHAIN_MAX - 1 ? "," : "");
+            SAVE_ESCAPED("chain_sha512", e->chain_sha512[j]);
+            fprintf(fp, "      \"chain_sha512[%d]\": \"%s\"%s\n", j, escaped,
+                    j < PERSIST_CHAIN_MAX - 1 ? "," : "");
         }
 
         fprintf(fp, "    }%s\n", i < count - 1 ? "," : "");
