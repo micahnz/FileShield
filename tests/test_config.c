@@ -775,6 +775,63 @@ static void test_glob_protected_paths(void)
 }
 
 /*
+ * Root-based globs: a wildcard in the first segment gives a static base
+ * of "/" (the documented whole-subtree rule target).  The stored
+ * pattern must keep its leading '/' so the base slice, the mark target
+ * and the protected-prefix check stay valid.
+ */
+static void test_glob_root_based(void)
+{
+    char conf[1024];
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "/**\n"
+             "/**/secret\n"
+             "/*.conf\n"
+             "\n"
+             "[denylist]\n"
+             "/usr/bin/curl = /**\n"
+             "/tmp/glob_root_rej_%d/**/\n", /* trailing slash: malformed */
+             (int)getpid());
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for root-based globs");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives the malformed trailing slash");
+    ASSERT(cfg.protected_count == 3, "3 root-based protected entries parsed");
+    ASSERT(cfg.denylist_count == 1, "1 valid denylist rule parsed");
+
+    ASSERT(cfg.protected[0].is_glob == 1, "'/**' is a glob");
+    ASSERT(strcmp(cfg.protected[0].path, "/**") == 0, "'/**' pattern preserved");
+    ASSERT(cfg.protected[0].base_len == 1, "'/**' static base is '/'");
+
+    ASSERT(cfg.protected[1].is_glob == 1, "'/**/secret' is a glob");
+    ASSERT(strcmp(cfg.protected[1].path, "/**/secret") == 0,
+           "'/**/secret' pattern preserved");
+    ASSERT(cfg.protected[1].base_len == 1, "'/**/secret' static base is '/'");
+
+    ASSERT(cfg.protected[2].is_glob == 1, "'/*.conf' is a glob");
+    ASSERT(strcmp(cfg.protected[2].path, "/*.conf") == 0,
+           "'/*.conf' pattern preserved");
+    ASSERT(cfg.protected[2].base_len == 1, "'/*.conf' static base is '/'");
+
+    ASSERT(cfg.denylist[0].target_is_glob == 1,
+           "denylist '/**' target is a glob");
+    ASSERT(strcmp(cfg.denylist[0].target_path, "/**") == 0,
+           "denylist '/**' target pattern preserved");
+    ASSERT(cfg.denylist[0].target_base_len == 1,
+           "denylist '/**' target static base is '/'");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
  * Malformed glob patterns are rejected with a warning and must not
  * produce an entry (fail closed: a typo never silently protects
  * nothing while looking active).
@@ -892,6 +949,35 @@ static void test_exclusion_rejection(void)
     ASSERT(r == 0, "config_load survives rejected exclusions");
     ASSERT(cfg.protected_count == 1, "only the valid positive survives");
     ASSERT(cfg.exclude_count == 0, "no malformed exclusion recorded");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * A relative exact protected entry can never match a canonical
+ * /proc/self/fd target, so it is rejected with a log instead of being
+ * stored as a silently-unprotecting entry.
+ */
+static void test_relative_protected_rejected(void)
+{
+    const char *conf = "[protected_paths]\n"
+                       "home/.ssh\n"
+                       "/tmp/fileshield_rel_ok\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives the rejected relative entry");
+    ASSERT(cfg.protected_count == 1, "only the absolute entry survives");
+    ASSERT(strcmp(cfg.protected[0].path, "/tmp/fileshield_rel_ok") == 0,
+           "the surviving entry is the valid positive");
+    ASSERT(cfg.protected[0].is_exclude == 0, "the surviving entry is positive");
 
     config_reset(&cfg);
     unlink(path);
@@ -1348,6 +1434,7 @@ int main(void)
     test_basic_parse();
     test_missing_file();
     test_unknown_section();
+    test_relative_protected_rejected();
     test_settings_user_ttl();
     test_settings_session_ttl();
     test_settings_session_ttl_value();
@@ -1361,6 +1448,7 @@ int main(void)
     test_whitespace_lines();
     test_path_canonicalization();
     test_glob_protected_paths();
+    test_glob_root_based();
     test_glob_rejection();
     test_exclusions_parse();
     test_exclusion_rejection();

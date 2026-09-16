@@ -424,7 +424,16 @@ char **expand_home_all_users(const char *path)
             int new_cap = (capacity == 0) ? 16 : capacity * 2;
             char **tmp = realloc(result, (size_t)(new_cap + 1) * sizeof(char *));
             if (!tmp)
-                continue; /* skip this user on OOM */
+            {
+                /* Fail the whole expansion: skipping one user on OOM
+                 * would silently leave their home unprotected while the
+                 * config still "loads fine".  Callers treat NULL as
+                 * fatal, which is the fail-closed direction. */
+                result[count] = NULL;
+                endpwent();
+                free_string_array(result);
+                return NULL;
+            }
             result = tmp;
             capacity = new_cap;
         }
@@ -432,7 +441,12 @@ char **expand_home_all_users(const char *path)
         size_t len = strlen(pw->pw_dir) + strlen(rest) + 1;
         char *expanded = malloc(len);
         if (!expanded)
-            continue;
+        {
+            result[count] = NULL;
+            endpwent();
+            free_string_array(result);
+            return NULL;
+        }
         snprintf(expanded, len, "%s%s", pw->pw_dir, rest);
         result[count++] = expanded;
     }

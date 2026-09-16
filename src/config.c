@@ -123,10 +123,12 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
  * Glob patterns are split at the first wildcard segment.  Only the
  * wildcard-free base is canonicalized (so symlinked homes still match
  * the canonical /proc/self/fd target paths); the suffix is matched
- * verbatim by glob_match_path().  A malformed pattern — relative, no
- * static base, '..', an empty segment ("//" or a trailing slash) — is
- * rejected.  Fail closed: a typo'd pattern must never silently match
- * nothing.
+ * verbatim by glob_match_path().  A wildcard in the first segment
+ * gives a static base of "/" (the whole-subtree and root-child glob
+ * forms) and is accepted.
+ * A malformed pattern — relative, no static base, '..', an empty
+ * segment ("//" or a trailing slash) — is rejected.  Fail closed: a
+ * typo'd pattern must never silently match nothing.
  *
  * Returns 0 on success, -1 when the pattern is rejected.
  */
@@ -135,6 +137,23 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
 {
     if (strchr(raw, '*') == NULL)
     {
+        /* Exact paths must be absolute: they are matched against
+         * canonical /proc/<pid>/fd target paths, so a relative entry can
+         * never match — reject it with a log instead of silently
+         * protecting nothing while the config "loads fine".  (This is
+         * the same requirement the glob branch enforces below.) */
+        if (raw[0] != '/')
+        {
+            log_msg(LOG_ERR,
+                    "config_load: protected/rule path must be absolute: %s",
+                    raw);
+            return -1;
+        }
+        if (strlen(raw) >= PATH_MAX)
+        {
+            log_msg(LOG_ERR, "config_load: path too long: %.64s", raw);
+            return -1;
+        }
         canonicalize_path(raw, out, outsz);
         *is_glob = 0;
         *base_len = (int)strlen(out);
@@ -164,14 +183,20 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
     base[blen] = '\0';
 
     const char *suffix = raw + blen;
-    if (*suffix != '/')
+    /* A static base longer than "/" always ends just before a '/', so the
+     * suffix starts with one.  A base of "/" (wildcard in the first
+     * segment) leaves everything after the leading '/' as the suffix,
+     * which may legitimately start with the wildcard itself. */
+    if (*suffix != '/' && !(blen == 1 && *suffix == '*'))
     {
         log_msg(LOG_ERR, "config_load: malformed glob pattern: %s", raw);
         return -1;
     }
 
-    /* Suffix segments must be non-empty and free of "..". */
-    for (const char *p = suffix + 1;;)
+    /* Suffix segments must be non-empty and free of "..".  When the
+     * suffix does not start with '/' (wildcard directly under root),
+     * the first suffix character is already a segment. */
+    for (const char *p = (*suffix == '/') ? suffix + 1 : suffix;;)
     {
         const char *end = strchr(p, '/');
         size_t seglen = end ? (size_t)(end - p) : strlen(p);
@@ -206,21 +231,22 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
         return -1;
     }
 
-    if (canon_len + suffix_len >= outsz)
+    /* Always store base_canon + suffix so that the wildcard-free base is
+     * exactly the first base_len characters of the stored pattern (the
+     * mark target and the protected-prefix check slice it that way).
+     * When the base is "/" and the suffix starts with '/', skip the
+     * junction duplicate instead of concatenating "//". */
+    size_t suffix_skip = (canon_len == 1 && suffix[0] == '/') ? 1 : 0;
+    size_t sfx_len = suffix_len - suffix_skip;
+
+    if (canon_len + sfx_len >= outsz)
     {
         log_msg(LOG_ERR, "config_load: glob pattern too long: %s", raw);
         return -1;
     }
 
-    if (canon_len == 1 && base_canon[0] == '/')
-    {
-        memcpy(out, suffix, suffix_len + 1);
-    }
-    else
-    {
-        memcpy(out, base_canon, canon_len);
-        memcpy(out + canon_len, suffix, suffix_len + 1);
-    }
+    memcpy(out, base_canon, canon_len);
+    memcpy(out + canon_len, suffix + suffix_skip, sfx_len + 1);
 
     *is_glob = 1;
     *base_len = (int)canon_len;
@@ -511,7 +537,24 @@ int config_load(const char *path, Config *cfg)
             else if (strcmp(s + 1, "denylist") == 0)
                 section = SECTION_DENYLIST;
             else
+            {
+                log_msg(LOG_ERR,
+                        "config_load: unknown section '%s': its entries are "
+                        "ignored (a typo'd section header silently drops "
+                        "every rule under it)",
+                        s + 1);
                 section = SECTION_NONE;
+            }
+            continue;
+        }
+
+        if (section == SECTION_NONE)
+        {
+            /* Entries outside a known section (or under an unknown one)
+             * are dropped; make that visible instead of silent. */
+            log_msg(LOG_ERR,
+                    "config_load: entry outside any known section is "
+                    "ignored: %s", s);
             continue;
         }
 
@@ -522,9 +565,10 @@ int config_load(const char *path, Config *cfg)
              * itself and removes matching paths from the protection of
              * every positive entry (deny wins; config order is
              * irrelevant).  '!' elsewhere is an ordinary path
-             * character.  Exclusions must be absolute after '~'
-             * expansion — unlike legacy exact positives, a relative one
-             * can never match a canonical target.
+             * character.  Both positives and exclusions must be
+             * absolute after '~' expansion: a relative path can never
+             * match a canonical target, so it is rejected with a log
+             * (fail closed) rather than silently protecting nothing.
              */
             const char *raw = s;
             int is_exclude = 0;
@@ -565,14 +609,9 @@ int config_load(const char *path, Config *cfg)
                     fclose(fp);
                     return -1;
                 }
-                if (is_exclude && paths[pi][0] != '/')
-                {
-                    log_msg(LOG_ERR, "config_load: exclusion must be absolute: %s", s);
-                    continue;
-                }
                 ProtectedPath *pp = &cfg->protected[cfg->protected_count];
                 if (protected_path_set(pp, paths[pi]) < 0)
-                    continue; /* malformed glob: rejected with a warning */
+                    continue; /* malformed or relative: rejected with a log */
                 pp->is_exclude = is_exclude;
                 if (is_exclude)
                 {
