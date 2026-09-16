@@ -1211,6 +1211,11 @@ static void test_defer_flush_contract(void) {
     ASSERT(fanotify_defer_event(&re_ev) == 0,
             "queue accepts events again after flush");
     fanotify_flush_pending(resp_pipe[1]);
+    /* Close the write end so the read below returns EOF instead of
+     * blocking forever when a response is missing: a hanging make test is
+     * worse than a failing one. */
+    close(resp_pipe[1]);
+    resp_pipe[1] = -1;
 
     /* Exactly one fanotify_response per deferred event must arrive. */
     size_t want = (size_t)(filled + 1) * sizeof(struct fanotify_response);
@@ -1251,7 +1256,8 @@ static void test_defer_flush_contract(void) {
 
     free(buf);
     close(resp_pipe[0]);
-    close(resp_pipe[1]);
+    if (resp_pipe[1] >= 0)
+        close(resp_pipe[1]);
 }
 
 /*

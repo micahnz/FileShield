@@ -62,7 +62,7 @@ static void test_overwrite(void) {
     cache_insert(200, "/bin/a", "/tmp/a", 60);
     cache_insert(200, "/bin/a", "/tmp/a", 120);
     int ttl = cache_lookup(200, "/bin/a", "/tmp/a");
-    ASSERT(ttl > 0 && ttl <= 120, "overwrite refreshes ttl");
+    ASSERT(ttl > 90, "overwrite refreshes ttl");
 
     /* A different target is a distinct entry, not an overwrite: both
      * lookups must stay valid side by side. */
