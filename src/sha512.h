@@ -25,6 +25,16 @@ int sha512_file(const char *path, char hex_out[129]);
 int sha512_proc_exe(pid_t pid, char hex_out[129]);
 
 /*
+ * Human-readable reason for the most recent sha512_file()/sha512_proc_exe()
+ * failure, e.g. "sha512sum timed out" or "sha512sum returned no digest".
+ * Empty when the last file/proc hash succeeded.  In-process string and
+ * buffer hashing never touch it, so a caller can capture the reason after
+ * a failed binary hash and use it later (e.g. in a dialog).  The daemon is
+ * single-threaded; the buffer is overwritten by the next file hash.
+ */
+const char *sha512_last_failure(void);
+
+/*
  * Compute the SHA-512 digest of an in-memory string (used to fingerprint
  * command lines without persisting potentially secret arguments).
  * Same return semantics as sha512_file().

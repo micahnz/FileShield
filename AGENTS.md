@@ -46,7 +46,7 @@ Headers are the source of truth for signatures; this table is the map.
 | Module         | Owns                                                                                                                                                                                                                                                                                                |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.c`       | daemonize, signal flags, startup marks, `reload_protection()` with fail-closed rollback, persisted-state and pin-table loading                                                                                                                                                                      |
-| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, deferred-event queue, dialog pump |
+| `fanotify.c/h` | fanotify init/marks/mount marks (glob entries mark their static base), protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, dialog pump |
 | `inode.c/h`    | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades)                                                                                                                                                                                               |
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                |
 | `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                 |
@@ -54,7 +54,7 @@ Headers are the source of truth for signatures; this table is the map.
 | `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes                                                                                                                                                             |
 | `persist.c/h`  | atomic JSON save (0600, `O_EXCL` temp + rename), tolerant line parser, fail-secure load                                                                                                                                                                                                             |
 | `pin.c/h`      | `[allowlist]` binary SHA-512 pins: strict fail-closed JSON load (missing = TOFU), 256-entry table with oldest-eviction, atomic store, change detection                                                                                                                                              |
-| `sha512.c/h`   | `sha512_file` (forked `sha512sum`), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf`                                                                                                                                                                                                      |
+| `sha512.c/h`   | `sha512_file` (forked `sha512sum`, `sha512_last_failure()` reason accessor), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf`                                                                                                                                                             |
 | `utils.c/h`    | `/proc` readers (`proc_exe_path`, `get_ppid`, `read_comm`, `read_cmdline`, `proc_stat_session`), `path_under`/`path_under_len`, protected-path glob matcher (`glob_base_len`, `glob_match_path`), home expansion, logging, `close_fds_from`                                                         |
 
 ### Event pipeline (decision order)
@@ -62,8 +62,11 @@ Headers are the source of truth for signatures; this table is the map.
 1. `event_resolve` — fd sanity, resolve target path, cache the protected-prefix verdict.
 2. `event_fastpath` — mount-mark noise (unknown inode, unprotected path), dedup-cache hits.
 3. `event_load_binary` — `/proc/<pid>/exe`; config denylist; hard-link classification.
-4. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512, call chain, session id; all
-   gathered while the requester is kernel-suspended so `/proc` is still valid.
+4. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512 (with its failure reason),
+   call chain (built lazily: only when a runtime list is non-empty, at the prompt boundary,
+   or defensively when recording), session id; all gathered while the requester is
+   kernel-suspended so `/proc` is still valid. A failed hash is negatively cached for 60 s
+   so an unhashable binary is retried once per window, not once per event.
 5. `event_runtime_denied` — session deny, runtime deny (full-cmdline fingerprint compared,
    computed lazily only when a runtime list can match).
 6. `event_runtime_allowed` — skipped entirely for hard-link events; otherwise file cache →
@@ -163,5 +166,5 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
 - Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt
-- Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the table is capped at 256 entries (oldest evicted)
+- Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the prompt names the failure reason and points at `[unsafe_allowlist]` for a permanent grant, failed hashes are retried at most once per 60 s, and ancestor hashing is skipped while no runtime _Always_ entries exist; the table is capped at 256 entries (oldest evicted)
 - Denylist rules are never hash-checked, and there is no CLI for pins: updates go through the change dialog, or root edits `/var/lib/fileshield/allowlist-hashes.json` and reloads

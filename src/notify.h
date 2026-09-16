@@ -29,6 +29,9 @@ typedef struct
     uid_t user_uid;          /* real uid of the requester                 */
     int user_ttl;            /* "Allow once" TTL in seconds (display only) */
     int session_ttl;         /* session cap in seconds; 0 = session life   */
+    int hash_unavailable;    /* 1 = binary digest missing: "Allow Always"
+                                cannot persist for this binary             */
+    const char *hash_failure; /* human-readable reason; may be NULL/""    */
 } NotifyRequest;
 
 /*

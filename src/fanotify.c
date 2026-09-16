@@ -229,8 +229,15 @@ static int denylist_match(const char *binary, const char *target)
  * the requesting process is suspended, so repeat lookups of the same
  * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime); any
  * metadata change invalidates the entry.
+ *
+ * Failures are remembered for a short window too: a binary that cannot
+ * be hashed (helper timeout on a FUSE mount, unreadable path) would
+ * otherwise fork, stall for the full SHA-512 timeout and log again on
+ * every single event.  The negative entry still reports "unavailable" to
+ * the pipeline, so every fail-closed decision is unchanged.
  */
 #define HASH_CACHE_MAX 64
+#define HASH_FAIL_RETRY_S 60
 
 typedef struct
 {
@@ -240,11 +247,21 @@ typedef struct
     time_t mtime_sec;
     long mtime_nsec;
     char hex[129];
+    int failed;         /* 1 = last attempt failed; retry after the window */
+    time_t retry_after; /* valid when failed                                */
+    char failure[80];   /* reason, kept so a cached miss can explain itself */
 } HashCacheEntry;
 
 static HashCacheEntry g_hash_cache[HASH_CACHE_MAX];
 static int g_hash_cache_count = 0;
 static int g_hash_cache_next = 0;
+
+/*
+ * Reason for the most recent binary-hash failure, including failures
+ * answered from the negative cache (where sha512_last_failure() would be
+ * stale or describe a different file).  Read it right after a -1 return.
+ */
+static char g_hash_failure_reason[80];
 
 static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
 {
@@ -252,13 +269,25 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
     struct stat st;
     char hex[129];
     int r;
+    int reuse = -1;
 
     int n = snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", (int)pid);
     if (n < 0 || (size_t)n >= sizeof(proc_path))
         return -1;
 
     if (stat(proc_path, &st) != 0)
-        return sha512_proc_exe(pid, hex_out);
+    {
+        /* The process is gone: no metadata to cache against. */
+        r = sha512_proc_exe(pid, hex_out);
+        snprintf(g_hash_failure_reason, sizeof(g_hash_failure_reason), "%s",
+                 r == 0 ? ""
+                        : (sha512_last_failure()[0]
+                               ? sha512_last_failure()
+                               : "hashing failed"));
+        return r;
+    }
+
+    time_t now = time(NULL);
 
     for (int i = 0; i < g_hash_cache_count; i++)
     {
@@ -268,29 +297,64 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
             e->mtime_sec == st.st_mtim.tv_sec &&
             e->mtime_nsec == st.st_mtim.tv_nsec)
         {
-            memcpy(hex_out, e->hex, sizeof(e->hex));
-            return 0;
+            if (!e->failed)
+            {
+                memcpy(hex_out, e->hex, sizeof(e->hex));
+                return 0;
+            }
+            if (now < e->retry_after)
+            {
+                snprintf(g_hash_failure_reason, sizeof(g_hash_failure_reason),
+                         "%s", e->failure);
+                log_msg(LOG_DEBUG,
+                        "[hash-cache] recent failure for pid=%d; "
+                        "not retrying yet",
+                        (int)pid);
+                return -1;
+            }
+            reuse = i; /* window expired: retry into this slot */
+            break;
         }
     }
 
     r = sha512_proc_exe(pid, hex);
-    if (r < 0)
-        return -1;
 
     int slot;
-    if (g_hash_cache_count < HASH_CACHE_MAX)
+    if (reuse >= 0)
+        slot = reuse;
+    else if (g_hash_cache_count < HASH_CACHE_MAX)
         slot = g_hash_cache_count++;
     else
     {
         slot = g_hash_cache_next;
         g_hash_cache_next = (g_hash_cache_next + 1) % HASH_CACHE_MAX;
     }
-    g_hash_cache[slot].dev = st.st_dev;
-    g_hash_cache[slot].ino = st.st_ino;
-    g_hash_cache[slot].size = st.st_size;
-    g_hash_cache[slot].mtime_sec = st.st_mtim.tv_sec;
-    g_hash_cache[slot].mtime_nsec = st.st_mtim.tv_nsec;
-    memcpy(g_hash_cache[slot].hex, hex, sizeof(hex));
+
+    HashCacheEntry *e = &g_hash_cache[slot];
+    e->dev = st.st_dev;
+    e->ino = st.st_ino;
+    e->size = st.st_size;
+    e->mtime_sec = st.st_mtim.tv_sec;
+    e->mtime_nsec = st.st_mtim.tv_nsec;
+
+    if (r < 0)
+    {
+        e->failed = 1;
+        e->retry_after = now + HASH_FAIL_RETRY_S;
+        e->hex[0] = '\0';
+        snprintf(e->failure, sizeof(e->failure), "%s",
+                 sha512_last_failure()[0] ? sha512_last_failure()
+                                          : "hashing failed");
+        snprintf(g_hash_failure_reason, sizeof(g_hash_failure_reason), "%s",
+                 e->failure);
+        return -1;
+    }
+
+    e->failed = 0;
+    e->retry_after = 0;
+    e->failure[0] = '\0';
+    g_hash_failure_reason[0] = '\0';
+    memcpy(e->hex, hex, sizeof(hex));
     memcpy(hex_out, hex, sizeof(hex));
     return 0;
 }
@@ -1477,13 +1541,35 @@ typedef struct
     char pcomm[256];
     char cmdline[512];        /* display form (NUL-collapsed, bounded)     */
     char bin_sha512[129];
+    char bin_hash_failure[80]; /* reason bin_sha512 is empty (prompt text) */
+    int binary_protected;     /* binary under a protected prefix          */
     char cmdline_sha512[129]; /* full raw cmdline, computed lazily          */
     int cmdline_sha_state;    /* 0 = not computed, 1 = computed, -1 = failed */
     ProcChain chain;
+    int chain_built;          /* 1 = chain captured (event_build_chain)    */
     pid_t sid;
     unsigned long long sid_start;
     int have_sid;
 } EventCtx;
+
+/*
+ * Capture the requester's ancestor chain on demand.  The chain is only
+ * consumed by the runtime "Always" matchers and recorders, so it is not
+ * built when both dynamic lists are empty: hashing three ancestors can
+ * stall for as long as the SHA-512 helper timeout on FUSE-mounted
+ * binaries, and a silent config-allowlist grant never needs it.  Every
+ * recording path builds it first (the prompt boundary does so before the
+ * dialog) so a permanent entry pins the chain as it was when the event
+ * arrived, not the state after the user decided.
+ */
+static void event_build_chain(EventCtx *c)
+{
+    if (!c->chain_built)
+    {
+        build_proc_chain(c->ev->pid, &c->chain);
+        c->chain_built = 1;
+    }
+}
 
 /*
  * Lazily fingerprint the requester's full command line.  Only the runtime
@@ -1648,16 +1734,36 @@ static void event_gather_identity(EventCtx *c)
         read_comm(c->ppid, c->pcomm, sizeof(c->pcomm));
     read_cmdline(pid, c->cmdline, sizeof(c->cmdline));
 
-    int sha_ok = -1;
-    if (!is_path_under_protected(c->binary))
-        sha_ok = cached_sha512_proc_exe(pid, c->bin_sha512);
-    if (sha_ok < 0)
-        log_msg(LOG_WARNING, "SHA-512 unavailable for %s (pid %d); "
-                             "\"Always Allow\" will not persist for this "
-                             "decision (access will be re-prompted)",
-                c->binary, (int)pid);
+    /*
+     * Requester digest, best effort.  The failure reason is captured now
+     * (the sha512 accessor is overwritten by later hashing) so a prompt
+     * can explain why "Allow Always" cannot persist.  A binary under a
+     * protected path is deliberately never hashed: opening it with the
+     * daemon's own helper would be self-interception.
+     */
+    c->binary_protected = is_path_under_protected(c->binary);
+    if (!c->binary_protected)
+    {
+        if (cached_sha512_proc_exe(pid, c->bin_sha512) < 0)
+        {
+            snprintf(c->bin_hash_failure, sizeof(c->bin_hash_failure), "%s",
+                     g_hash_failure_reason[0] ? g_hash_failure_reason
+                                              : "hashing failed");
+            log_msg(LOG_DEBUG, "SHA-512 unavailable for %s (pid %d): %s",
+                    c->binary, (int)pid, c->bin_hash_failure);
+        }
+    }
+    else
+    {
+        snprintf(c->bin_hash_failure, sizeof(c->bin_hash_failure),
+                 "the binary is under a protected path");
+    }
 
-    build_proc_chain(pid, &c->chain);
+    /* Ancestor hashes are only consumed by the runtime "Always" matchers;
+     * with both lists empty the chain is built later (prompt boundary and
+     * record time) instead of stalling every event on unhashable mounts. */
+    if (g_dyn_allow_count > 0 || g_dyn_deny_count > 0)
+        event_build_chain(c);
 
     /* Session identity, best effort.  Without it session-scoped decisions
      * cannot be matched or recorded (they degrade to one-time decisions). */
@@ -2008,6 +2114,9 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
         const char *cmdline_fp = event_cmdline_fp(c);
         if (cmdline_fp[0] != '\0')
         {
+            /* Defensive: the prompt path built it already, but a future
+             * recorder must never persist an empty chain by accident. */
+            event_build_chain(c);
             dyn_allow_add(c->binary, c->bin_sha512, &c->chain, c->target,
                           c->cmdline, cmdline_fp);
         }
@@ -2054,6 +2163,8 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
         const char *cmdline_fp = event_cmdline_fp(c);
         if (cmdline_fp[0] != '\0')
         {
+            /* Defensive: see record_allow_decision(). */
+            event_build_chain(c);
             dyn_deny_add(c->binary, c->bin_sha512, &c->chain, c->target,
                          c->cmdline, cmdline_fp);
         }
@@ -2080,6 +2191,19 @@ static void event_ask_user(EventCtx *c)
         return;
     }
 
+    /* Snapshot the chain before the dialog: an Always/Deny Always decision
+     * records the chain as it was when the event arrived, not the state
+     * after the user decided. */
+    event_build_chain(c);
+
+    /* The digest-unavailable warning belongs here, where a prompt actually
+     * needs it: silent grants (cache, rules, unsafe list) never log it. */
+    if (c->bin_sha512[0] == '\0')
+        log_msg(LOG_WARNING,
+                "SHA-512 unavailable for %s (pid %d): %s; prompting "
+                "(no persistent \"Allow Always\")",
+                c->binary, (int)c->ev->pid, c->bin_hash_failure);
+
     log_msg(LOG_INFO, "[dialog] asking user: pid=%d binary=%s target=%s comm=%s",
             (int)c->ev->pid, c->binary, c->target, c->comm);
 
@@ -2095,6 +2219,8 @@ static void event_ask_user(EventCtx *c)
     req.user_uid = proc_uid(c->ev->pid);
     req.user_ttl = g_config ? g_config->user_ttl_seconds : 300;
     req.session_ttl = g_config ? g_config->session_ttl_seconds : 0;
+    req.hash_unavailable = (c->bin_sha512[0] == '\0');
+    req.hash_failure = c->bin_hash_failure;
 
     int decision = notify_ask(&req);
     log_msg(LOG_INFO, "[dialog] user chose %s for %s (pid %d) -> %s",

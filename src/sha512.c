@@ -17,6 +17,23 @@
 /* Upper bound on hashing a single executable before the helper is killed. */
 #define SHA512_TIMEOUT_S 15
 
+/*
+ * Reason for the most recent file/proc hashing failure, captured so the
+ * event pipeline can explain an unavailable digest in a prompt.  Only the
+ * forked file path writes it: sha512_string()/sha512_buf() leave it alone.
+ */
+static char g_last_failure[80] = "";
+
+static void set_failure(const char *reason)
+{
+    snprintf(g_last_failure, sizeof(g_last_failure), "%s", reason);
+}
+
+const char *sha512_last_failure(void)
+{
+    return g_last_failure;
+}
+
 /* ------------------------------------------------------------------ */
 /*  in-process SHA-512 (FIPS 180-4)                                    */
 /* ------------------------------------------------------------------ */
@@ -237,11 +254,11 @@ static void silence_stderr(void)
  * The caller treats a missing digest as a hashing failure (fail closed);
  * an orphaned zombie is a bounded cost, not a correctness risk.
  */
-static void kill_helper_bounded(pid_t pid)
+static void kill_helper_bounded(pid_t pid, const char *label)
 {
     if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
-        log_msg(LOG_WARNING, "sha512: kill helper pid %d: %s", (int)pid,
-                strerror(errno));
+        log_msg(LOG_WARNING, "sha512: %s: kill helper pid %d: %s", label,
+                (int)pid, strerror(errno));
 
     for (int i = 0; i < REAP_KILL_TRIES; i++)
     {
@@ -252,11 +269,11 @@ static void kill_helper_bounded(pid_t pid)
     }
 
     log_msg(LOG_WARNING,
-            "sha512: helper pid %d survived SIGKILL for %d ms; abandoning",
-            (int)pid, REAP_KILL_TRIES * 10);
+            "sha512: %s: helper pid %d survived SIGKILL for %d ms; abandoning",
+            label, (int)pid, REAP_KILL_TRIES * 10);
 }
 
-static int reap_helper(pid_t pid, int *status_out)
+static int reap_helper(pid_t pid, const char *label, int *status_out)
 {
     time_t deadline = time(NULL) + REAP_DEADLINE_S;
 
@@ -273,9 +290,10 @@ static int reap_helper(pid_t pid, int *status_out)
         usleep(10000); /* 10 ms tick */
     }
 
-    log_msg(LOG_WARNING, "sha512: helper did not exit in %ds; killing",
-            REAP_DEADLINE_S);
-    kill_helper_bounded(pid);
+    set_failure("sha512sum did not exit in time");
+    log_msg(LOG_WARNING, "sha512: %s: helper did not exit in %ds; killing",
+            label, REAP_DEADLINE_S);
+    kill_helper_bounded(pid, label);
     return -1;
 }
 
@@ -284,24 +302,32 @@ static int reap_helper(pid_t pid, int *status_out)
  * deadline, reap the child and validate the digest.  Output format:
  * "<128-hex-digits>  <filename>\n"; only the first 128 bytes are used.
  */
-static int collect_digest(int fd, pid_t pid, char hex_out[129])
+static int collect_digest(int fd, pid_t pid, const char *label,
+                          char hex_out[129])
 {
     char buf[200];
     ssize_t total = 0;
+    int timed_out = 0;
     time_t deadline = time(NULL) + SHA512_TIMEOUT_S;
 
     while (total < (ssize_t)sizeof(buf) - 1)
     {
         int remaining_ms = (int)(difftime(deadline, time(NULL)) * 1000.0);
         if (remaining_ms <= 0)
+        {
+            timed_out = 1;
             break;
+        }
 
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
         if (poll(&pfd, 1, remaining_ms) <= 0)
+        {
+            timed_out = 1;
             break;
+        }
 
         ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
         if (n <= 0)
@@ -312,38 +338,72 @@ static int collect_digest(int fd, pid_t pid, char hex_out[129])
 
     if (total < 128)
     {
-        log_msg(LOG_ERR, "sha512: timed out or short read");
-        kill_helper_bounded(pid);
+        if (timed_out)
+        {
+            set_failure("sha512sum timed out");
+            log_msg(LOG_ERR, "sha512: %s: timed out", label);
+        }
+        else
+        {
+            set_failure("sha512sum returned no digest");
+            log_msg(LOG_ERR, "sha512: %s: short read (helper failed)", label);
+        }
+        kill_helper_bounded(pid, label);
         return -1;
     }
 
     int status = 0;
-    if (reap_helper(pid, &status) < 0)
+    if (reap_helper(pid, label, &status) < 0)
         return -1;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    if (!WIFEXITED(status))
+    {
+        set_failure("sha512sum was killed");
+        log_msg(LOG_ERR, "sha512: %s: helper was killed by a signal", label);
         return -1;
+    }
+    if (WEXITSTATUS(status) != 0)
+    {
+        char reason[48];
+        snprintf(reason, sizeof(reason), "sha512sum failed (exit %d)",
+                 WEXITSTATUS(status));
+        set_failure(reason);
+        log_msg(LOG_ERR, "sha512: %s: helper exited %d", label,
+                WEXITSTATUS(status));
+        return -1;
+    }
 
     /* Validate: first 128 chars must all be hex digits. */
     for (int i = 0; i < 128; i++)
     {
         if (!isxdigit((unsigned char)buf[i]))
+        {
+            set_failure("sha512sum returned an invalid digest");
+            log_msg(LOG_ERR, "sha512: %s: invalid digest output", label);
             return -1;
+        }
     }
 
     memcpy(hex_out, buf, 128);
     hex_out[128] = '\0';
+    set_failure("");
     return 0;
 }
 
 int sha512_file(const char *path, char hex_out[129])
 {
     int pipefd[2];
+
+    set_failure("");
     if (pipe2(pipefd, O_CLOEXEC) < 0)
+    {
+        set_failure("pipe() failed");
         return -1;
+    }
 
     pid_t pid = fork();
     if (pid < 0)
     {
+        set_failure("fork() failed");
         close(pipefd[0]);
         close(pipefd[1]);
         return -1;
@@ -367,7 +427,7 @@ int sha512_file(const char *path, char hex_out[129])
     }
 
     close(pipefd[1]);
-    return collect_digest(pipefd[0], pid, hex_out);
+    return collect_digest(pipefd[0], pid, path, hex_out);
 }
 
 /* Encode a raw 64-byte digest as 128 lower-case hex characters. */

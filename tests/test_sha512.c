@@ -172,6 +172,24 @@ static void test_file_digest(void)
            "missing file fails");
 }
 
+/*
+ * Failure reasons: a failed file hash records a human-readable reason for
+ * the prompt/diagnostic path, and the next successful hash clears it.
+ */
+static void test_file_failure_reason(void)
+{
+    char hex[129];
+
+    ASSERT(sha512_file("/nonexistent/fileshield/sha512", hex) == -1,
+           "missing file fails");
+    ASSERT(sha512_last_failure()[0] != '\0',
+           "failure reason is recorded after a failed hash");
+
+    ASSERT(sha512_file("/proc/self/exe", hex) == 0, "hash own executable");
+    ASSERT(sha512_last_failure()[0] == '\0',
+           "failure reason is cleared after a successful hash");
+}
+
 int main(void)
 {
     printf("=== test_sha512 ===\n");
@@ -184,6 +202,7 @@ int main(void)
     test_buf_differential();
     test_string_differential();
     test_file_digest();
+    test_file_failure_reason();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

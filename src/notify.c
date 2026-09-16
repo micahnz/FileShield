@@ -617,6 +617,7 @@ typedef struct
     char cmd[256];
     char exe[512];
     char path[512];
+    char note[280]; /* hash-unavailable note; empty when the hash is known */
 } PromptText;
 
 /*
@@ -635,7 +636,7 @@ static int ask_grant_scope(const DisplaySession *session,
                            const DialogEnvSetting *env, int env_count,
                            const PromptText *t, pid_t pid, int session_ttl)
 {
-    char body[2048];
+    char body[3072];
     char session_bullet[160];
 
     if (session_ttl > 0)
@@ -656,8 +657,9 @@ static int ask_grant_scope(const DisplaySession *session,
              "%s\n"
              "\xe2\x80\xa2 Allow Always \xe2\x80\x94 this file, this command and "
              "its call chain, permanently\n"
-             "\xe2\x80\xa2 Deny         \xe2\x80\x94 deny this time",
-             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet);
+             "\xe2\x80\xa2 Deny         \xe2\x80\x94 deny this time%s",
+             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet,
+             t->note);
 
     int r = run_kdialog(session, env, env_count, body,
                             "Allow Session", "Allow Always", "Deny");
@@ -719,7 +721,7 @@ int notify_ask(const NotifyRequest *req)
         return NOTIFY_DENY;
 
     PromptText t;
-    char msg[2048];
+    char msg[3072];
     char once_bullet[160];
 
     /* Attacker-controlled strings (file names, comm, cmdline) are
@@ -739,6 +741,20 @@ int notify_ask(const NotifyRequest *req)
         memcpy(t.path + sizeof(t.path) - 4, "...", 4);
     if (req->cmdline && strlen(req->cmdline) >= sizeof(t.cmd) - 1)
         memcpy(t.cmd + sizeof(t.cmd) - 4, "...", 4);
+
+    /* An unavailable digest cannot back a persistent grant: say so before
+     * the user picks, and point at the deliberate escape hatch.  The
+     * reason string is daemon-generated (sha512.c), never requester text. */
+    t.note[0] = '\0';
+    if (req->hash_unavailable)
+        snprintf(t.note, sizeof(t.note),
+                 "\n\nNote: the binary SHA-512 is unavailable (%s). "
+                 "\"Allow Always\" cannot persist for this binary - add it "
+                 "to [unsafe_allowlist] in fileshield.conf if it needs a "
+                 "permanent grant.",
+                 req->hash_failure && req->hash_failure[0] != '\0'
+                     ? req->hash_failure
+                     : "hashing failed");
 
     /* "Allow once" is keyed by PID + binary + file for user_ttl. */
     if (req->user_ttl > 0)
@@ -761,9 +777,9 @@ int notify_ask(const NotifyRequest *req)
              "\xe2\x80\xa2 Allow      \xe2\x80\x94 choose session or permanent "
              "access\n"
              "\xe2\x80\xa2 Deny       \xe2\x80\x94 choose this time, session or "
-             "permanent",
+             "permanent%s",
              t.comm, (int)req->pid, t.pcomm, (int)req->ppid,
-             t.path, t.exe, t.cmd, once_bullet);
+             t.path, t.exe, t.cmd, once_bullet, t.note);
 
     /* Auto-detect the active graphical session if env vars are not set.
      * The daemon itself is never modified: the session is applied by the
