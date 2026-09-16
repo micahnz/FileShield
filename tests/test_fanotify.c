@@ -1479,7 +1479,7 @@ static void test_drain_and_deny(void) {
     fanotify_drain_and_deny(sv[0]);
 
     /* One FAN_DENY per permission event; none for the notification event. */
-    struct fanotify_response resp[PERM_EVENTS];
+    struct fanotify_response resp[PERM_EVENTS] = {0};
     size_t want = sizeof(resp[0]) * PERM_EVENTS;
     size_t got = 0;
     while (got < want) {

@@ -1,4 +1,4 @@
-.PHONY: all clean install install-config test bench lint
+.PHONY: all clean install install-config uninstall test bench lint
 
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 \
@@ -19,6 +19,9 @@ TARGET  := fileshield
 # `make install` never replaces an existing /etc/fileshield.conf (upgrades
 # keep local rules). Set REPLACE_CONFIG=1, or run `make install-config`,
 # to overwrite it with the shipped defaults.
+# With DESTDIR set (packaging), systemctl is skipped entirely.  Otherwise the
+# unit is reloaded and an already-running service is restarted with the new
+# binary (try-restart keeps a stopped service stopped).
 REPLACE_CONFIG ?= 0
 
 SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
@@ -131,19 +134,41 @@ install: all
 		echo "installed default config to $(DESTDIR)$(ETCDIR)/fileshield.conf"; \
 	fi
 	install -m 0644 -D fileshield.service "$(DESTDIR)$(SYSDDIR)/fileshield.service"
-	systemctl daemon-reload
-	sudo systemctl restart fileshield
+	@if [ -z "$(DESTDIR)" ]; then \
+		systemctl daemon-reload; \
+		if [ "$$(id -u)" -eq 0 ]; then \
+			systemctl try-restart fileshield; \
+		else \
+			sudo systemctl try-restart fileshield; \
+		fi; \
+	else \
+		echo "staged install ($(DESTDIR)): skipping systemctl"; \
+	fi
 
 # Convenience alias for `make install REPLACE_CONFIG=1`.
 install-config:
 	$(MAKE) install REPLACE_CONFIG=1
+
+# Remove the installed binary and unit.  Never touches /etc/fileshield.conf
+# or the state and pins under /var/lib/fileshield.
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/$(TARGET)"
+	rm -f "$(DESTDIR)$(SYSDDIR)/fileshield.service"
+	@if [ -z "$(DESTDIR)" ]; then systemctl daemon-reload; fi
+	@echo "removed $(DESTDIR)$(BINDIR)/$(TARGET) and $(DESTDIR)$(SYSDDIR)/fileshield.service"
+	@echo "left /etc/fileshield.conf and /var/lib/fileshield untouched"
+
 clean:
 	rm -rf $(OBJDIR)
 
 lint:
 	cppcheck --std=c99 --enable=all --suppress=missingIncludeSystem \
 		--suppress=unusedFunction --suppress=checkersReport \
-		$(SRCDIR)/*.c $(TSTDIR)/*.c 2>&1 || true
+		--suppress=normalCheckLevelMaxBranches \
+		--suppress=unmatchedSuppression \
+		--suppress=variableScope --suppress=constVariablePointer \
+		--suppress=constParameterCallback \
+		--error-exitcode=1 $(SRCDIR)/*.c $(TSTDIR)/*.c
 
 debug: CFLAGS += -O0 -g -U_FORTIFY_SOURCE -fsanitize=address,undefined
 debug: LDFLAGS += -fsanitize=address,undefined
