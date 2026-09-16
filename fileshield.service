@@ -24,21 +24,27 @@ StateDirectoryMode=0700
 UMask=0077
 RestrictSUIDSGID=yes
 ProtectProc=invisible
-# ProtectHome cannot be enabled: the daemon places fanotify marks on the real
-# /home mount. ProtectHome would create a separate bind-mount namespace, making
-# fanotify_mark() target a shadow mount that user processes never open, so all
-# home-directory marks would be silently ineffective.
-PrivateTmp=yes
+# Mount marks are attached to the init-namespace mounts through
+# /proc/1/root, so the mount-namespace sandboxing below (ProtectSystem=,
+# ProtectProc=, PrivateDevices=) does not blind them: the marks live on
+# the mounts user processes open through, not on the service's copies.
+# Do not enable ProtectHome=yes: it substitutes empty shadow directories
+# and the daemon resolves protected paths from the real tree.
+# Do not enable PrivateTmp=yes: it hides /tmp/.X11-unix from the dialog
+# child on X11 desktops, and the daemon never uses /tmp itself.
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 RestrictAddressFamilies=AF_UNIX
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
+RestrictNamespaces=yes
 SystemCallFilter=@system-service rseq fanotify_init fanotify_mark setuid setgid setresuid setresgid
+SystemCallFilter=~@mount
 SystemCallArchitectures=native
 
-# fanotify requires CAP_SYS_ADMIN; /proc/<pid>/exe requires CAP_SYS_PTRACE;
+# fanotify requires CAP_SYS_ADMIN; /proc/<pid>/exe and the /proc/1/root
+# mount-mark paths require CAP_SYS_PTRACE;
 # CAP_DAC_READ_SEARCH is required to traverse home directories with mode 750
 # (e.g. /home/user drwxr-x--- ) so that fanotify_mark can resolve their paths.
 # CAP_SETUID + CAP_SETGID are required to drop to the desktop user before
