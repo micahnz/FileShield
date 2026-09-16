@@ -63,9 +63,11 @@ Headers are the source of truth for signatures; this table is the map.
 2. `event_fastpath` — mount-mark noise (unknown inode, unprotected path), dedup-cache hits.
 3. `event_load_binary` — `/proc/<pid>/exe`; config denylist; hard-link classification.
 4. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512 (with its failure reason),
-   call chain (built lazily: only when a runtime list is non-empty, at the prompt boundary,
-   or defensively when recording), session id; all gathered while the requester is
-   kernel-suspended so `/proc` is still valid. A failed hash is negatively cached for 60 s
+   session id; gathered while the requester is kernel-suspended so `/proc` is still valid.
+   The call chain is captured lazily: the runtime matchers request it only after an entry
+   passes its path/digest keys, and the prompt boundary builds it (force-refreshing negative
+   hash-failure windows) before any dialog. A failed hash is negatively cached for 60 s by
+   file identity, with a `(pid, start)` fallback when `/proc/<pid>/exe` cannot be stat()ed,
    so an unhashable binary is retried once per window, not once per event.
 5. `event_runtime_denied` — session deny, runtime deny (full-cmdline fingerprint compared,
    computed lazily only when a runtime list can match).

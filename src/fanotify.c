@@ -263,7 +263,77 @@ static int g_hash_cache_next = 0;
  */
 static char g_hash_failure_reason[80];
 
-static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
+/*
+ * Fallback failure cache for processes whose /proc/<pid>/exe cannot be
+ * stat()ed (the exe target is unreachable from this mount namespace, or
+ * the process is mid-exec).  The main cache has no metadata to key on in
+ * that case, so remember the failure against (pid, process start time)
+ * instead: hashing such a path fails immediately, and retrying it on
+ * every event is pure cost and log noise.  The start time makes PID
+ * reuse a miss.  force_retry bypasses the window (recording wants a
+ * fresh attempt at the pre-dialog snapshot).
+ */
+#define HASH_PID_FAIL_MAX 32
+
+typedef struct
+{
+    pid_t pid;           /* 0 = empty slot                                  */
+    unsigned long long start; /* /proc/<pid>/stat field 22                    */
+    time_t retry_after;
+    char failure[80];
+} HashPidFailEntry;
+
+static HashPidFailEntry g_hash_pid_fails[HASH_PID_FAIL_MAX];
+static int g_hash_pid_fail_count = 0;
+static int g_hash_pid_fail_next = 0;
+
+static void hash_pid_fail_store(pid_t pid, unsigned long long start,
+                                time_t now, const char *reason)
+{
+    int slot = -1;
+
+    for (int i = 0; i < g_hash_pid_fail_count; i++)
+    {
+        if (g_hash_pid_fails[i].pid == pid &&
+            g_hash_pid_fails[i].start == start)
+        {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0)
+    {
+        if (g_hash_pid_fail_count < HASH_PID_FAIL_MAX)
+            slot = g_hash_pid_fail_count++;
+        else
+        {
+            slot = g_hash_pid_fail_next;
+            g_hash_pid_fail_next = (g_hash_pid_fail_next + 1) % HASH_PID_FAIL_MAX;
+        }
+    }
+
+    g_hash_pid_fails[slot].pid = pid;
+    g_hash_pid_fails[slot].start = start;
+    g_hash_pid_fails[slot].retry_after = now + HASH_FAIL_RETRY_S;
+    snprintf(g_hash_pid_fails[slot].failure,
+             sizeof(g_hash_pid_fails[slot].failure), "%s", reason);
+}
+
+static void hash_pid_fail_forget(pid_t pid, unsigned long long start)
+{
+    for (int i = 0; i < g_hash_pid_fail_count; i++)
+    {
+        if (g_hash_pid_fails[i].pid == pid &&
+            g_hash_pid_fails[i].start == start)
+        {
+            g_hash_pid_fails[i].pid = 0;
+            return;
+        }
+    }
+}
+
+static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
 {
     char proc_path[64];
     struct stat st;
@@ -277,14 +347,49 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
 
     if (stat(proc_path, &st) != 0)
     {
-        /* The process is gone: no metadata to cache against. */
+        /* No metadata to key the main cache on: use (pid, start). */
+        unsigned long long start = 0;
+        int have_start = proc_stat_session(pid, NULL, &start) == 0;
+
+        if (have_start)
+        {
+            for (int i = 0; i < g_hash_pid_fail_count; i++)
+            {
+                const HashPidFailEntry *e = &g_hash_pid_fails[i];
+                if (e->pid == pid && e->start == start)
+                {
+                    if (!force_retry && time(NULL) < e->retry_after)
+                    {
+                        snprintf(g_hash_failure_reason,
+                                 sizeof(g_hash_failure_reason), "%s",
+                                 e->failure);
+                        log_msg(LOG_DEBUG,
+                                "[hash-cache] recent failure for pid=%d; "
+                                "not retrying yet",
+                                (int)pid);
+                        return -1;
+                    }
+                    break;
+                }
+            }
+        }
+
         r = sha512_proc_exe(pid, hex_out);
+        if (r == 0)
+        {
+            g_hash_failure_reason[0] = '\0';
+            if (have_start)
+                hash_pid_fail_forget(pid, start);
+            return 0;
+        }
+
         snprintf(g_hash_failure_reason, sizeof(g_hash_failure_reason), "%s",
-                 r == 0 ? ""
-                        : (sha512_last_failure()[0]
-                               ? sha512_last_failure()
-                               : "hashing failed"));
-        return r;
+                 sha512_last_failure()[0] ? sha512_last_failure()
+                                          : "hashing failed");
+        if (have_start)
+            hash_pid_fail_store(pid, start, time(NULL),
+                                g_hash_failure_reason);
+        return -1;
     }
 
     time_t now = time(NULL);
@@ -302,7 +407,7 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
                 memcpy(hex_out, e->hex, sizeof(e->hex));
                 return 0;
             }
-            if (now < e->retry_after)
+            if (!force_retry && now < e->retry_after)
             {
                 snprintf(g_hash_failure_reason, sizeof(g_hash_failure_reason),
                          "%s", e->failure);
@@ -312,7 +417,7 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129])
                         (int)pid);
                 return -1;
             }
-            reuse = i; /* window expired: retry into this slot */
+            reuse = i; /* window expired or forced: retry into this slot */
             break;
         }
     }
@@ -371,7 +476,12 @@ typedef struct
     int depth;                           /* how many ancestors were captured            */
 } ProcChain;
 
-static void build_proc_chain(pid_t start_pid, ProcChain *c)
+/*
+ * force_retry bypasses negative hash-failure entries for every ancestor:
+ * used when a decision is about to be recorded, so the persisted chain
+ * gets a fresh attempt rather than a cached "unhashable" verdict.
+ */
+static void build_proc_chain(pid_t start_pid, ProcChain *c, int force_retry)
 {
     memset(c, 0, sizeof(*c));
     pid_t cur = start_pid;
@@ -390,7 +500,8 @@ static void build_proc_chain(pid_t start_pid, ProcChain *c)
              * exist on the host.  Never open a protected path to hash it:
              * the daemon would intercept its own helper. */
             if (!is_path_under_protected(exe))
-                cached_sha512_proc_exe(p, c->sha512[i]); /* best-effort */
+                cached_sha512_proc_exe(p, c->sha512[i],
+                                       force_retry); /* best-effort */
             free(exe);
         }
         c->depth = i + 1;
@@ -662,10 +773,13 @@ static void load_dyn_list(DynEntry *list, int *list_count,
  * The command-line fingerprint is compared, not recomputed: the caller
  * produces it lazily so unrelated events never pay for the hash.
  */
+typedef const ProcChain *(*ChainProviderFn)(void *ctx);
+
 static int dyn_match(const DynEntry *list, int count,
                      const char *binary, const char *bin_sha512,
-                     const ProcChain *chain, const char *target,
-                     const char *cmdline_fp, int require_binary_sha)
+                     ChainProviderFn chain_fn, void *chain_ctx,
+                     const char *target, const char *cmdline_fp,
+                     int require_binary_sha)
 {
     if (!target || target[0] == '\0')
         return 0;
@@ -695,6 +809,11 @@ static int dyn_match(const DynEntry *list, int count,
                 continue;
         }
 
+        /* Ancestor identity is the first key that needs the call chain:
+         * build it only now, so an event whose binary/target/digest
+         * matches no entry never pays for ancestor hashing.  The
+         * provider memoizes, so the chain is built at most once. */
+        const ProcChain *chain = chain_fn(chain_ctx);
         if (e->chain_depth != chain->depth)
             continue;
 
@@ -740,11 +859,11 @@ static int dyn_match(const DynEntry *list, int count,
 
 /* "Always Allow" lookup: grants are strict (see dyn_match). */
 static int dyn_allow_match(const char *binary, const char *bin_sha512,
-                           const ProcChain *chain, const char *target,
-                           const char *cmdline_fp)
+                           ChainProviderFn chain_fn, void *chain_ctx,
+                           const char *target, const char *cmdline_fp)
 {
     return dyn_match(g_dyn_allow, g_dyn_allow_count, binary, bin_sha512,
-                     chain, target, cmdline_fp, 1);
+                     chain_fn, chain_ctx, target, cmdline_fp, 1);
 }
 
 /*
@@ -840,11 +959,11 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
  * identity that cannot be verified -- see dyn_match.
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
-                          const ProcChain *chain, const char *target,
-                          const char *cmdline_fp)
+                          ChainProviderFn chain_fn, void *chain_ctx,
+                          const char *target, const char *cmdline_fp)
 {
     return dyn_match(g_dyn_deny, g_dyn_deny_count, binary, bin_sha512,
-                     chain, target, cmdline_fp, 0);
+                     chain_fn, chain_ctx, target, cmdline_fp, 0);
 }
 
 static void dyn_deny_add(const char *binary, const char *bin_sha512,
@@ -1554,21 +1673,29 @@ typedef struct
 
 /*
  * Capture the requester's ancestor chain on demand.  The chain is only
- * consumed by the runtime "Always" matchers and recorders, so it is not
- * built when both dynamic lists are empty: hashing three ancestors can
- * stall for as long as the SHA-512 helper timeout on FUSE-mounted
- * binaries, and a silent config-allowlist grant never needs it.  Every
- * recording path builds it first (the prompt boundary does so before the
- * dialog) so a permanent entry pins the chain as it was when the event
- * arrived, not the state after the user decided.
+ * consumed by the runtime "Always" matchers and recorders: matchers ask
+ * for it through event_chain_provider() after an entry has passed every
+ * cheap key, so an event that matches no entry (or is granted by the
+ * config lists) never pays for ancestor hashing.  force_retry makes the
+ * prompt boundary re-attempt ancestors that are inside a negative
+ * failure window, so a recorded entry still gets the best available
+ * chain; it must be called before the dialog so the permanent key
+ * reflects the event, not the state after the user decided.
  */
-static void event_build_chain(EventCtx *c)
+static void event_build_chain(EventCtx *c, int force_retry)
 {
-    if (!c->chain_built)
-    {
-        build_proc_chain(c->ev->pid, &c->chain);
-        c->chain_built = 1;
-    }
+    if (c->chain_built && !force_retry)
+        return;
+    build_proc_chain(c->ev->pid, &c->chain, force_retry);
+    c->chain_built = 1;
+}
+
+/* Matcher-side chain provider: builds without bypassing failure windows. */
+static const ProcChain *event_chain_provider(void *ctx)
+{
+    EventCtx *c = ctx;
+    event_build_chain(c, 0);
+    return &c->chain;
 }
 
 /*
@@ -1744,7 +1871,7 @@ static void event_gather_identity(EventCtx *c)
     c->binary_protected = is_path_under_protected(c->binary);
     if (!c->binary_protected)
     {
-        if (cached_sha512_proc_exe(pid, c->bin_sha512) < 0)
+        if (cached_sha512_proc_exe(pid, c->bin_sha512, 0) < 0)
         {
             snprintf(c->bin_hash_failure, sizeof(c->bin_hash_failure), "%s",
                      g_hash_failure_reason[0] ? g_hash_failure_reason
@@ -1759,11 +1886,9 @@ static void event_gather_identity(EventCtx *c)
                  "the binary is under a protected path");
     }
 
-    /* Ancestor hashes are only consumed by the runtime "Always" matchers;
-     * with both lists empty the chain is built later (prompt boundary and
-     * record time) instead of stalling every event on unhashable mounts. */
-    if (g_dyn_allow_count > 0 || g_dyn_deny_count > 0)
-        event_build_chain(c);
+    /* The ancestor chain is captured lazily: by the dynamic matchers only
+     * once an entry passes its cheap keys, and at the prompt boundary
+     * before any dialog, so silent grants never hash ancestors at all. */
 
     /* Session identity, best effort.  Without it session-scoped decisions
      * cannot be matched or recorded (they degrade to one-time decisions). */
@@ -1792,8 +1917,8 @@ static int event_runtime_denied(EventCtx *c)
     }
 
     if (g_dyn_deny_count > 0 &&
-        dyn_deny_match(c->binary, c->bin_sha512, &c->chain, c->target,
-                       event_cmdline_fp(c)))
+        dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider, c,
+                       c->target, event_cmdline_fp(c)))
     {
         log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
                 c->binary, (int)c->ev->pid, c->target);
@@ -2001,8 +2126,8 @@ static int event_runtime_allowed(EventCtx *c)
     }
 
     if (g_dyn_allow_count > 0 &&
-        dyn_allow_match(c->binary, c->bin_sha512, &c->chain, c->target,
-                        event_cmdline_fp(c)))
+        dyn_allow_match(c->binary, c->bin_sha512, event_chain_provider, c,
+                        c->target, event_cmdline_fp(c)))
     {
         int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
         cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
@@ -2116,7 +2241,7 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
         {
             /* Defensive: the prompt path built it already, but a future
              * recorder must never persist an empty chain by accident. */
-            event_build_chain(c);
+            event_build_chain(c, 0);
             dyn_allow_add(c->binary, c->bin_sha512, &c->chain, c->target,
                           c->cmdline, cmdline_fp);
         }
@@ -2164,7 +2289,7 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
         if (cmdline_fp[0] != '\0')
         {
             /* Defensive: see record_allow_decision(). */
-            event_build_chain(c);
+            event_build_chain(c, 0);
             dyn_deny_add(c->binary, c->bin_sha512, &c->chain, c->target,
                          c->cmdline, cmdline_fp);
         }
@@ -2193,8 +2318,9 @@ static void event_ask_user(EventCtx *c)
 
     /* Snapshot the chain before the dialog: an Always/Deny Always decision
      * records the chain as it was when the event arrived, not the state
-     * after the user decided. */
-    event_build_chain(c);
+     * after the user decided.  force_retry gives recording a fresh attempt
+     * at ancestors stuck inside a negative failure window. */
+    event_build_chain(c, 1);
 
     /* The digest-unavailable warning belongs here, where a prompt actually
      * needs it: silent grants (cache, rules, unsafe list) never log it. */
@@ -2672,12 +2798,19 @@ void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 /*  Test seams (see fanotify.h)                                       */
 /* ------------------------------------------------------------------ */
 
+/* Test-seam chain provider: the synthetic zero-depth chain is the ctx. */
+static const ProcChain *test_chain_provider(void *ctx)
+{
+    return (const ProcChain *)ctx;
+}
+
 int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
                                   const char *target, const char *cmdline_fp)
 {
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
-    return dyn_allow_match(binary, bin_sha512, &chain, target, cmdline_fp);
+    return dyn_allow_match(binary, bin_sha512, test_chain_provider, &chain,
+                           target, cmdline_fp);
 }
 
 int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
@@ -2685,7 +2818,8 @@ int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
 {
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
-    return dyn_deny_match(binary, bin_sha512, &chain, target, cmdline_fp);
+    return dyn_deny_match(binary, bin_sha512, test_chain_provider, &chain,
+                          target, cmdline_fp);
 }
 
 int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129])
