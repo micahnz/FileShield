@@ -227,8 +227,11 @@ static const RuleEntry *denylist_match(const char *binary, const char *target)
 /*
  * Hashing forks sha512sum and runs on the event-loop critical path while
  * the requesting process is suspended, so repeat lookups of the same
- * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime); any
- * metadata change invalidates the entry.
+ * binary reuse the cached digest.  Keyed by (dev, ino, size, mtime,
+ * ctime); any metadata change invalidates the entry.  ctime matters for
+ * the pin verdict: mtime is settable by the file's owner (utimensat), so
+ * a user-writable binary could otherwise be swapped in place and keep a
+ * stale cached digest that still matches the allowlist pin.
  *
  * Failures are remembered for a short window too: a binary that cannot
  * be hashed (helper timeout on a FUSE mount, unreadable path) would
@@ -246,6 +249,8 @@ typedef struct
     off_t size;
     time_t mtime_sec;
     long mtime_nsec;
+    time_t ct_sec;
+    long ct_nsec;
     char hex[129];
     int failed;         /* 1 = last attempt failed; retry after the window */
     time_t retry_after; /* valid when failed                                */
@@ -400,7 +405,9 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
         if (e->dev == st.st_dev && e->ino == st.st_ino &&
             e->size == st.st_size &&
             e->mtime_sec == st.st_mtim.tv_sec &&
-            e->mtime_nsec == st.st_mtim.tv_nsec)
+            e->mtime_nsec == st.st_mtim.tv_nsec &&
+            e->ct_sec == st.st_ctim.tv_sec &&
+            e->ct_nsec == st.st_ctim.tv_nsec)
         {
             if (!e->failed)
             {
@@ -441,6 +448,8 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
     e->size = st.st_size;
     e->mtime_sec = st.st_mtim.tv_sec;
     e->mtime_nsec = st.st_mtim.tv_nsec;
+    e->ct_sec = st.st_ctim.tv_sec;
+    e->ct_nsec = st.st_ctim.tv_nsec;
 
     if (r < 0)
     {
