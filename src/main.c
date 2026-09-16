@@ -401,11 +401,7 @@ int main(int argc, char *argv[])
     }
 
     log_msg(LOG_INFO, "Fileshield shutting down");
-    /* Fail closed: the kernel allows outstanding permission events when
-     * the group fd is closed, so deny the userspace-deferred queue and
-     * everything still queued in the kernel before close(fan_fd). */
     fanotify_flush_pending(fan_fd);
-    fanotify_drain_and_deny(fan_fd);
     close(fan_fd);
     config_reset(cfg);
     free(cfg);
