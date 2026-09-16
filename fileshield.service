@@ -8,11 +8,17 @@ Type=simple
 User=root
 ExecStart=/usr/local/sbin/fileshield --foreground
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# Restart on every unattended termination — a protection daemon must not
+# silently stay down after a clean-looking internal exit.  A manual
+# `systemctl stop` still stays stopped.
+Restart=always
 RestartSec=5
 
 # The Wayland session is auto-detected from /run/user/ at runtime.  X11 is
-# not auto-detected: set DISPLAY here for X11 desktops.
+# not auto-detected: set DISPLAY here for X11 desktops.  XDG_RUNTIME_DIR is
+# deliberately not set here (systemd does not provide it to services): the
+# daemon derives the runtime dir and bus address from the requesting
+# process's uid in that case, so prompts still reach the right user.
 # Environment=WAYLAND_DISPLAY=wayland-1
 # Environment=DISPLAY=:0
 
@@ -35,6 +41,16 @@ ProtectProc=invisible
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+# AF_UNIX only: the daemon and kdialog/notify-send need no network sockets.
+# NOTE: Qt/kdialog sometimes opens an AF_NETLINK (route) socket at startup;
+# if a prompt ever fails to appear on a specific desktop, that filter is
+# the first suspect (a failed prompt denies access — fail closed, not a
+# security hole).
 RestrictAddressFamilies=AF_UNIX
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
@@ -51,6 +67,13 @@ SystemCallArchitectures=native
 # spawning kdialog (session sockets are mode 0600, owner=user).
 # CAP_KILL is required to terminate a hung dialog after the outer timeout;
 # the dialog child has already dropped to the desktop UID by then.
+#
+# ProtectProc=invisible + CAP_SYS_PTRACE are a coupled pair: identity
+# gathering reads /proc/<pid>/{exe,stat,environ,cmdline} of OTHER users'
+# processes, which pidfs visibility checks permit only because the
+# ambient CAP_SYS_PTRACE satisfies them.  If the capability set is ever
+# trimmed, every prompt fails (fail closed) — verify with a root smoke
+# test of a full prompt cycle whenever the unit or capability set changes.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
 

@@ -1,4 +1,4 @@
-.PHONY: all clean install install-config uninstall test bench lint
+.PHONY: all clean install install-config uninstall test bench lint debug
 
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 \
