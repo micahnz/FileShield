@@ -313,11 +313,37 @@ static int find_wayland_session(unsigned long uid_val, DisplaySession *out)
 }
 
 /*
+ * user_runtime_dir: validate /run/user/<uid> (real directory owned by the
+ * user, mirroring find_wayland_session's checks) and fill the session's
+ * runtime dir and bus address from it.  Returns 1 on success.
+ */
+static int user_runtime_dir(unsigned long uid_val, DisplaySession *out)
+{
+    char user_dir[PATH_MAX];
+    struct stat st;
+
+    snprintf(user_dir, sizeof(user_dir), "/run/user/%lu", uid_val);
+    if (lstat(user_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != (uid_t)uid_val)
+        return 0;
+
+    snprintf(out->xdg_runtime_dir, sizeof(out->xdg_runtime_dir), "%s",
+             user_dir);
+    snprintf(out->dbus_address, sizeof(out->dbus_address), "unix:path=%s/bus",
+             user_dir);
+    out->uid = (uid_t)uid_val;
+    return 1;
+}
+
+/*
  * detect_display_session: determine which desktop session should show the
  * prompt.  Preference order:
  *   1. Environment already provides WAYLAND_DISPLAY/DISPLAY (systemd
  *      override or a manual run); derive the session uid from
- *      XDG_RUNTIME_DIR ownership.
+ *      XDG_RUNTIME_DIR ownership when it is usable, otherwise from the
+ *      requester's uid (a systemd service normally has no
+ *      XDG_RUNTIME_DIR, and the shipped unit's X11 guidance sets only
+ *      DISPLAY).
  *   2. The requesting process's own uid (preferred_uid): the prompt must
  *      be shown to the user whose process triggered it.
  *   3. As a last resort for unknown requesters, the first active non-root
@@ -343,21 +369,43 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
 
         const char *xdg = getenv("XDG_RUNTIME_DIR");
         struct stat st;
-        if (!xdg || stat(xdg, &st) != 0 || st.st_uid == 0)
-            return 0; /* cannot determine a non-root desktop user */
-        out->uid = st.st_uid;
-        snprintf(out->xdg_runtime_dir, sizeof(out->xdg_runtime_dir), "%s", xdg);
+        if (xdg && stat(xdg, &st) == 0 && st.st_uid != 0)
+        {
+            out->uid = st.st_uid;
+            snprintf(out->xdg_runtime_dir, sizeof(out->xdg_runtime_dir), "%s",
+                     xdg);
 
-        /* An explicitly configured bus address wins; otherwise derive it
-         * from the runtime directory, as the auto-detection path does. */
-        const char *dbus_env = getenv("DBUS_SESSION_BUS_ADDRESS");
-        if (dbus_env && dbus_env[0] != '\0')
-            snprintf(out->dbus_address, sizeof(out->dbus_address), "%s",
-                     dbus_env);
-        else
-            snprintf(out->dbus_address, sizeof(out->dbus_address),
-                     "unix:path=%s/bus", xdg);
-        return 1;
+            /* An explicitly configured bus address wins; otherwise derive
+             * it from the runtime directory, as the auto-detection path
+             * does. */
+            const char *dbus_env = getenv("DBUS_SESSION_BUS_ADDRESS");
+            if (dbus_env && dbus_env[0] != '\0')
+                snprintf(out->dbus_address, sizeof(out->dbus_address), "%s",
+                         dbus_env);
+            else
+                snprintf(out->dbus_address, sizeof(out->dbus_address),
+                         "unix:path=%s/bus", xdg);
+            return 1;
+        }
+
+        /* No usable XDG_RUNTIME_DIR: derive the runtime dir from the
+         * requester's uid — the prompt belongs to the user whose process
+         * triggered it anyway.  uid 0 or unknown requesters must not be
+         * pointed at an arbitrary desktop user, so they refuse (fail
+         * closed) instead of scanning /run/user. */
+        if (preferred_uid != (uid_t)-1 && preferred_uid != 0 &&
+            user_runtime_dir((unsigned long)preferred_uid, out))
+        {
+            log_msg(LOG_WARNING,
+                    "XDG_RUNTIME_DIR unset or root-owned; using the "
+                    "requester's runtime dir for uid %d",
+                    (int)preferred_uid);
+            return 1;
+        }
+        log_msg(LOG_WARNING,
+                "env display set but no usable XDG_RUNTIME_DIR and no "
+                "promptable requester uid; refusing a GUI prompt");
+        return 0;
     }
 
     if (preferred_uid != (uid_t)-1 && preferred_uid != 0)
@@ -473,7 +521,13 @@ static void sanitize_text(const char *in, char *out, size_t outsz)
 /* Kill the dialog process group and reap with a bounded wait. */
 static void kill_and_reap(pid_t pid, int *status, int *child_exited)
 {
-    kill(-pid, SIGKILL);
+    /* The PID may have been recycled between the last WNOHANG check and
+     * this kill: confirm the process still leads this group before
+     * signaling it, and fall back to the single pid when it does not. */
+    if (getpgid(pid) == pid)
+        kill(-pid, SIGKILL);
+    else
+        kill(pid, SIGKILL);
     for (int i = 0; i < 100 && !*child_exited; i++) /* up to ~10s */
     {
         pid_t wr = waitpid(pid, status, WNOHANG);
@@ -554,6 +608,15 @@ static int run_kdialog(const DisplaySession *session,
 
     while (!child_exited && now_ms() < deadline)
     {
+        if (!g_running || g_fatal)
+        {
+            /* Shutdown while a dialog is open: stop waiting so the daemon
+             * terminates promptly (bounded shutdown latency). */
+            log_msg(LOG_WARNING,
+                    "[dialog] shutdown while a dialog is open; denying it");
+            break;
+        }
+
         struct pollfd pfd;
         int nfds = 0;
 
@@ -586,13 +649,17 @@ static int run_kdialog(const DisplaySession *session,
         else if (wr < 0 && errno != EINTR)
         {
             log_msg(LOG_ERR, "waitpid failed: %m");
+            /* Do not leak the child: it may still be on screen, and an
+             * unreaped zombie would linger. */
+            kill_and_reap(pid, &status, &child_exited);
             return -1;
         }
     }
 
     if (!child_exited)
     {
-        log_msg(LOG_WARNING, "[dialog] kdialog outer timeout, killing pid=%d",
+        log_msg(LOG_WARNING,
+                "[dialog] kdialog timeout or shutdown, killing pid=%d",
                 (int)pid);
         kill_and_reap(pid, &status, &child_exited);
     }
@@ -979,7 +1046,7 @@ int notify_ask_hash_change(const NotifyHashChange *req)
  */
 #define NOTIFY_DEDUP_MAX 128
 /* Defensive fallback only: the effective cap comes from [settings] notify_max. */
-#define NOTIFY_GLOBAL_MAX 20
+#define NOTIFY_GLOBAL_MAX NOTIFY_MAX_DEFAULT
 #define NOTIFY_GLOBAL_WINDOW_S 60
 #define NOTIFY_SEND_PATH "/usr/bin/notify-send"
 
@@ -1100,6 +1167,19 @@ void notify_rule_hit(const NotifyHit *hit)
         }
     }
 
+    /* Deliverability before budget: a uid with no desktop session must
+     * not spend the dedup or flood budget (the global cap is shared by
+     * every user) on notifications that are never shown. */
+    DisplaySession session;
+    if (!detect_display_session(hit->uid, &session))
+    {
+        log_msg(LOG_DEBUG,
+                "notify_rule_hit: no desktop session for uid %d; "
+                "notification skipped",
+                (int)hit->uid);
+        return;
+    }
+
     if (!notify_rate_allow(hit->kind, hit->binary ? hit->binary : "",
                            hit->target ? hit->target : "",
                            hit->dedup_seconds, hit->max_per_window))
@@ -1141,16 +1221,6 @@ void notify_rule_hit(const NotifyHit *hit)
              rule, bin, (int)hit->pid, comm[0] != '\0' ? ", " : "", comm,
              target);
 
-    DisplaySession session;
-    if (!detect_display_session(hit->uid, &session))
-    {
-        log_msg(LOG_DEBUG,
-                "notify_rule_hit: no desktop session for uid %d; "
-                "notification skipped",
-                (int)hit->uid);
-        return;
-    }
-
     /*
      * Double fork: the grandchild is reparented to init and delivers the
      * notification, the intermediate exits immediately, and the daemon
@@ -1180,8 +1250,14 @@ void notify_rule_hit(const NotifyHit *hit)
         _exit(127);
     }
 
-    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
         ;
+    /* A 127 exit means exec failed: notify-send may have been removed
+     * since the cached check.  Drop the flag so the next hit re-checks
+     * instead of paying a doomed double fork forever. */
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
+        g_notify_send_ok = 0;
 }
 
 int notify_test_hit_rate(int kind, const char *binary, const char *target,
