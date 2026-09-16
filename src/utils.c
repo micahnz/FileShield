@@ -451,8 +451,12 @@ char **expand_home_all_users(const char *path)
                 /* Fail the whole expansion: skipping one user on OOM
                  * would silently leave their home unprotected while the
                  * config still "loads fine".  Callers treat NULL as
-                 * fatal, which is the fail-closed direction. */
-                result[count] = NULL;
+                 * fatal, which is the fail-closed direction.  On the
+                 * first growth result is still NULL (nothing to
+                 * terminate); otherwise terminate the live array so
+                 * free_string_array() never reads past the last entry. */
+                if (result)
+                    result[count] = NULL;
                 endpwent();
                 free_string_array(result);
                 return NULL;

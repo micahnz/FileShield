@@ -63,19 +63,22 @@ Headers are the source of truth for signatures; this table is the map.
 ### Event pipeline (decision order)
 
 1. `event_resolve` — fd sanity, resolve target path, cache the protected-prefix verdict.
-2. `event_fastpath` — mount-mark noise (unknown inode, unprotected path), dedup-cache hits.
+2. `event_fastpath` — mount-mark noise (unknown inode, unprotected path).
 3. `event_load_binary` — `/proc/<pid>/exe`; config denylist (with a best-effort
    notify-send tripwire when `notify_denylist` is on); hard-link classification.
-4. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512 (with its failure reason),
+4. `event_dedup` — duplicate-event reuse (directory + mount marks fire twice for one
+   open), keyed on pid + `/proc/<pid>/stat` start time + resolved binary + dev/ino +
+   resolved path: a recycled PID or an exec never inherits a decision.
+5. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512 (with its failure reason),
    session id; gathered while the requester is kernel-suspended so `/proc` is still valid.
    The call chain is captured lazily: the runtime matchers request it only after an entry
    passes its path/digest keys, and the prompt boundary builds it (force-refreshing negative
    hash-failure windows) before any dialog. A failed hash is negatively cached for 60 s by
    file identity, with a `(pid, start)` fallback when `/proc/<pid>/exe` cannot be stat()ed,
    so an unhashable binary is retried once per window, not once per event.
-5. `event_runtime_denied` — session deny, runtime deny (full-cmdline fingerprint compared,
+6. `event_runtime_denied` — session deny, runtime deny (full-cmdline fingerprint compared,
    computed lazily only when a runtime list can match).
-6. `event_runtime_allowed` — skipped entirely for hard-link events; otherwise file cache →
+7. `event_runtime_allowed` — skipped entirely for hard-link events; otherwise file cache →
    session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]`
    (first use pins silently, a changed hash prompts). Config-rule hits raise a
    notify-send notification when their `[settings]` toggle is on (unsafe and denylist
@@ -83,7 +86,7 @@ Headers are the source of truth for signatures; this table is the map.
    Unsafe grants log at `WARNING` and notify on the first hit per process; repeat hits log at
    `INFO` marked `(repeat)` and skip the notification, and another process is a new instance
    (per-process gate keyed by `(pid, start)`); other grants stay `INFO`.
-7. `event_ask_user` — dialog rate limit, kdialog stages, decision recording.
+8. `event_ask_user` — dialog rate limit, kdialog stages, decision recording.
 
 ### `notify.h` decision codes
 

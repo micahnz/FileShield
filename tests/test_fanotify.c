@@ -1437,6 +1437,46 @@ static void test_scope_guard(void) {
     ASSERT(fanotify_scope_guard("/tmp/scope-guard-test.conf") == 0,
            "scope guard accepts a benign config");
 
+    /*
+     * Device-level fallback (kernels without statx(STATX_MNT_ID)): a
+     * protected path sharing the config's device must refuse instead of
+     * trusting an unverified mount check; a different-device target
+     * stays accepted.
+     */
+    char fallback_conf[80];
+    char fallback_target[80];
+    FILE *tf;
+
+    snprintf(fallback_conf, sizeof(fallback_conf), "/tmp/scope-guard-%d.conf",
+             (int)getpid());
+    snprintf(fallback_target, sizeof(fallback_target),
+             "/tmp/scope-guard-%d.target", (int)getpid());
+    tf = fopen(fallback_conf, "w");
+    ASSERT(tf != NULL, "create fallback config file");
+    if (tf)
+        fclose(tf);
+    tf = fopen(fallback_target, "w");
+    ASSERT(tf != NULL, "create fallback target file");
+    if (tf)
+        fclose(tf);
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "%s",
+             fallback_target);
+    cfg.protected_count = 1;
+    g_config = &cfg;
+
+    fanotify_test_force_mount_id_unavailable(1);
+    ASSERT(fanotify_scope_guard(fallback_conf) == -1,
+           "fallback refuses a same-device config collision");
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "/dev");
+    ASSERT(fanotify_scope_guard(fallback_conf) == 0,
+           "fallback accepts a different-device target");
+    fanotify_test_force_mount_id_unavailable(0);
+
+    unlink(fallback_conf);
+    unlink(fallback_target);
+
     g_config = saved;
 }
 
@@ -1509,35 +1549,45 @@ static void test_drain_and_deny(void) {
 }
 
 /*
- * Part 0f: the recent-decision dedup cache.  The resolved path is part of
- * the key (a hard link reaches the same inode through a different path),
- * a newer decision shadow an older one for the same key, and a reload
+ * Part 0f: the recent-decision dedup cache.  The key is the full decision
+ * identity (pid, process start time, resolved binary, dev, ino, path):
+ * a hard link, a recycled PID or an exec to another binary must not
+ * inherit a decision; a newer decision shadows an older one; a reload
  * clears the cache.
  */
 static void test_recent_decision_cache(void) {
+    const char *bin_a = "/usr/bin/tool-a";
+    const char *bin_b = "/usr/bin/tool-b";
+
     fanotify_test_recent_clear();
 
-    fanotify_test_recent_insert(100, (dev_t)1, (ino_t)2, "/home/u/secret",
-                                FAN_ALLOW);
-    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+    fanotify_test_recent_insert(100, 111, bin_a, (dev_t)1, (ino_t)2,
+                                "/home/u/secret", FAN_ALLOW);
+    ASSERT(fanotify_test_recent_lookup(100, 111, bin_a, (dev_t)1, (ino_t)2,
                                        "/home/u/secret") == FAN_ALLOW,
            "dedup cache returns the stored decision");
-    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+    ASSERT(fanotify_test_recent_lookup(100, 111, bin_a, (dev_t)1, (ino_t)2,
                                        "/home/u/link") == -1,
            "a different path to the same inode does not reuse the decision");
-    ASSERT(fanotify_test_recent_lookup(101, (dev_t)1, (ino_t)2,
+    ASSERT(fanotify_test_recent_lookup(101, 111, bin_a, (dev_t)1, (ino_t)2,
                                        "/home/u/secret") == -1,
            "a different pid does not reuse the decision");
+    ASSERT(fanotify_test_recent_lookup(100, 222, bin_a, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == -1,
+           "a recycled pid (new start time) does not reuse the decision");
+    ASSERT(fanotify_test_recent_lookup(100, 111, bin_b, (dev_t)1, (ino_t)2,
+                                       "/home/u/secret") == -1,
+           "an exec to another binary does not reuse the decision");
 
     /* Newest decision wins for the same key. */
-    fanotify_test_recent_insert(100, (dev_t)1, (ino_t)2, "/home/u/secret",
-                                FAN_DENY);
-    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+    fanotify_test_recent_insert(100, 111, bin_a, (dev_t)1, (ino_t)2,
+                                "/home/u/secret", FAN_DENY);
+    ASSERT(fanotify_test_recent_lookup(100, 111, bin_a, (dev_t)1, (ino_t)2,
                                        "/home/u/secret") == FAN_DENY,
            "a newer decision shadows the older one");
 
     fanotify_test_recent_clear();
-    ASSERT(fanotify_test_recent_lookup(100, (dev_t)1, (ino_t)2,
+    ASSERT(fanotify_test_recent_lookup(100, 111, bin_a, (dev_t)1, (ino_t)2,
                                        "/home/u/secret") == -1,
            "clear drops every cached decision");
 }
@@ -1588,7 +1638,8 @@ static void test_dialog_env_whitelist(void) {
  * it).  The child inherits the in-memory session table and config.
  */
 static int child_verdict(const char *binary, const char *sha,
-                         const char *target, pid_t sid, int hardlink) {
+                         const char *target, pid_t sid, int hardlink,
+                         int defer) {
     int status = 0;
     pid_t pid = fork();
 
@@ -1596,7 +1647,7 @@ static int child_verdict(const char *binary, const char *sha,
         return -1;
     if (pid == 0)
         _exit(fanotify_test_verdict_stage(binary, sha, target, NULL, sid,
-                                          hardlink));
+                                          hardlink, defer));
     if (waitpid(pid, &status, 0) != pid)
         return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -1623,18 +1674,18 @@ static void test_verdict_stage_order(void) {
     session_clear();
 
     /* The unsafe rule grants when nothing denies. */
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0) == 2,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0, 0) == 2,
            "unsafe rule grants when nothing denies");
 
     /* Hard-link events must not inherit any grant. */
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1) == 0,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1, 0) == 0,
            "hard-link event skips every grant stage");
 
     /* A recorded session deny beats the unsafe grant. */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
     session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0) == 1,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 0) == 1,
            "session deny wins over an unsafe grant");
 
     session_clear();
@@ -1668,21 +1719,73 @@ static void test_pump_defer_contract(void) {
     session_clear();
 
     /* Allowlisted read: decided mid-dialog (granted), never queued. */
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0) == 2,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 0, 1) == 2,
            "defer mode: an allowlisted read is decided, not deferred");
 
     /* Hard-link event: always prompts, so always defers mid-dialog. */
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1) == 0,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", 0, 1, 1) == 0,
            "defer mode: a hard-link event defers to the main loop");
 
     /* Recorded session deny: decided mid-dialog (deny wins early). */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
     session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0) == 1,
+    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 1) == 1,
            "defer mode: a session deny decides instead of queueing");
 
     session_clear();
+    g_config = saved;
+}
+
+/*
+ * Part 0h3: a changed [allowlist] hash pin defers while a dialog is open
+ * instead of stacking a hash-change prompt on it.  The dialog rate
+ * limiter is exhausted first so a regression that reaches the prompt
+ * path is denied without ever forking a dialog.
+ */
+static void test_pin_change_defers_in_pump(void) {
+    static Config cfg;
+    Config *saved = g_config;
+
+    ASSERT(pin_fixture_reset() == 0, "pin fixture reset");
+    ASSERT(pin_store("/bin/pintool", PIN_SHA_A) == 0, "seed the rule pin");
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.allowlist[0].binary, sizeof(cfg.allowlist[0].binary), "%s",
+             "/bin/pintool");
+    snprintf(cfg.allowlist[0].target_path,
+             sizeof(cfg.allowlist[0].target_path), "%s", "/home/u/secret");
+    cfg.allowlist_count = 1;
+    g_config = &cfg;
+
+    /* Control: in defer mode a matching pin still grants mid-dialog (the
+     * rule and its pin are live). */
+    ASSERT(child_verdict("/bin/pintool", PIN_SHA_A, "/home/u/secret", 0, 0,
+                         1) == 2,
+           "defer mode: an unchanged pin still grants");
+
+    /* Exhaust the dialog rate limiter for this binary: any path that
+     * reaches the hash-change prompt is now denied without a dialog. */
+    for (int i = 0; i < 25; i++)
+        (void)fanotify_test_dialog_rate_limited("/bin/pintool");
+    ASSERT(fanotify_test_dialog_rate_limited("/bin/pintool") == 1,
+           "dialog rate limit is exhausted");
+
+    /* A changed pin in defer mode must queue (0).  Without the defer
+     * check it runs config_allow_hash_change(), hits the exhausted rate
+     * limiter and reports the decided stage (2). */
+    ASSERT(child_verdict("/bin/pintool", PIN_SHA_B, "/home/u/secret", 0, 0,
+                         1) == 0,
+           "defer mode: a changed pin queues instead of prompting");
+
+    /* Outside defer mode the same event is still decided: the hash-change
+     * stage runs, hits the exhausted rate limiter and reports the decided
+     * deny (2 = a granted/decided stage, not the dialog). */
+    ASSERT(child_verdict("/bin/pintool", PIN_SHA_B, "/home/u/secret", 0, 0,
+                         0) == 2,
+           "without defer the changed pin is decided, not queued");
+
+    pin_fixture_cleanup();
     g_config = saved;
 }
 
@@ -1713,6 +1816,7 @@ int main(void) {
     test_dialog_env_whitelist();
     test_verdict_stage_order();
     test_pump_defer_contract();
+    test_pin_change_defers_in_pump();
     test_dialog_rate_limiter();
     test_missing_path_is_skipped();
     test_glob_protected_verdict();

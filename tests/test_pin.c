@@ -753,6 +753,66 @@ static int test_unwritable_dir_non_root(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  a failed append must not leave a phantom slot behind: the next     */
+/*  successful store has to persist exactly the valid pins             */
+/* ------------------------------------------------------------------ */
+
+static int test_failed_append_then_store(void)
+{
+    char path[TPATH];
+    char blocker[TPATH];
+    char bad[TTBUF];
+    char old[129];
+
+    make_test_path(path, sizeof(path), "appendfail.json");
+    ASSERT(reset_pins(path) == 0, "reset");
+
+    /* Seed exactly one live pin, then delete the state file and reload:
+     * the table is empty again, but the seeded slot is still in memory
+     * (slots past the count are not visible). */
+    ASSERT(pin_store("/usr/bin/known", SHA_A) == 0, "seed a known pin");
+    ASSERT(unlink(path) == 0, "delete the state file");
+    ASSERT(pin_load(path) == 0, "missing file reloads as an empty table");
+    ASSERT(pin_check("/usr/bin/known", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "deleted table grants nothing");
+
+    /* A regular file where the parent directory should be: the atomic
+     * write cannot even create its temp file (same trick as the
+     * write-failure test). */
+    make_test_path(blocker, sizeof(blocker), "appendfail_blocker");
+    unlink(blocker);
+    ASSERT(write_raw_file(blocker, "not a directory") == 0,
+           "create blocker file");
+    snprintf(bad, sizeof(bad), "%s/state.json", blocker);
+    pin_set_state_file(bad);
+
+    ASSERT(pin_store("/usr/bin/phantom", SHA_A) == -1, "append fails");
+    /* The failed append must not make the deleted pin live again: the
+     * count may only cover the entries the pre-store table had. */
+    ASSERT(pin_check("/usr/bin/known", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "failed append does not resurrect the deleted pin");
+    ASSERT(pin_check("/usr/bin/phantom", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "failed append leaves no phantom entry");
+
+    /* With a working path again, the next store must persist a file the
+     * strict loader accepts.  A phantom slot (count incremented before
+     * the snapshot) would serialize an empty or stale pattern and either
+     * poison the whole table as damaged or resurrect a removed pin. */
+    pin_set_state_file(path);
+    ASSERT(pin_store("/usr/bin/real", SHA_A) == 0, "next store succeeds");
+    ASSERT(pin_load(path) == 0, "stored file loads clean (no phantom)");
+    ASSERT(pin_check("/usr/bin/real", SHA_A, old) == PIN_CHECK_MATCH,
+           "valid entry preserved");
+    ASSERT(pin_check("/usr/bin/known", SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "deleted pin stays gone after the next store");
+
+    unlink(blocker);
+    unlink(path);
+    TEST_PASS("failed append leaves no phantom for the next store");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -785,6 +845,7 @@ int main(void)
     failed |= test_eviction_tie_break();
     failed |= test_write_failure_keeps_memory();
     failed |= test_unwritable_dir_non_root();
+    failed |= test_failed_append_then_store();
 
     rmdir(g_test_dir);
 

@@ -1043,6 +1043,11 @@ static int mark_path_for(const char *path, char *out, size_t outsz)
     return 0;
 }
 
+/* Test seam (fanotify.h): when set, mount_id_of() reports "unavailable"
+ * exactly like a kernel without statx(STATX_MNT_ID), so the device-level
+ * fallbacks can be exercised on any kernel. */
+static int g_test_mount_id_unavailable = 0;
+
 /*
  * Mount ID of the mount containing 'path', resolved through the init
  * namespace.  Used to dedupe marks per mount instance (st_dev is not a
@@ -1054,6 +1059,8 @@ static unsigned long long mount_id_of(const char *path)
     char ns_path[PATH_MAX];
     struct statx stx;
 
+    if (g_test_mount_id_unavailable)
+        return 0;
     if (mark_path_for(path, ns_path, sizeof(ns_path)) < 0)
         return 0;
     memset(&stx, 0, sizeof(stx));
@@ -1077,6 +1084,12 @@ int fanotify_test_mark_path(const char *path, char *out, size_t outsz)
 unsigned long long fanotify_test_mount_id(const char *path)
 {
     return mount_id_of(path);
+}
+
+/* Test seam (fanotify.h): force mount_id_of() to report unavailable. */
+void fanotify_test_force_mount_id_unavailable(int on)
+{
+    g_test_mount_id_unavailable = on;
 }
 
 /* Recursively walk a directory and add inodes of regular files.
@@ -1304,10 +1317,28 @@ int fanotify_scope_guard(const char *config_path)
     unsigned long long config_id =
         (config_path && config_path[0]) ? mark_target_mount_id(config_path) : 0;
 
+    /*
+     * Device-level fallback for kernels without statx(STATX_MNT_ID)
+     * (pre-5.8) or a failed statx: mount IDs cannot be compared there,
+     * but the mount-mark bookkeeping itself falls back to device-level
+     * dedupe, so a state/config file on the same device as a protected
+     * path may still be intercepted.  A refusal is the only fail-closed
+     * outcome; proceeding unverified is the self-deadlock freeze class.
+     */
+    dev_t state_dev = 0;
+    dev_t config_dev = 0;
+    struct stat dst;
+
+    if (state_id == 0 && stat(PERSIST_STATE_DIR, &dst) == 0)
+        state_dev = dst.st_dev;
+    if (config_id == 0 && config_path && config_path[0] &&
+        stat(config_path, &dst) == 0)
+        config_dev = dst.st_dev;
+
     if (state_id == 0 && config_id == 0)
         log_msg(LOG_WARNING,
-                "scope guard: mount IDs unavailable (statx); mount-scope "
-                "collisions could not be verified");
+                "scope guard: mount IDs unavailable (statx); using "
+                "device-level collision checks");
 
     for (int i = 0; i < g_config->protected_count; i++)
     {
@@ -1329,7 +1360,40 @@ int fanotify_scope_guard(const char *config_path)
 
         id = mark_target_mount_id(target);
         if (id == 0)
+        {
+            /* Mount IDs unavailable: compare devices.  An existing
+             * target's own device is the one its mount mark would
+             * intercept; a missing target would be covered by a mount
+             * mark on its nearest existing ancestor. */
+            char ancestor[PATH_MAX];
+            struct stat pst;
+
+            if (state_dev == 0 && config_dev == 0)
+                continue; /* nothing to compare against */
+            if (stat(target, &pst) != 0 &&
+                !nearest_existing_ancestor(target, ancestor,
+                                           sizeof(ancestor), &pst))
+                continue;
+            if (state_dev != 0 && pst.st_dev == state_dev)
+            {
+                log_msg(LOG_ERR,
+                        "scope guard: statx mount IDs unavailable and state "
+                        "directory %s shares device %lu with protected path "
+                        "%s; the daemon could deadlock on its own open",
+                        PERSIST_STATE_DIR, (unsigned long)pst.st_dev, target);
+                return -1;
+            }
+            if (config_dev != 0 && pst.st_dev == config_dev)
+            {
+                log_msg(LOG_ERR,
+                        "scope guard: statx mount IDs unavailable and config "
+                        "%s shares device %lu with protected path %s; the "
+                        "daemon could deadlock on its own open",
+                        config_path, (unsigned long)pst.st_dev, target);
+                return -1;
+            }
             continue;
+        }
         if (state_id != 0 && id == state_id)
         {
             log_msg(LOG_ERR,
@@ -1846,13 +1910,15 @@ static void handle_notification_event(int fan_fd,
 /*
  * When both a directory mark and a mount mark are active, the kernel fires
  * two separate FAN_OPEN_PERM events for the same file open (one per mark).
- * The cache records the (pid, dev, ino) → decision for the most recent
- * RECENT_CACHE_MAX events so the second identical event is resolved
- * instantly without showing a second dialog.
+ * The cache records the decision for the most recent RECENT_CACHE_MAX
+ * events so the second identical event is resolved instantly without
+ * showing a second dialog.
  *
- * Entries expire after RECENT_CACHE_TTL_MS milliseconds.  The resolved
- * path is part of the key: a hard link reaches the same inode through a
- * different path and must not inherit the decision.  A config reload
+ * Entries expire after RECENT_CACHE_TTL_MS milliseconds.  The key is the
+ * full decision identity — (pid, process start time, resolved binary,
+ * dev, ino, resolved path) — so a hard link (different path), a recycled
+ * PID (different start time) or an exec to another binary can never
+ * inherit a decision the previous process image earned.  A config reload
  * clears the cache so a changed rule set is never replayed around.
  */
 #define RECENT_CACHE_MAX 32
@@ -1861,8 +1927,10 @@ static void handle_notification_event(int fan_fd,
 typedef struct
 {
     pid_t pid;
+    unsigned long long start; /* /proc/<pid>/stat start time (field 22) */
     dev_t dev;
     ino_t ino;
+    char binary[PATH_MAX]; /* resolved /proc/<pid>/exe                   */
     char target[PATH_MAX]; /* resolved path: hard links share the inode */
     int fan_decision;      /* FAN_ALLOW or FAN_DENY */
     struct timespec ts;
@@ -1872,17 +1940,19 @@ static RecentDecision g_recent[RECENT_CACHE_MAX];
 static int g_recent_count = 0;
 static unsigned int g_recent_head = 0; /* ring-buffer write head (wraps) */
 
-static void recent_cache_insert(pid_t pid, dev_t dev, ino_t ino,
+static void recent_cache_insert(pid_t pid, unsigned long long start,
+                                const char *binary, dev_t dev, ino_t ino,
                                 const char *target, int decision)
 {
     unsigned int slot;
 
     /* One entry per key: a newer decision must shadow an older one for the
-     * same (pid, inode, path) instead of living beside it in the ring. */
+     * same identity instead of living beside it in the ring. */
     for (int i = 0; i < g_recent_count; i++)
     {
         RecentDecision *e = &g_recent[i];
-        if (e->pid == pid && e->dev == dev && e->ino == ino &&
+        if (e->pid == pid && e->start == start && e->dev == dev &&
+            e->ino == ino && strcmp(e->binary, binary) == 0 &&
             strcmp(e->target, target) == 0)
         {
             e->fan_decision = decision;
@@ -1893,8 +1963,11 @@ static void recent_cache_insert(pid_t pid, dev_t dev, ino_t ino,
 
     slot = g_recent_head % RECENT_CACHE_MAX;
     g_recent[slot].pid = pid;
+    g_recent[slot].start = start;
     g_recent[slot].dev = dev;
     g_recent[slot].ino = ino;
+    snprintf(g_recent[slot].binary, sizeof(g_recent[slot].binary), "%s",
+             binary);
     snprintf(g_recent[slot].target, sizeof(g_recent[slot].target), "%s",
              target);
     g_recent[slot].fan_decision = decision;
@@ -1905,7 +1978,8 @@ static void recent_cache_insert(pid_t pid, dev_t dev, ino_t ino,
 }
 
 /* Returns FAN_ALLOW, FAN_DENY, or -1 (not found / expired). */
-static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino,
+static int recent_cache_lookup(pid_t pid, unsigned long long start,
+                               const char *binary, dev_t dev, ino_t ino,
                                const char *target)
 {
     struct timespec now;
@@ -1913,7 +1987,8 @@ static int recent_cache_lookup(pid_t pid, dev_t dev, ino_t ino,
     for (int i = 0; i < g_recent_count; i++)
     {
         RecentDecision *e = &g_recent[i];
-        if (e->pid != pid || e->dev != dev || e->ino != ino ||
+        if (e->pid != pid || e->start != start || e->dev != dev ||
+            e->ino != ino || strcmp(e->binary, binary) != 0 ||
             strcmp(e->target, target) != 0)
             continue;
         long age_ms = (now.tv_sec - e->ts.tv_sec) * 1000L + (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
@@ -1933,16 +2008,18 @@ static void recent_cache_clear(void)
 
 /* Test seams (fanotify.h): the dedup cache, unprivileged and side-effect
  * free beyond the cache itself. */
-void fanotify_test_recent_insert(pid_t pid, dev_t dev, ino_t ino,
+void fanotify_test_recent_insert(pid_t pid, unsigned long long start,
+                                 const char *binary, dev_t dev, ino_t ino,
                                  const char *target, int decision)
 {
-    recent_cache_insert(pid, dev, ino, target, decision);
+    recent_cache_insert(pid, start, binary, dev, ino, target, decision);
 }
 
-int fanotify_test_recent_lookup(pid_t pid, dev_t dev, ino_t ino,
+int fanotify_test_recent_lookup(pid_t pid, unsigned long long start,
+                                const char *binary, dev_t dev, ino_t ino,
                                 const char *target)
 {
-    return recent_cache_lookup(pid, dev, ino, target);
+    return recent_cache_lookup(pid, start, binary, dev, ino, target);
 }
 
 void fanotify_test_recent_clear(void)
@@ -2067,6 +2144,7 @@ typedef struct
     char target[PATH_MAX]; /* /proc/self/fd/<fd> resolved path         */
     dev_t ev_dev;
     ino_t ev_ino;
+    int have_ev_stat;      /* 1 = ev_dev/ev_ino valid (fstat succeeded) */
 
     /* Cached prefix verdict: the target path needs it in the fast path,
      * the hard-link classification and the prompt policy, and the
@@ -2098,6 +2176,12 @@ typedef struct
     pid_t sid;
     unsigned long long sid_start;
     int have_sid;
+
+    /* Process instance identity for the dedup cache: /proc/<pid>/stat
+     * start time, captured by event_dedup() while the process is still
+     * suspended. */
+    unsigned long long pid_start;
+    int have_pid_start;
 } EventCtx;
 
 /*
@@ -2252,8 +2336,12 @@ static const char *event_cmdline_fp(EventCtx *c)
  */
 static void ctx_respond(EventCtx *c, unsigned int response)
 {
-    recent_cache_insert(c->ev->pid, c->ev_dev, c->ev_ino, c->target,
-                        (int)response);
+    /* Complete identity only: an event whose start time or inode could
+     * not be captured is never cached, so a duplicate runs the pipeline
+     * again (fail closed) instead of inheriting a decision. */
+    if (c->binary && c->have_pid_start && c->have_ev_stat)
+        recent_cache_insert(c->ev->pid, c->pid_start, c->binary, c->ev_dev,
+                            c->ev_ino, c->target, (int)response);
     fanotify_respond(c->fan_fd, c->ev, response);
 }
 
@@ -2325,17 +2413,7 @@ static int event_fastpath(EventCtx *c)
     {
         c->ev_dev = st.st_dev;
         c->ev_ino = st.st_ino;
-        int cached = recent_cache_lookup(c->ev->pid, c->ev_dev, c->ev_ino,
-                                         c->target);
-        if (cached != -1)
-        {
-            log_msg(LOG_DEBUG,
-                    "[dedup] reusing cached decision=%s for pid=%d target=%s",
-                    cached == (int)FAN_ALLOW ? "ALLOW" : "DENY",
-                    (int)c->ev->pid, c->target);
-            fanotify_respond(c->fan_fd, c->ev, (unsigned int)cached);
-            return 1;
-        }
+        c->have_ev_stat = 1;
     }
     return 0;
 }
@@ -2388,6 +2466,43 @@ static int event_load_binary(EventCtx *c)
         return 1;
     }
     return 0;
+}
+
+/*
+ * Duplicate-event reuse (runs after the binary is resolved, before the
+ * identity gathering).  Now that the full decision identity is
+ * available: a directory mark and a mount mark
+ * can fire twice for one open, and the second event reuses the first
+ * decision.  The key carries the process instance (pid + /proc/<pid>/stat
+ * start time) and the resolved binary in addition to (dev, ino, path);
+ * the file cache rejects PID reuse the same way, and an exec must not
+ * inherit a decision the previous image earned.  A missing start time or
+ * inode skips the cache so the pipeline runs again (fail closed).
+ * Returns 1 when the event was decided here.
+ */
+static int event_dedup(EventCtx *c)
+{
+    unsigned long long start = 0;
+    int cached;
+
+    if (!c->have_ev_stat)
+        return 0;
+    if (proc_stat_session(c->ev->pid, NULL, &start) != 0)
+        return 0; /* cannot bind the decision to a process instance */
+    c->pid_start = start;
+    c->have_pid_start = 1;
+
+    cached = recent_cache_lookup(c->ev->pid, c->pid_start, c->binary,
+                                 c->ev_dev, c->ev_ino, c->target);
+    if (cached == -1)
+        return 0;
+
+    log_msg(LOG_DEBUG,
+            "[dedup] reusing cached decision=%s for pid=%d binary=%s target=%s",
+            cached == (int)FAN_ALLOW ? "ALLOW" : "DENY", (int)c->ev->pid,
+            c->binary, c->target);
+    fanotify_respond(c->fan_fd, c->ev, (unsigned int)cached);
+    return 1;
 }
 
 /*
@@ -2749,7 +2864,15 @@ static int event_runtime_allowed(EventCtx *c)
                 return 1;
             }
             if (verdict == ALLOWLIST_PIN_CHANGED)
+            {
+                /* Defer mode (the dialog pump): the hash-change prompt is
+                 * a second modal dialog, so queue the event instead of
+                 * stacking it on the open one.  The main loop replays the
+                 * event and prompts once the current dialog is done. */
+                if (c->defer_on_ask)
+                    return 0;
                 return config_allow_hash_change(c, rule, old_sha512);
+            }
 
             /* ALLOWLIST_PIN_NO_GRANT: damaged table or unavailable hash;
              * never grant silently and never store a fresh pin. */
@@ -2991,6 +3114,8 @@ static int process_open_perm(int fan_fd, const struct fanotify_event_metadata *e
         goto out;
     if (event_load_binary(&c))
         goto out;
+    if (event_dedup(&c))
+        goto out;
     event_gather_identity(&c);
     if (run_verdict_stages(&c))
         goto out;
@@ -3010,14 +3135,15 @@ out:
 /*
  * Test seam (fanotify.h): run the real verdict stages over a synthetic
  * request.  Returns 1 when a deny stage decided, 2 when a grant stage
- * decided, 0 when the event would reach the dialog.  sid > 0 makes the
- * synthetic context look like a member of that session (for recorded
- * session decisions); cmdline_fp may be NULL.  hardlink mirrors the
- * pipeline's hard-link classification.
+ * decided, 0 when the event would reach the dialog (or defer, when
+ * 'defer' is set).  sid > 0 makes the synthetic context look like a
+ * member of that session (for recorded session decisions); cmdline_fp
+ * may be NULL.  hardlink mirrors the pipeline's hard-link
+ * classification; defer mirrors the pump's defer_on_ask mode.
  */
 int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,
-                                pid_t sid, int hardlink)
+                                pid_t sid, int hardlink, int defer)
 {
     struct fanotify_event_metadata ev;
     EventCtx c;
@@ -3055,6 +3181,7 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
         c.have_sid = 1;
     }
     c.hardlink_event = hardlink;
+    c.defer_on_ask = defer;
 
     verdict = run_verdict_stages(&c);
 

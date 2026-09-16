@@ -395,6 +395,10 @@ int pin_load(const char *filepath)
     g_pin_count = count;
     g_pin_seq = (unsigned long)count;
     g_pin_damaged = 0;
+    /* Clear slots beyond the loaded table: stale pins from an earlier,
+     * larger load must never become live (or be serialized) again. */
+    for (i = count; i < PIN_MAX; i++)
+        memset(&g_pins[i], 0, sizeof(g_pins[i]));
     log_msg(LOG_INFO, "pin_load: loaded %d pin(s) from %s", count, path);
     return 0;
 }
@@ -546,6 +550,23 @@ int pin_store(const char *pattern, const char *sha512)
         return -1;
     }
 
+    /*
+     * Stage on a snapshot and commit to memory only after the write
+     * succeeded: a serialize or write failure must not leave the live
+     * table diverged from disk (the eviction victim would be gone from
+     * memory while its pin still exists on disk, silently re-TOFUing a
+     * rule until the next successful store or restart).  The snapshot
+     * is taken before the append increments g_pin_count: captured
+     * after it, a failed write would restore a count one past the last
+     * valid entry, leaving a phantom pin that the next successful
+     * store would serialize (empty pattern -> damaged file, or a stale
+     * pattern from an earlier larger load -> silent re-grant).
+     */
+    static PinEntry snapshot[PIN_MAX];
+    int snap_count = g_pin_count;
+    unsigned long snap_seq = g_pin_seq;
+    memcpy(snapshot, g_pins, sizeof(g_pins));
+
     for (i = 0; i < g_pin_count; i++)
     {
         if (strcmp(g_pins[i].pattern, pattern) == 0)
@@ -572,18 +593,6 @@ int pin_store(const char *pattern, const char *sha512)
         log_msg(LOG_INFO, "pin_store: table full; evicting pin %s",
                 g_pins[idx].pattern);
     }
-
-    /*
-     * Stage on a snapshot and commit to memory only after the write
-     * succeeded: a serialize or write failure must not leave the live
-     * table diverged from disk (the eviction victim would be gone from
-     * memory while its pin still exists on disk, silently re-TOFUing a
-     * rule until the next successful store or restart).
-     */
-    static PinEntry snapshot[PIN_MAX];
-    int snap_count = g_pin_count;
-    unsigned long snap_seq = g_pin_seq;
-    memcpy(snapshot, g_pins, sizeof(g_pins));
 
     memcpy(g_pins[idx].pattern, pattern, strlen(pattern) + 1);
     memcpy(g_pins[idx].sha512, sha512, 129);

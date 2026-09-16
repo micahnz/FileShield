@@ -222,13 +222,24 @@ int fanotify_test_mark_path(const char *path, char *out, size_t outsz);
 unsigned long long fanotify_test_mount_id(const char *path);
 
 /*
- * Test seams: the recent-decision dedup cache.  The key is
- * (pid, dev, ino, resolved path); a newer decision replaces an older one
- * for the same key, and a reload clears the cache.
+ * Test seam: force mount_id_of() to report "unavailable", simulating a
+ * kernel without statx(STATX_MNT_ID), so the scope guard's device-level
+ * fallback can be regression-tested on any kernel.
  */
-void fanotify_test_recent_insert(pid_t pid, dev_t dev, ino_t ino,
+void fanotify_test_force_mount_id_unavailable(int on);
+
+/*
+ * Test seams: the recent-decision dedup cache.  The key is
+ * (pid, process start time, resolved binary, dev, ino, resolved path); a
+ * newer decision replaces an older one for the same key, and a reload
+ * clears the cache.  The start time and binary bind a decision to one
+ * process image, so a recycled PID or an exec cannot inherit it.
+ */
+void fanotify_test_recent_insert(pid_t pid, unsigned long long start,
+                                 const char *binary, dev_t dev, ino_t ino,
                                  const char *target, int decision);
-int fanotify_test_recent_lookup(pid_t pid, dev_t dev, ino_t ino,
+int fanotify_test_recent_lookup(pid_t pid, unsigned long long start,
+                                const char *binary, dev_t dev, ino_t ino,
                                 const char *target);
 void fanotify_test_recent_clear(void);
 
@@ -238,11 +249,12 @@ void fanotify_test_recent_clear(void);
  * stage decided, 0 when the event would reach the dialog.  sid > 0 marks
  * the synthetic context as a member of that session; cmdline_fp may be
  * NULL; hardlink mirrors the pipeline's hard-link classification (which
- * strips every grant).
+ * strips every grant); defer mirrors the pump's defer_on_ask mode (a
+ * changed hash pin defers instead of opening a second dialog).
  */
 int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,
-                                pid_t sid, int hardlink);
+                                pid_t sid, int hardlink, int defer);
 
 /* Test seam: the per-binary dialog rate limiter. */
 int fanotify_test_dialog_rate_limited(const char *binary);
