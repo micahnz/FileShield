@@ -128,4 +128,10 @@ int notify_test_env_key_allowed(const char *key);
  */
 void notify_test_sanitize_ellipsized(const char *in, char *out, size_t outsz);
 
+/*
+ * Test seam: map a raw wait(2) status to the kdialog button index
+ * (0 = Yes, 1 = No, 2 = Cancel; -1 = no usable answer, fail closed).
+ */
+int notify_test_kdialog_choice(int status);
+
 #endif

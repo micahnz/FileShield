@@ -30,13 +30,48 @@
  * sets 300; config.c applies the same default at parse time). */
 #define DEFAULT_USER_TTL_S 300
 
+/*
+ * fanotify.c — the event decision pipeline and mark bookkeeping.
+ *
+ * Sections in file order (the banners below mark each one):
+ *   proc helpers            - /proc reads used to identify the requester
+ *   protected-path matching - prefix/glob/exclusion verdicts
+ *   config rule matching    - [allowlist]/[unsafe_allowlist]/[denylist]
+ *   hash caches             - binary SHA-512 and failure windows
+ *   mark table              - every kernel mark, tracked for removal
+ *   scope guard             - refuses configs the marks would intercept
+ *   per-event context       - EventCtx and identity gathering
+ *   decision pipeline       - event_resolve ... event_ask_user
+ *   response handling       - fanotify_respond + the retry queue
+ *   deferred queue + pump   - events held while a dialog is open
+ *   main event loop         - fanotify_loop
+ *   public API + test seams
+ *
+ * Event -> response lifecycle:
+ *   1. fanotify_loop()/fanotify_pump() read FAN_OPEN_PERM events and run
+ *      process_open_perm(), which walks the stages in fanotify.h order.
+ *   2. A decided event is answered through respond_event(): the response
+ *      is written and - on success - the event fd is closed.
+ *   3. If the write fails, the response is queued (g_unanswered) and the
+ *      event fd is kept open: closing it would strand the caller's open()
+ *      until group close, where the kernel auto-ALLOWS it.  The main loop
+ *      and the pump retry the queue; fanotify_drain_and_deny() forces a
+ *      final DENY before close(fan_fd) on shutdown.
+ *   4. Events that need the user are deferred with their fds open and
+ *      replayed by the main loop after the dialog (fanotify_process_pending).
+ */
+
 /* Defined later in this file; declared early for the call-chain hasher. */
 static int is_path_under_protected(const char *path);
 
 /* Defined with the protected-path matchers; the inode walk uses it. */
 static const ProtectedPath *exclusion_match(const char *path);
 
-/* Defined later; the decision stages respond through this. */
+/* Defined later; the decision stages respond through this.  Return
+ * contract (see fanotify_respond): 0 = delivered or already answered, so
+ * the caller may close the event fd; -1 = write failed, the response was
+ * queued for retry, so the caller must keep the fd open; -2 = queue full,
+ * the caller closes the fd and the daemon restarts. */
 static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
                             unsigned int response);
 
@@ -1316,11 +1351,11 @@ static unsigned long long mark_target_mount_id(const char *path)
     return mount_id_of(ancestor);
 }
 
-int fanotify_scope_guard(const char *config_path)
+/* Scope guard, check 1: the daemon's own config or state directory must
+ * not lie under a protected path, or an inode mark (shared across mount
+ * namespaces) would intercept the daemon's own open and deadlock it. */
+static int scope_guard_containment(const char *config_path)
 {
-    if (!g_config)
-        return -1;
-
     /* 1. Containment: inode marks reach every namespace. */
     if (config_path && config_path[0] &&
         is_path_under_protected(config_path))
@@ -1339,7 +1374,19 @@ int fanotify_scope_guard(const char *config_path)
                 PERSIST_STATE_DIR);
         return -1;
     }
+    return 0;
+}
 
+/*
+ * Scope guard, check 2: the config or state file must not lie on a mount
+ * that will be mount-marked.  Only possible when mounts are shared (a
+ * private mount namespace cannot be reached by init-namespace marks), so
+ * the check short-circuits there.  Without statx(STATX_MNT_ID) mount IDs
+ * cannot be compared and the device-level fallback refuses a same-device
+ * collision, matching the mount-mark bookkeeping's own dedupe fallback.
+ */
+static int scope_guard_mount_collision(const char *config_path)
+{
     /* 2. Mount collision: only possible when mounts are shared. */
     if (!in_init_mount_ns())
     {
@@ -1450,6 +1497,16 @@ int fanotify_scope_guard(const char *config_path)
         }
     }
     return 0;
+}
+
+int fanotify_scope_guard(const char *config_path)
+{
+    if (!g_config)
+        return -1;
+
+    if (scope_guard_containment(config_path) < 0)
+        return -1;
+    return scope_guard_mount_collision(config_path);
 }
 
 /* Print the marks a config would install, without touching the kernel. */
@@ -2812,6 +2869,138 @@ static int config_allow_hash_change(EventCtx *c, const RuleEntry *e,
 }
 
 /*
+ * Grant stages, evaluated in order by event_runtime_allowed().  Each
+ * returns 1 when it decided the event (the response has been written, or
+ * the hash-change prompt decided it) and 0 to fall through to the next
+ * stage.  Denials never reach these: event_runtime_denied() runs first,
+ * and hard-link events skip every grant stage.
+ */
+
+/* File cache: "Allow Once" decisions and config-allowlist refreshes. */
+static int try_file_cache(EventCtx *c)
+{
+    if (cache_lookup(c->ev->pid, c->binary, c->target) <= 0)
+        return 0;
+    ctx_respond(c, FAN_ALLOW);
+    return 1;
+}
+
+/* Session-scoped allow entries: same shell session, binary and file. */
+static int try_session_allow(EventCtx *c)
+{
+    if (!c->have_sid ||
+        !session_allow_match(c->sid, c->binary, c->bin_sha512, c->target))
+        return 0;
+    log_msg(LOG_INFO, "session allowlist hit: %s (pid %d, sid %d) -> %s",
+            c->binary, (int)c->ev->pid, (int)c->sid, c->target);
+    ctx_respond(c, FAN_ALLOW);
+    return 1;
+}
+
+/* Runtime "Always" entries: persisted allowlist, command-line keyed. */
+static int try_runtime_allow(EventCtx *c)
+{
+    if (g_dyn_allow_count <= 0 ||
+        !dyn_allow_match(c->binary, c->bin_sha512, event_chain_provider, c,
+                         c->target, event_cmdline_fp(c)))
+        return 0;
+
+    int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
+    cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
+    log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
+            c->binary, (int)c->ev->pid, c->target);
+    ctx_respond(c, FAN_ALLOW);
+    return 1;
+}
+
+/*
+ * Config [unsafe_allowlist]: an explicit admin opt-in that skips hash
+ * checking and pinning entirely.  Evaluated before the hash-pinned
+ * [allowlist]; a hit grants silently with the rule's target scope and
+ * never touches the pin state.
+ */
+static int try_unsafe_allowlist(EventCtx *c)
+{
+    const RuleEntry *unsafe = unsafe_allowlist_match(c->binary, c->target);
+    if (!unsafe)
+        return 0;
+
+    int first = unsafe_first_hit(c->ev->pid);
+
+    /* The first hit from a process stands out: WARNING severity and the
+     * matched rule, because the rule skips hash pinning and an
+     * impersonated binary is exactly what this surfaces.  Repeats from
+     * the same process stay in the journal at INFO so the access audit
+     * trail remains complete. */
+    log_msg(first ? LOG_WARNING : LOG_INFO,
+            "unsafe allowlist hit%s: %s (pid %d) -> %s (rule: %s)",
+            first ? "" : " (repeat)", c->binary, (int)c->ev->pid,
+            c->target, unsafe->binary);
+    if (first)
+        config_rule_notify(c, unsafe, NOTIFY_HIT_UNSAFE, c->comm);
+    config_allow_grant(c, unsafe);
+    return 1;
+}
+
+/*
+ * Config [allowlist], hash-pinned: a pin match grants; a first event
+ * stores the digest immediately and grants; a changed digest asks the
+ * user (returning 0 in defer mode so the pump queues it); a damaged
+ * table or an unavailable digest falls through to the normal dialog
+ * (fail closed, no silent re-TOFU).
+ */
+static int try_pinned_allowlist(EventCtx *c)
+{
+    const RuleEntry *rule = allowlist_match(c->binary, c->target);
+    if (!rule)
+        return 0;
+
+    char old_sha512[129];
+    int verdict = config_allow_pin_verdict(rule, c->bin_sha512, old_sha512);
+
+    if (verdict == ALLOWLIST_PIN_FIRST_USE)
+    {
+        config_allow_pin_first_seen(rule, c->bin_sha512);
+        config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
+        config_allow_grant(c, rule);
+        return 1;
+    }
+    if (verdict == ALLOWLIST_PIN_MATCH)
+    {
+        log_msg(LOG_INFO,
+                "config allowlist hit (pin match): %s (pid %d) -> %s",
+                c->binary, (int)c->ev->pid, c->target);
+        config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
+        config_allow_grant(c, rule);
+        return 1;
+    }
+    if (verdict == ALLOWLIST_PIN_CHANGED)
+    {
+        /* Defer mode (the dialog pump): the hash-change prompt is a
+         * second modal dialog, so queue the event instead of stacking it
+         * on the open one.  The main loop replays the event and prompts
+         * once the current dialog is done. */
+        if (c->defer_on_ask)
+            return 0;
+        return config_allow_hash_change(c, rule, old_sha512);
+    }
+
+    /* ALLOWLIST_PIN_NO_GRANT: damaged table or unavailable hash; never
+     * grant silently and never store a fresh pin. */
+    if (c->bin_sha512[0] == '\0')
+        log_msg(LOG_WARNING,
+                "allowlist rule %s: binary SHA-512 unavailable for %s; "
+                "asking the user (no silent grant)",
+                rule->binary, c->binary);
+    else
+        log_msg(LOG_ERR,
+                "allowlist rule %s: pin table damaged; asking the user "
+                "(no silent grant, no re-TOFU)",
+                rule->binary);
+    return 0;
+}
+
+/*
  * Stage 6: grants, in order: file cache ("Allow Once" and fast paths),
  * session allowlist, dynamic allowlist ("Allow Always"), unsafe config
  * allowlist ([unsafe_allowlist], no pinning), hash-pinned config
@@ -2830,118 +3019,18 @@ static int event_runtime_allowed(EventCtx *c)
     if (c->hardlink_event)
         return 0;
 
-    if (cache_lookup(c->ev->pid, c->binary, c->target) > 0)
-    {
-        ctx_respond(c, FAN_ALLOW);
+    /* Order is part of the security contract (AGENTS.md); each helper
+     * is a single grant stage and returns 1 only when it decided. */
+    if (try_file_cache(c))
         return 1;
-    }
-
-    if (c->have_sid &&
-        session_allow_match(c->sid, c->binary, c->bin_sha512, c->target))
-    {
-        log_msg(LOG_INFO, "session allowlist hit: %s (pid %d, sid %d) -> %s",
-                c->binary, (int)c->ev->pid, (int)c->sid, c->target);
-        ctx_respond(c, FAN_ALLOW);
+    if (try_session_allow(c))
         return 1;
-    }
-
-    if (g_dyn_allow_count > 0 &&
-        dyn_allow_match(c->binary, c->bin_sha512, event_chain_provider, c,
-                        c->target, event_cmdline_fp(c)))
-    {
-        int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
-        cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
-        log_msg(LOG_INFO, "dynamic allowlist hit: %s (pid %d) -> %s",
-                c->binary, (int)c->ev->pid, c->target);
-        ctx_respond(c, FAN_ALLOW);
+    if (try_runtime_allow(c))
         return 1;
-    }
-
-    /*
-     * Config [unsafe_allowlist]: an explicit admin opt-in that skips
-     * hash checking and pinning entirely.  Evaluated before the
-     * hash-pinned [allowlist]; a hit grants silently with the rule's
-     * target scope and never touches the pin state.
-     */
-    {
-        const RuleEntry *unsafe = unsafe_allowlist_match(c->binary,
-                                                         c->target);
-        if (unsafe)
-        {
-            int first = unsafe_first_hit(c->ev->pid);
-
-            /* The first hit from a process stands out: WARNING severity
-             * and the matched rule, because the rule skips hash pinning
-             * and an impersonated binary is exactly what this surfaces.
-             * Repeats from the same process stay in the journal at INFO
-             * so the access audit trail remains complete. */
-            log_msg(first ? LOG_WARNING : LOG_INFO,
-                    "unsafe allowlist hit%s: %s (pid %d) -> %s (rule: %s)",
-                    first ? "" : " (repeat)", c->binary, (int)c->ev->pid,
-                    c->target, unsafe->binary);
-            if (first)
-                config_rule_notify(c, unsafe, NOTIFY_HIT_UNSAFE, c->comm);
-            config_allow_grant(c, unsafe);
-            return 1;
-        }
-    }
-
-    /*
-     * Config [allowlist], hash-pinned: a pin match grants; a first event
-     * stores the digest immediately and grants; a changed digest asks
-     * the user; a damaged table or an unavailable digest falls through
-     * to the normal dialog (fail closed, no silent re-TOFU).
-     */
-    {
-        const RuleEntry *rule = allowlist_match(c->binary, c->target);
-        if (rule)
-        {
-            char old_sha512[129];
-            int verdict = config_allow_pin_verdict(rule, c->bin_sha512,
-                                                   old_sha512);
-
-            if (verdict == ALLOWLIST_PIN_FIRST_USE)
-            {
-                config_allow_pin_first_seen(rule, c->bin_sha512);
-                config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
-                config_allow_grant(c, rule);
-                return 1;
-            }
-            if (verdict == ALLOWLIST_PIN_MATCH)
-            {
-                log_msg(LOG_INFO,
-                        "config allowlist hit (pin match): %s (pid %d) -> %s",
-                        c->binary, (int)c->ev->pid, c->target);
-                config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
-                config_allow_grant(c, rule);
-                return 1;
-            }
-            if (verdict == ALLOWLIST_PIN_CHANGED)
-            {
-                /* Defer mode (the dialog pump): the hash-change prompt is
-                 * a second modal dialog, so queue the event instead of
-                 * stacking it on the open one.  The main loop replays the
-                 * event and prompts once the current dialog is done. */
-                if (c->defer_on_ask)
-                    return 0;
-                return config_allow_hash_change(c, rule, old_sha512);
-            }
-
-            /* ALLOWLIST_PIN_NO_GRANT: damaged table or unavailable hash;
-             * never grant silently and never store a fresh pin. */
-            if (c->bin_sha512[0] == '\0')
-                log_msg(LOG_WARNING,
-                        "allowlist rule %s: binary SHA-512 unavailable for "
-                        "%s; asking the user (no silent grant)",
-                        rule->binary, c->binary);
-            else
-                log_msg(LOG_ERR,
-                        "allowlist rule %s: pin table damaged; asking the "
-                        "user (no silent grant, no re-TOFU)",
-                        rule->binary);
-            return 0;
-        }
-    }
+    if (try_unsafe_allowlist(c))
+        return 1;
+    if (try_pinned_allowlist(c))
+        return 1;
     return 0;
 }
 
@@ -3250,6 +3339,25 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
     return verdict;
 }
 
+/*
+ * Advance to the next event in one read(2) batch.  Encapsulates the
+ * offset arithmetic and the malformed-length guard: a zero or oversized
+ * event_len must end the walk instead of looping or stepping outside the
+ * buffer.  Returns NULL when the batch is exhausted (the caller's
+ * while (FAN_EVENT_OK(...)) then also fails and exits).
+ */
+static const struct fanotify_event_metadata *
+event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
+{
+    if (ev->event_len == 0 || (ssize_t)ev->event_len > *remaining)
+        return NULL;
+    *remaining -= (ssize_t)ev->event_len;
+    if (*remaining < (ssize_t)sizeof(struct fanotify_event_metadata))
+        return NULL;
+    return (const struct fanotify_event_metadata *)((const char *)ev +
+                                                    ev->event_len);
+}
+
 /* ------------------------------------------------------------------ */
 /*  fanotify_pump: drain pending events while dialog child is running */
 /* ------------------------------------------------------------------ */
@@ -3443,11 +3551,11 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 close((int)ev->fd);
             }
 
-            if (ev->event_len == 0 || g_fatal)
+            if (g_fatal)
                 break;
-            remaining -= ev->event_len;
-            ev = (const struct fanotify_event_metadata *)((const char *)ev +
-                                                          ev->event_len);
+            ev = event_next(ev, &remaining);
+            if (!ev)
+                break;
         }
         if (g_fatal)
             break;
@@ -3809,11 +3917,9 @@ void fanotify_drain_and_deny(int fan_fd)
                 close((int)ev->fd);
             }
 
-            if (ev->event_len == 0)
+            ev = event_next(ev, &remaining);
+            if (!ev)
                 break;
-            remaining -= ev->event_len;
-            ev = (const struct fanotify_event_metadata *)((const char *)ev +
-                                                          ev->event_len);
         }
     }
 
@@ -3966,11 +4072,11 @@ void fanotify_loop(int fd, int wake_fd)
                     close((int)ev->fd);
                 }
 
-                if (ev->event_len == 0 || g_fatal)
+                if (g_fatal)
                     break;
-                remaining -= ev->event_len;
-                ev = (const struct fanotify_event_metadata *)((const char *)ev +
-                                                              ev->event_len);
+                ev = event_next(ev, &remaining);
+                if (!ev)
+                    break;
             }
         }
 

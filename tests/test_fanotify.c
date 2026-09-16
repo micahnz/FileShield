@@ -1145,6 +1145,20 @@ static void test_cmdline_fingerprint_full(void) {
 }
 
 /*
+ * Part 0k: the dialog exit-status mapping fails closed for everything
+ * that is not a definite Yes/No/Cancel.
+ */
+static void test_kdialog_status_mapping(void) {
+    ASSERT(notify_test_kdialog_choice(0 << 8) == 0, "exit 0 is Yes");
+    ASSERT(notify_test_kdialog_choice(1 << 8) == 1, "exit 1 is No");
+    ASSERT(notify_test_kdialog_choice(2 << 8) == 2, "exit 2 is Cancel");
+    ASSERT(notify_test_kdialog_choice(124 << 8) == -1, "timeout denies");
+    ASSERT(notify_test_kdialog_choice(127 << 8) == -1, "exec failure denies");
+    ASSERT(notify_test_kdialog_choice(3 << 8) == -1, "unknown code denies");
+    ASSERT(notify_test_kdialog_choice(SIGKILL) == -1, "signal death denies");
+}
+
+/*
  * Part 1: fill the deferred queue to capacity, verify a full queue
  * refuses further events, then verify the fail-closed flush denies and
  * closes every deferred event.
@@ -2048,6 +2062,7 @@ int main(void) {
     test_scope_guard();
     test_recent_decision_cache();
     test_dialog_env_whitelist();
+    test_kdialog_status_mapping();
     test_verdict_stage_order();
     test_pump_defer_contract();
     test_pin_change_defers_in_pump();

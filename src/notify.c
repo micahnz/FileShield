@@ -565,6 +565,38 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
 }
 
 /*
+ * Map a reaped dialog child's wait(2) status to its button index
+ * (0 = Yes, 1 = No, 2 = Cancel), or -1 for anything that must deny.
+ * Pure apart from the timeout log, so the fail-closed mapping can be
+ * reviewed and table-tested in one place:
+ *   - not a normal exit (killed by the outer timeout path)  -> -1
+ *   - 124: coreutils timeout(1) killed kdialog               -> -1
+ *   - 0/1/2: Yes / No / Cancel                               -> 0/1/2
+ *   - anything else (e.g. 127 exec failure)                  -> -1
+ */
+static int kdialog_status_to_choice(int status)
+{
+    if (!WIFEXITED(status))
+        return -1;
+
+    int ec = WEXITSTATUS(status);
+    if (ec == 124) /* coreutils timeout(1) */
+    {
+        log_msg(LOG_WARNING, "[dialog] kdialog timed out (30s)");
+        return -1;
+    }
+    if (ec >= 0 && ec <= 2)
+        return ec;
+    return -1;
+}
+
+/* Test seam (notify.h): the dialog exit-status mapping. */
+int notify_test_kdialog_choice(int status)
+{
+    return kdialog_status_to_choice(status);
+}
+
+/*
  * run_kdialog: show a kdialog --yesnocancel prompt with custom button
  * labels and return 0 = yes, 1 = no, 2 = cancel/window close,
  * -1 = failure/timeout.
@@ -694,22 +726,9 @@ static int run_kdialog(const DisplaySession *session,
 
     /* A child killed by the outer timeout, an exec failure (127) or any
      * unexpected exit code is a failure: the caller fails closed. */
-    if (!child_exited || !WIFEXITED(status))
+    if (!child_exited)
         return -1;
-
-    int ec = WEXITSTATUS(status);
-    if (ec == 124) /* coreutils timeout(1) */
-    {
-        log_msg(LOG_WARNING, "[dialog] kdialog timed out (30s)");
-        return -1;
-    }
-    if (ec == 0)
-        return 0; /* Yes */
-    if (ec == 1)
-        return 1; /* No click, or a runtime error: see the comment above */
-    if (ec == 2)
-        return 2; /* Cancel / window close / Escape */
-    return -1;
+    return kdialog_status_to_choice(status);
 }
 
 const char *notify_decision_name(int decision)

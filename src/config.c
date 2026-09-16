@@ -493,6 +493,226 @@ static int protected_path_set(ProtectedPath *pp, const char *raw)
                             &pp->base_len, raw);
 }
 
+/*
+ * Add one [protected_paths] line (positive, or '!' exclusion) to cfg,
+ * expanding '~/...' once per real user.  Returns 0 on success (including
+ * entries rejected by validation, which are logged) and -1 when the
+ * config must be refused (allocation failure or MAX_PATHS reached).
+ */
+static int add_protected_entry(Config *cfg, char *s)
+{
+    /*
+     * A leading '!' marks an exclusion: it protects nothing itself and
+     * removes matching paths from the protection of every positive entry
+     * (deny wins; config order is irrelevant).  '!' elsewhere is an
+     * ordinary path character.  Both positives and exclusions must be
+     * absolute after '~' expansion: a relative path can never match a
+     * canonical target, so it is rejected with a log (fail closed)
+     * rather than silently protecting nothing.
+     */
+    const char *raw = s;
+    int is_exclude = 0;
+    if (raw[0] == '!')
+    {
+        is_exclude = 1;
+        raw = trim(s + 1);
+        if (*raw == '\0')
+        {
+            log_msg(LOG_ERR, "config_load: empty exclusion: %s", s);
+            return 0;
+        }
+    }
+
+    /* Expand ~/... for every user in /etc/passwd so that each user's
+     * home directory is protected, not just root's. */
+    char **paths = expand_home_all_users(raw);
+    if (!paths)
+    {
+        log_msg(LOG_ERR, "config_load: out of memory");
+        return -1;
+    }
+    for (int pi = 0; paths[pi] != NULL; pi++)
+    {
+        if (cfg->protected_count >= MAX_PATHS)
+        {
+            /* Refuse the whole config: truncating the protection list
+             * would silently leave the dropped paths unmarked and
+             * unwatched.  A '~/...' line expands once per real user, so
+             * multi-user machines reach this sooner than the line count
+             * suggests. */
+            log_msg(LOG_ERR,
+                    "config_load: too many protected paths (max %d); "
+                    "refusing the config (note: '~/...' expands once "
+                    "per real user)", MAX_PATHS);
+            free_string_array(paths);
+            return -1;
+        }
+        ProtectedPath *pp = &cfg->protected[cfg->protected_count];
+        if (protected_path_set(pp, paths[pi]) < 0)
+            continue; /* malformed or relative: rejected with a log */
+        pp->is_exclude = is_exclude;
+        if (is_exclude)
+        {
+            cfg->exclude_idx[cfg->exclude_count] = cfg->protected_count;
+            cfg->exclude_count++;
+            /* Audit trail: every carve-out is visible in the journal. */
+            log_msg(LOG_INFO, "config_load: exclusion: !%s", pp->path);
+        }
+        cfg->protected_count++;
+    }
+    free_string_array(paths);
+    return 0;
+}
+
+/*
+ * Append every rule on one line to a section.  Returns 0 on success
+ * (including lines add_rule() skips with a log) and -1 when the config
+ * must be refused (allocation failure or the section's rule cap).
+ */
+static int load_rules(RuleEntry *rules, int *count, const char *section_name,
+                      const char *line)
+{
+    if (add_rule(rules, count, line) < 0)
+    {
+        log_msg(LOG_ERR,
+                "config_load: cannot add to [%s] (out of memory or rule cap "
+                "reached); refusing the config",
+                section_name);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Apply one [settings] "key = value" pair to cfg.  Unknown keys are
+ * logged and ignored; an invalid value keeps the current/default one.
+ * Settings can never make a config unusable, so there is no failure
+ * return: a typo is visible in the journal instead of failing startup.
+ */
+static void apply_setting(Config *cfg, const char *key, const char *val)
+{
+    if (strcmp(key, "user_ttl") == 0)
+    {
+        /* 0 disables "Allow Once" caching: each open prompts again. */
+        int ttl;
+        if (parse_int_setting(val, &ttl))
+        {
+            if (ttl > FS_MAX_TTL_SECONDS)
+            {
+                log_msg(LOG_WARNING,
+                        "config_load: user_ttl %d clamped to %d seconds",
+                        ttl, FS_MAX_TTL_SECONDS);
+                ttl = FS_MAX_TTL_SECONDS;
+            }
+            cfg->user_ttl_seconds = ttl;
+        }
+        else
+            log_msg(LOG_ERR, "config_load: invalid user_ttl: %s", val);
+    }
+    else if (strcmp(key, "session_ttl") == 0)
+    {
+        /* 0 is a valid value: session decisions then live exactly
+         * as long as the session leader (the shell). */
+        int ttl;
+        if (parse_int_setting(val, &ttl))
+        {
+            if (ttl > FS_MAX_TTL_SECONDS)
+            {
+                log_msg(LOG_WARNING,
+                        "config_load: session_ttl %d clamped to %d seconds",
+                        ttl, FS_MAX_TTL_SECONDS);
+                ttl = FS_MAX_TTL_SECONDS;
+            }
+            cfg->session_ttl_seconds = ttl;
+        }
+        else
+            log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
+    }
+    else if (strcmp(key, "debug") == 0)
+    {
+        /* Enables the per-event LOG_DEBUG firehose at runtime.
+         * Staged: applied only when the whole config is accepted. */
+        int on;
+        if (parse_bool(val, &on))
+        {
+            cfg->debug_set = 1;
+            cfg->debug = on;
+        }
+        else
+            log_msg(LOG_ERR,
+                    "config_load: invalid debug value (yes|no): %s",
+                    val);
+    }
+    else if (strcmp(key, "notify_unsafe_allowlist") == 0)
+    {
+        int on;
+        if (parse_bool(val, &on))
+            cfg->notify_unsafe_allow = on;
+        else
+            log_msg(LOG_ERR,
+                    "config_load: invalid notify_unsafe_allowlist "
+                    "(yes|no): %s", val);
+    }
+    else if (strcmp(key, "notify_allowlist") == 0)
+    {
+        int on;
+        if (parse_bool(val, &on))
+            cfg->notify_allow = on;
+        else
+            log_msg(LOG_ERR,
+                    "config_load: invalid notify_allowlist (yes|no): %s",
+                    val);
+    }
+    else if (strcmp(key, "notify_denylist") == 0)
+    {
+        int on;
+        if (parse_bool(val, &on))
+            cfg->notify_deny = on;
+        else
+            log_msg(LOG_ERR,
+                    "config_load: invalid notify_denylist (yes|no): %s",
+                    val);
+    }
+    else if (strcmp(key, "notify_dedup_ttl") == 0)
+    {
+        /* Seconds an identical (list, binary, target) notification is
+         * suppressed; 0 notifies on every hit. */
+        int ttl;
+        if (parse_int_setting(val, &ttl))
+        {
+            if (ttl > FS_MAX_TTL_SECONDS)
+            {
+                log_msg(LOG_WARNING,
+                        "config_load: notify_dedup_ttl %d clamped to "
+                        "%d seconds", ttl, FS_MAX_TTL_SECONDS);
+                ttl = FS_MAX_TTL_SECONDS;
+            }
+            cfg->notify_dedup_seconds = ttl;
+        }
+        else
+            log_msg(LOG_ERR, "config_load: invalid notify_dedup_ttl: %s",
+                    val);
+    }
+    else if (strcmp(key, "notify_max") == 0)
+    {
+        /* Global cap per 60 s window; the dedup window bounds each
+         * key, this bounds a burst of distinct keys. */
+        int max;
+        if (parse_int_setting(val, &max) && max >= 1)
+            cfg->notify_max = max;
+        else
+            log_msg(LOG_ERR, "config_load: invalid notify_max (>= 1): %s",
+                    val);
+    }
+    else
+    {
+        /* A typo'd key must be visible: silently ignoring it could
+         * leave a protection or notification toggle at its default
+         * while the admin believes it is set. */
+        log_msg(LOG_WARNING, "config_load: unknown setting: %s", key);
+    }
+}
+
 /* Sections of fileshield.conf; SECTION_NONE is "before/outside any". */
 enum
 {
@@ -627,78 +847,18 @@ int config_load(const char *path, Config *cfg)
 
         if (section == SECTION_PROTECTED)
         {
-            /*
-             * A leading '!' marks an exclusion: it protects nothing
-             * itself and removes matching paths from the protection of
-             * every positive entry (deny wins; config order is
-             * irrelevant).  '!' elsewhere is an ordinary path
-             * character.  Both positives and exclusions must be
-             * absolute after '~' expansion: a relative path can never
-             * match a canonical target, so it is rejected with a log
-             * (fail closed) rather than silently protecting nothing.
-             */
-            const char *raw = s;
-            int is_exclude = 0;
-            if (raw[0] == '!')
+            if (add_protected_entry(cfg, s) < 0)
             {
-                is_exclude = 1;
-                raw = trim(s + 1);
-                if (*raw == '\0')
-                {
-                    log_msg(LOG_ERR, "config_load: empty exclusion: %s", s);
-                    continue;
-                }
-            }
-
-            /* Expand ~/... for every user in /etc/passwd so that each
-             * user's home directory is protected, not just root's. */
-            char **paths = expand_home_all_users(raw);
-            if (!paths)
-            {
-                log_msg(LOG_ERR, "config_load: out of memory");
                 fclose(fp);
                 return -1;
             }
-            for (int pi = 0; paths[pi] != NULL; pi++)
-            {
-                if (cfg->protected_count >= MAX_PATHS)
-                {
-                    /* Refuse the whole config: truncating the protection
-                     * list would silently leave the dropped paths
-                     * unmarked and unwatched.  A '~/...' line expands once
-                     * per real user, so multi-user machines reach this
-                     * sooner than the line count suggests. */
-                    log_msg(LOG_ERR,
-                            "config_load: too many protected paths (max %d); "
-                            "refusing the config (note: '~/...' expands once "
-                            "per real user)", MAX_PATHS);
-                    free_string_array(paths);
-                    fclose(fp);
-                    return -1;
-                }
-                ProtectedPath *pp = &cfg->protected[cfg->protected_count];
-                if (protected_path_set(pp, paths[pi]) < 0)
-                    continue; /* malformed or relative: rejected with a log */
-                pp->is_exclude = is_exclude;
-                if (is_exclude)
-                {
-                    cfg->exclude_idx[cfg->exclude_count] = cfg->protected_count;
-                    cfg->exclude_count++;
-                    /* Audit trail: every carve-out is visible in the journal. */
-                    log_msg(LOG_INFO, "config_load: exclusion: !%s", pp->path);
-                }
-                cfg->protected_count++;
-            }
-            free_string_array(paths);
         }
         else if (section == SECTION_ALLOWLIST)
         {
             /* [allowlist] "binary = target" or a bare binary (global). */
-            if (add_rule(cfg->allowlist, &cfg->allowlist_count, s) < 0)
+            if (load_rules(cfg->allowlist, &cfg->allowlist_count, "allowlist",
+                           s) < 0)
             {
-                log_msg(LOG_ERR,
-                        "config_load: cannot add to [allowlist] (out of "
-                        "memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }
@@ -707,11 +867,9 @@ int config_load(const char *path, Config *cfg)
         {
             /* [unsafe_allowlist]: same format as [allowlist], but grants
              * skip the binary hash pinning entirely. */
-            if (add_rule(cfg->unsafe_allowlist, &cfg->unsafe_allowlist_count, s) < 0)
+            if (load_rules(cfg->unsafe_allowlist, &cfg->unsafe_allowlist_count,
+                           "unsafe_allowlist", s) < 0)
             {
-                log_msg(LOG_ERR,
-                        "config_load: cannot add to [unsafe_allowlist] (out "
-                        "of memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }
@@ -723,137 +881,14 @@ int config_load(const char *path, Config *cfg)
             if (!eq)
                 continue;
             *eq = '\0';
-            const char *key = trim(s);
-            char *val = trim(eq + 1);
-            if (strcmp(key, "user_ttl") == 0)
-            {
-                /* 0 disables "Allow Once" caching: each open prompts again. */
-                int ttl;
-                if (parse_int_setting(val, &ttl))
-                {
-                    if (ttl > FS_MAX_TTL_SECONDS)
-                    {
-                        log_msg(LOG_WARNING,
-                                "config_load: user_ttl %d clamped to %d seconds",
-                                ttl, FS_MAX_TTL_SECONDS);
-                        ttl = FS_MAX_TTL_SECONDS;
-                    }
-                    cfg->user_ttl_seconds = ttl;
-                }
-                else
-                    log_msg(LOG_ERR, "config_load: invalid user_ttl: %s", val);
-            }
-            else if (strcmp(key, "session_ttl") == 0)
-            {
-                /* 0 is a valid value: session decisions then live exactly
-                 * as long as the session leader (the shell). */
-                int ttl;
-                if (parse_int_setting(val, &ttl))
-                {
-                    if (ttl > FS_MAX_TTL_SECONDS)
-                    {
-                        log_msg(LOG_WARNING,
-                                "config_load: session_ttl %d clamped to %d seconds",
-                                ttl, FS_MAX_TTL_SECONDS);
-                        ttl = FS_MAX_TTL_SECONDS;
-                    }
-                    cfg->session_ttl_seconds = ttl;
-                }
-                else
-                    log_msg(LOG_ERR, "config_load: invalid session_ttl: %s", val);
-            }
-            else if (strcmp(key, "debug") == 0)
-            {
-                /* Enables the per-event LOG_DEBUG firehose at runtime.
-                 * Staged: applied only when the whole config is accepted. */
-                int on;
-                if (parse_bool(val, &on))
-                {
-                    cfg->debug_set = 1;
-                    cfg->debug = on;
-                }
-                else
-                    log_msg(LOG_ERR,
-                            "config_load: invalid debug value (yes|no): %s",
-                            val);
-            }
-            else if (strcmp(key, "notify_unsafe_allowlist") == 0)
-            {
-                int on;
-                if (parse_bool(val, &on))
-                    cfg->notify_unsafe_allow = on;
-                else
-                    log_msg(LOG_ERR,
-                            "config_load: invalid notify_unsafe_allowlist "
-                            "(yes|no): %s", val);
-            }
-            else if (strcmp(key, "notify_allowlist") == 0)
-            {
-                int on;
-                if (parse_bool(val, &on))
-                    cfg->notify_allow = on;
-                else
-                    log_msg(LOG_ERR,
-                            "config_load: invalid notify_allowlist (yes|no): %s",
-                            val);
-            }
-            else if (strcmp(key, "notify_denylist") == 0)
-            {
-                int on;
-                if (parse_bool(val, &on))
-                    cfg->notify_deny = on;
-                else
-                    log_msg(LOG_ERR,
-                            "config_load: invalid notify_denylist (yes|no): %s",
-                            val);
-            }
-            else if (strcmp(key, "notify_dedup_ttl") == 0)
-            {
-                /* Seconds an identical (list, binary, target) notification is
-                 * suppressed; 0 notifies on every hit. */
-                int ttl;
-                if (parse_int_setting(val, &ttl))
-                {
-                    if (ttl > FS_MAX_TTL_SECONDS)
-                    {
-                        log_msg(LOG_WARNING,
-                                "config_load: notify_dedup_ttl %d clamped to "
-                                "%d seconds", ttl, FS_MAX_TTL_SECONDS);
-                        ttl = FS_MAX_TTL_SECONDS;
-                    }
-                    cfg->notify_dedup_seconds = ttl;
-                }
-                else
-                    log_msg(LOG_ERR, "config_load: invalid notify_dedup_ttl: %s",
-                            val);
-            }
-            else if (strcmp(key, "notify_max") == 0)
-            {
-                /* Global cap per 60 s window; the dedup window bounds each
-                 * key, this bounds a burst of distinct keys. */
-                int max;
-                if (parse_int_setting(val, &max) && max >= 1)
-                    cfg->notify_max = max;
-                else
-                    log_msg(LOG_ERR, "config_load: invalid notify_max (>= 1): %s",
-                            val);
-            }
-            else
-            {
-                /* A typo'd key must be visible: silently ignoring it could
-                 * leave a protection or notification toggle at its default
-                 * while the admin believes it is set. */
-                log_msg(LOG_WARNING, "config_load: unknown setting: %s", key);
-            }
+            apply_setting(cfg, trim(s), trim(eq + 1));
         }
         else if (section == SECTION_DENYLIST)
         {
             /* [denylist] "binary = target" or a bare binary (global). */
-            if (add_rule(cfg->denylist, &cfg->denylist_count, s) < 0)
+            if (load_rules(cfg->denylist, &cfg->denylist_count, "denylist",
+                           s) < 0)
             {
-                log_msg(LOG_ERR,
-                        "config_load: cannot add to [denylist] (out of "
-                        "memory or rule cap reached); refusing the config");
                 fclose(fp);
                 return -1;
             }
