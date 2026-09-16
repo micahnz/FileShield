@@ -1237,6 +1237,41 @@ static void test_rule_expansion_with_globs(void)
     free(path);
 }
 
+/*
+ * The shipped fileshield.conf is the default every install gets.  Keep it
+ * consistent with its documented contract (the rule sections are empty:
+ * every rule is an explicit opt-in) and within the hard limits.  Guards
+ * against silent default drift.
+ */
+static void test_shipped_config_contract(void)
+{
+    const char *path = "fileshield.conf";
+    Config cfg;
+
+    if (access(path, R_OK) != 0)
+        path = "../fileshield.conf"; /* running from tests/ or obj/ */
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "shipped fileshield.conf parses");
+
+    ASSERT(cfg.allowlist_count == 0,
+           "shipped [allowlist] is empty (documented opt-in default)");
+    ASSERT(cfg.unsafe_allowlist_count == 0,
+           "shipped [unsafe_allowlist] is empty");
+    ASSERT(cfg.denylist_count == 0, "shipped [denylist] is empty");
+
+    ASSERT(cfg.protected_count > 0, "shipped config protects paths");
+    ASSERT(cfg.protected_count <= MAX_PATHS, "shipped config within MAX_PATHS");
+    ASSERT(cfg.user_ttl_seconds == 300, "shipped user_ttl is 300");
+    ASSERT(cfg.session_ttl_seconds == 0, "shipped session_ttl is 0");
+    ASSERT(cfg.notify_unsafe_allow == 1,
+           "shipped notify_unsafe_allowlist is on");
+    ASSERT(cfg.notify_allow == 0, "shipped notify_allowlist is off");
+    ASSERT(cfg.notify_deny == 1, "shipped notify_denylist is on");
+
+    config_reset(&cfg);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -1271,6 +1306,7 @@ int main(void)
     test_target_trailing_slash();
     test_scoped_missing_target();
     test_config_load_does_not_publish_global();
+    test_shipped_config_contract();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);
