@@ -44,7 +44,7 @@ static int g_fan_fd = -1;
  *
  * Deliberately NOT forwarded:
  *   - DISPLAY / WAYLAND_DISPLAY / XAUTHORITY / DBUS_SESSION_BUS_ADDRESS:
- *     the prompt must stay on the display FileShield detected, never one
+ *     the prompt must stay on the display Fileshield detected, never one
  *     a malicious process points at.
  *   - LD_* / PATH / QT_PLUGIN_PATH / QT_QPA_PLATFORM*: no code loading or
  *     platform override.
@@ -498,7 +498,7 @@ static int run_kdialog(const DisplaySession *session,
 
         execl("/usr/bin/timeout", "timeout", "30",
               "/usr/bin/kdialog", "kdialog",
-              "--title", "FileShield",
+              "--title", "Fileshield",
               "--yesnocancel", text,
               "--yes-label", yes_label,
               "--no-label", no_label,
@@ -806,5 +806,112 @@ int notify_ask(const NotifyRequest *req)
                               req->pid, req->session_ttl);
 
     log_msg(LOG_WARNING, "[dialog] no valid kdialog choice; denying once");
+    return NOTIFY_DENY;
+}
+
+/*
+ * Prompt for a changed [allowlist] binary hash.  One decision only:
+ * Yes = "Update & Allow" (the caller persists new_hash and grants the
+ * access), No/Cancel/window close/timeout/failure = deny this attempt
+ * with the old pin kept.  The two-stage grant flow is deliberately not
+ * involved: the change already names one rule, one binary and one file.
+ *
+ * Rate limiting is the caller's job (see notify.h): the pipeline must
+ * reject dialog_rate_limited() binaries before calling so a tampered
+ * binary cannot flood prompts.
+ */
+int notify_ask_hash_change(const NotifyHashChange *req)
+{
+    if (!req)
+        return NOTIFY_DENY;
+
+    char rule[512];
+    char exe[512];
+    char cmd[256];
+    char path[512];
+    char old_hash[64];
+    char new_hash[64];
+    char body[4096];
+
+    /* Sanitized, bounded copies: even the rule pattern and the digests
+     * are treated as untrusted so control characters cannot forge dialog
+     * lines. */
+    sanitize_text(req->rule_pattern, rule, sizeof(rule));
+    sanitize_text(req->exe && req->exe[0] != '\0' ? req->exe : "(unknown)",
+                  exe, sizeof(exe));
+    sanitize_text(req->path, path, sizeof(path));
+    sanitize_text(req->cmdline && req->cmdline[0] != '\0' ? req->cmdline
+                                                          : "(unknown)",
+                  cmd, sizeof(cmd));
+    sanitize_text(req->old_hash && req->old_hash[0] != '\0' ? req->old_hash
+                                                            : "(unknown)",
+                  old_hash, sizeof(old_hash));
+    sanitize_text(req->new_hash && req->new_hash[0] != '\0' ? req->new_hash
+                                                            : "(unknown)",
+                  new_hash, sizeof(new_hash));
+
+    if (req->rule_pattern && strlen(req->rule_pattern) >= sizeof(rule) - 1)
+        memcpy(rule + sizeof(rule) - 4, "...", 4);
+    if (req->exe && strlen(req->exe) >= sizeof(exe) - 1)
+        memcpy(exe + sizeof(exe) - 4, "...", 4);
+    if (req->path && strlen(req->path) >= sizeof(path) - 1)
+        memcpy(path + sizeof(path) - 4, "...", 4);
+    if (req->cmdline && strlen(req->cmdline) >= sizeof(cmd) - 1)
+        memcpy(cmd + sizeof(cmd) - 4, "...", 4);
+
+    /* Full digests are journal-logged by the caller; the prompt shows
+     * only the 16-hex prefixes a human can compare at a glance. */
+    snprintf(body, sizeof(body),
+             "SHA-512 changed for allowlist rule:\n"
+             "%s\n\n"
+             "Binary:   %s\n"
+             "Target:   %s\n"
+             "Command:  %s\n\n"
+             "Old SHA-512: %.16s\xe2\x80\xa6\n"
+             "New SHA-512: %.16s\xe2\x80\xa6\n\n"
+             "Update & Allow trusts the new binary and records the new "
+             "hash.\n"
+             "Deny / Cancel blocks this attempt and keeps the old hash.",
+             rule, exe, path, cmd, old_hash, new_hash);
+
+    DisplaySession session;
+    int have_session = detect_display_session(req->user_uid, &session);
+    log_msg(LOG_DEBUG,
+            "[notify_hash_change] session: uid=%d wayland=%s display=%s",
+            (int)session.uid,
+            session.wayland_display[0] ? session.wayland_display : "(none)",
+            session.display[0] ? session.display : "(none)");
+
+    /* Never run a security prompt as a root GUI process. */
+    if (getuid() == 0 && !have_session)
+    {
+        log_msg(LOG_ERR,
+                "no non-root desktop session found; denying hash update "
+                "for %s",
+                exe);
+        return NOTIFY_DENY;
+    }
+
+    /* Cosmetic session variables only, same whitelist as notify_ask(). */
+    DialogEnvSetting dialog_env[DIALOG_ENV_MAX];
+    int dialog_env_count = collect_dialog_env(req->pid, dialog_env,
+                                              DIALOG_ENV_MAX);
+    log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
+            dialog_env_count);
+
+    int r = run_kdialog(&session, dialog_env, dialog_env_count, body,
+                        "Update & Allow", "Deny", "Cancel");
+    if (r == 0)
+    {
+        log_msg(LOG_WARNING,
+                "hash change approved for allowlist rule %s (%s); "
+                "new hash pinned by caller",
+                rule, exe);
+        return NOTIFY_ALLOW_ALWAYS;
+    }
+
+    log_msg(LOG_WARNING,
+            "hash change denied for allowlist rule %s (%s); old pin kept",
+            rule, exe);
     return NOTIFY_DENY;
 }

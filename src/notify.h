@@ -32,12 +32,44 @@ typedef struct
 } NotifyRequest;
 
 /*
+ * One hash-change prompt: an [allowlist] rule matched but the requester's
+ * binary no longer matches the pinned SHA-512.  Strings are borrowed from
+ * the caller for the duration of the call; notify_ask_hash_change()
+ * sanitizes and bounds them before they reach kdialog.
+ *
+ * The caller owns dialog rate limiting: this prompt must never be
+ * reachable for a binary that dialog_rate_limited() would reject (same
+ * contract as notify_ask()).
+ */
+typedef struct
+{
+    const char *rule_pattern; /* canonical rule binary pattern (pin key)  */
+    const char *exe;          /* concrete binary path                     */
+    const char *old_hash;     /* pinned SHA-512 hex digest                */
+    const char *new_hash;     /* freshly computed SHA-512 hex digest      */
+    const char *path;         /* target file                              */
+    const char *cmdline;      /* display command line; "" = unknown       */
+    pid_t pid;
+    uid_t user_uid;           /* real uid of the requester                */
+} NotifyHashChange;
+
+/*
  * Store the fanotify fd so notify_ask() can pump pending events while the
  * dialog child is running (prevents dialog deadlock on mount-marked FSes).
  */
 void notify_set_fan_fd(int fd);
 
 int notify_ask(const NotifyRequest *req);
+
+/*
+ * Ask the user whether a changed [allowlist] binary hash may replace the
+ * pinned value.  Yes = "Update & Allow" -> NOTIFY_ALLOW_ALWAYS (the caller
+ * persists the new hash and grants this access); No, Cancel, window close,
+ * timeout, kdialog failure and a NULL req all return NOTIFY_DENY with the
+ * old pin untouched.  Refuses to prompt without a non-root desktop
+ * session, mirroring notify_ask() (fail closed).
+ */
+int notify_ask_hash_change(const NotifyHashChange *req);
 
 /* Human-readable name of a NOTIFY_* decision code ("Allow Once"). */
 const char *notify_decision_name(int decision);

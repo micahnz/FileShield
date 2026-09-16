@@ -5,7 +5,7 @@
 #include <sys/types.h>
 
 #define MAX_PATHS 1024
-#define MAX_RULES 128 /* per section: [allowlist] and [denylist] */
+#define MAX_RULES 128 /* per section: [allowlist], [unsafe_allowlist], [denylist] */
 
 /*
  * One [protected_paths] entry.  Exact entries keep the historical
@@ -22,16 +22,28 @@ typedef struct
 } ProtectedPath;
 
 /*
- * One [allowlist] or [denylist] line: a binary optionally scoped to a
- * target file or directory.  An empty target_path means the rule is
- * global: it covers every protected path the binary touches.  A binary
- * may appear on multiple lines with different targets when it needs
- * exceptions for more than one file or folder.
+ * One [allowlist], [unsafe_allowlist] or [denylist] line: a binary
+ * optionally scoped to a target file or directory.  An empty target_path
+ * means the rule is global: it covers every protected path the binary
+ * touches.  A binary may appear on multiple lines with different targets
+ * when it needs exceptions for more than one file or folder.
+ *
+ * Either side may be a glob ('*' / '**', same engine as [protected_paths]):
+ * the stored path is the canonical wildcard-free base followed by the
+ * verbatim suffix, with the base length recorded in *_base_len.  Exact
+ * sides keep their historical semantics — binary by strcmp, target by
+ * path_under() (equal or under) — and carry is_glob = 0 with
+ * base_len = strlen(path).  A global rule has an empty target_path with
+ * target_base_len 0.
  */
 typedef struct
 {
     char binary[PATH_MAX];
     char target_path[PATH_MAX];
+    int binary_is_glob;
+    int binary_base_len; /* wildcard-free prefix length; strlen(binary) when exact */
+    int target_is_glob;
+    int target_base_len; /* wildcard-free prefix length; strlen(target_path) when exact, 0 when global */
 } RuleEntry;
 
 typedef struct
@@ -42,6 +54,8 @@ typedef struct
     int exclude_idx[MAX_PATHS]; /* protected[] indexes of the exclusions      */
     RuleEntry allowlist[MAX_RULES];
     int allowlist_count;
+    RuleEntry unsafe_allowlist[MAX_RULES];
+    int unsafe_allowlist_count;
     RuleEntry denylist[MAX_RULES];
     int denylist_count;
     int user_ttl_seconds;    /* "Allow Once" TTL; 0 = not cached (the shipped

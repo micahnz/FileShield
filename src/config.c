@@ -69,6 +69,127 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
 }
 
 /*
+ * rule_pattern_set: canonicalize one path-or-glob pattern into out,
+ * recording whether it is a glob and the length of its wildcard-free
+ * base.  Shared by [protected_paths] entries and both sides of every
+ * rule, so all three accept the same syntax and fail the same way.
+ *
+ * Exact patterns keep the historical behavior: the whole path is
+ * canonicalized.
+ *
+ * Glob patterns are split at the first wildcard segment.  Only the
+ * wildcard-free base is canonicalized (so symlinked homes still match
+ * the canonical /proc/self/fd target paths); the suffix is matched
+ * verbatim by glob_match_path().  A malformed pattern — relative, no
+ * static base, '..', an empty segment ("//" or a trailing slash) — is
+ * rejected.  Fail closed: a typo'd pattern must never silently match
+ * nothing.
+ *
+ * Returns 0 on success, -1 when the pattern is rejected.
+ */
+static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
+                            int *base_len, const char *raw)
+{
+    if (strchr(raw, '*') == NULL)
+    {
+        canonicalize_path(raw, out, outsz);
+        *is_glob = 0;
+        *base_len = (int)strlen(out);
+        return 0;
+    }
+
+    if (raw[0] != '/')
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern must be absolute: %s", raw);
+        return -1;
+    }
+
+    int blen = glob_base_len(raw);
+    if (blen <= 0)
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern has no static base: %s", raw);
+        return -1;
+    }
+    if (blen >= PATH_MAX)
+    {
+        log_msg(LOG_ERR, "config_load: glob base too long: %s", raw);
+        return -1;
+    }
+
+    char base[PATH_MAX];
+    memcpy(base, raw, (size_t)blen);
+    base[blen] = '\0';
+
+    const char *suffix = raw + blen;
+    if (*suffix != '/')
+    {
+        log_msg(LOG_ERR, "config_load: malformed glob pattern: %s", raw);
+        return -1;
+    }
+
+    /* Suffix segments must be non-empty and free of "..". */
+    for (const char *p = suffix + 1;;)
+    {
+        const char *end = strchr(p, '/');
+        size_t seglen = end ? (size_t)(end - p) : strlen(p);
+        if (seglen == 0)
+        {
+            log_msg(LOG_ERR, "config_load: empty segment in glob pattern: %s", raw);
+            return -1;
+        }
+        if (seglen == 2 && p[0] == '.' && p[1] == '.')
+        {
+            log_msg(LOG_ERR, "config_load: '..' not allowed in glob pattern: %s", raw);
+            return -1;
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+
+    char base_canon[PATH_MAX];
+    canonicalize_path(base, base_canon, sizeof(base_canon));
+
+    size_t canon_len = strlen(base_canon);
+    size_t suffix_len = strlen(suffix);
+
+    /* An unresolvable ".." in the base yields a pattern no canonical
+     * target can ever match; reject it rather than match nothing. */
+    if (strstr(base_canon, "/../") != NULL ||
+        (canon_len > 3 && strcmp(base_canon + canon_len - 3, "/..") == 0) ||
+        strcmp(base_canon, "/..") == 0)
+    {
+        log_msg(LOG_ERR, "config_load: unresolvable '..' in glob base: %s", raw);
+        return -1;
+    }
+
+    if (canon_len + suffix_len >= outsz)
+    {
+        log_msg(LOG_ERR, "config_load: glob pattern too long: %s", raw);
+        return -1;
+    }
+
+    if (canon_len == 1 && base_canon[0] == '/')
+    {
+        memcpy(out, suffix, suffix_len + 1);
+    }
+    else
+    {
+        memcpy(out, base_canon, canon_len);
+        memcpy(out + canon_len, suffix, suffix_len + 1);
+    }
+
+    *is_glob = 1;
+    *base_len = (int)canon_len;
+
+    if (canon_len == 1)
+        log_msg(LOG_WARNING,
+                "config_load: glob pattern based at / can be expensive to walk: %s",
+                raw);
+    return 0;
+}
+
+/*
  * Count entries of a NULL-terminated string array.
  */
 static int string_array_len(char **arr)
@@ -80,9 +201,12 @@ static int string_array_len(char **arr)
     return n;
 }
 
-/* Append one parsed rule to a section array (shared per-section cap). */
-static void rule_append(RuleEntry *rules, int *count,
-                        const char *binary, const char *target)
+/*
+ * Append one prepared rule to a section array.  The entry is already
+ * canonicalized and bounds-checked by rule_pattern_set(), so this is a
+ * plain copy past the shared per-section cap.
+ */
+static void rule_append(RuleEntry *rules, int *count, const RuleEntry *e)
 {
     if (*count >= MAX_RULES)
     {
@@ -90,18 +214,24 @@ static void rule_append(RuleEntry *rules, int *count,
                 MAX_RULES);
         return;
     }
-    RuleEntry *e = &rules[*count];
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    rules[*count] = *e;
     (*count)++;
 }
 
 /*
- * add_rule: parse one [allowlist]/[denylist] line and append the resulting
- * rule(s).  Format:
+ * add_rule: parse one [allowlist]/[unsafe_allowlist]/[denylist] line and
+ * append the resulting rule(s).  Format:
  *
  *   /path/to/bin = /path/to/target   scoped rule (equal-or-under match)
  *   /path/to/bin                     global rule (no '=' separator)
+ *
+ * Either side may be a glob ('*' / '**', the [protected_paths] engine).
+ * Both sides are validated and canonicalized by rule_pattern_set(): the
+ * wildcard-free base is canonicalized and the suffix kept verbatim.
+ * Exact binaries match by strcmp and exact targets by path_under()
+ * (equal or under) at event time; globs are matched full-path by
+ * glob_match_path() in fanotify.c.  Malformed patterns skip that
+ * expanded copy with a log (fail closed).
  *
  * Both sides expand '~' for every real user, mirroring [protected_paths].
  * When both sides expand, entry i pairs user i's binary with user i's
@@ -199,15 +329,20 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
             continue;
         }
 
-        char bin_canon[PATH_MAX];
-        char tgt_canon[PATH_MAX];
-        canonicalize_path(bpath, bin_canon, sizeof(bin_canon));
+        RuleEntry e;
+        memset(&e, 0, sizeof(e));
+        if (rule_pattern_set(e.binary, sizeof(e.binary), &e.binary_is_glob,
+                             &e.binary_base_len, bpath) < 0)
+            continue; /* malformed glob: rejected with a log */
         if (tpath[0] != '\0')
-            canonicalize_path(tpath, tgt_canon, sizeof(tgt_canon));
-        else
-            tgt_canon[0] = '\0';
+        {
+            if (rule_pattern_set(e.target_path, sizeof(e.target_path),
+                                 &e.target_is_glob, &e.target_base_len,
+                                 tpath) < 0)
+                continue;
+        }
 
-        rule_append(rules, count, bin_canon, tgt_canon);
+        rule_append(rules, count, &e);
     }
 
     free_string_array(bins);
@@ -217,121 +352,18 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
 }
 
 /*
- * protected_path_set: canonicalize one [protected_paths] entry into pp.
- *
- * Exact entries keep the historical behavior: the whole path is
- * canonicalized.
- *
- * Glob entries are split at the first wildcard segment.  Only the
- * wildcard-free base is canonicalized (so symlinked homes still match
- * the canonical /proc/self/fd target paths); the suffix is matched
- * verbatim by glob_match_path().  A malformed suffix — '..', an empty
- * segment ("//" or a trailing slash) — rejects the whole entry.  Fail
- * closed: a typo'd pattern must never silently protect nothing.
+ * protected_path_set: canonicalize one [protected_paths] entry into pp
+ * via the shared rule_pattern_set() validator (rules accept the same
+ * pattern syntax, so both share one implementation).  Exact entries
+ * keep the historical behavior; malformed globs are rejected.
  *
  * Returns 0 on success, -1 when the entry is rejected.
  */
 static int protected_path_set(ProtectedPath *pp, const char *raw)
 {
     memset(pp, 0, sizeof(*pp));
-
-    if (strchr(raw, '*') == NULL)
-    {
-        canonicalize_path(raw, pp->path, sizeof(pp->path));
-        pp->is_glob = 0;
-        pp->base_len = (int)strlen(pp->path);
-        return 0;
-    }
-
-    if (raw[0] != '/')
-    {
-        log_msg(LOG_ERR, "config_load: glob pattern must be absolute: %s", raw);
-        return -1;
-    }
-
-    int blen = glob_base_len(raw);
-    if (blen <= 0)
-    {
-        log_msg(LOG_ERR, "config_load: glob pattern has no static base: %s", raw);
-        return -1;
-    }
-    if (blen >= PATH_MAX)
-    {
-        log_msg(LOG_ERR, "config_load: glob base too long: %s", raw);
-        return -1;
-    }
-
-    char base[PATH_MAX];
-    memcpy(base, raw, (size_t)blen);
-    base[blen] = '\0';
-
-    const char *suffix = raw + blen;
-    if (*suffix != '/')
-    {
-        log_msg(LOG_ERR, "config_load: malformed glob pattern: %s", raw);
-        return -1;
-    }
-
-    /* Suffix segments must be non-empty and free of "..". */
-    for (const char *p = suffix + 1;;)
-    {
-        const char *end = strchr(p, '/');
-        size_t seglen = end ? (size_t)(end - p) : strlen(p);
-        if (seglen == 0)
-        {
-            log_msg(LOG_ERR, "config_load: empty segment in glob pattern: %s", raw);
-            return -1;
-        }
-        if (seglen == 2 && p[0] == '.' && p[1] == '.')
-        {
-            log_msg(LOG_ERR, "config_load: '..' not allowed in glob pattern: %s", raw);
-            return -1;
-        }
-        if (!end)
-            break;
-        p = end + 1;
-    }
-
-    char base_canon[PATH_MAX];
-    canonicalize_path(base, base_canon, sizeof(base_canon));
-
-    size_t base_len = strlen(base_canon);
-    size_t suffix_len = strlen(suffix);
-
-    /* An unresolvable ".." in the base yields a pattern no canonical
-     * target can ever match; reject it rather than protect nothing. */
-    if (strstr(base_canon, "/../") != NULL ||
-        (base_len > 3 && strcmp(base_canon + base_len - 3, "/..") == 0) ||
-        strcmp(base_canon, "/..") == 0)
-    {
-        log_msg(LOG_ERR, "config_load: unresolvable '..' in glob base: %s", raw);
-        return -1;
-    }
-
-    if (base_len + suffix_len >= sizeof(pp->path))
-    {
-        log_msg(LOG_ERR, "config_load: glob pattern too long: %s", raw);
-        return -1;
-    }
-
-    if (base_len == 1 && base_canon[0] == '/')
-    {
-        memcpy(pp->path, suffix, suffix_len + 1);
-    }
-    else
-    {
-        memcpy(pp->path, base_canon, base_len);
-        memcpy(pp->path + base_len, suffix, suffix_len + 1);
-    }
-
-    pp->is_glob = 1;
-    pp->base_len = (int)base_len;
-
-    if (pp->base_len == 1)
-        log_msg(LOG_WARNING,
-                "config_load: glob pattern based at / can be expensive to walk: %s",
-                raw);
-    return 0;
+    return rule_pattern_set(pp->path, sizeof(pp->path), &pp->is_glob,
+                            &pp->base_len, raw);
 }
 
 /* Sections of fileshield.conf; SECTION_NONE is "before/outside any". */
@@ -341,7 +373,8 @@ enum
     SECTION_PROTECTED,
     SECTION_ALLOWLIST,
     SECTION_SETTINGS,
-    SECTION_DENYLIST
+    SECTION_DENYLIST,
+    SECTION_UNSAFE_ALLOWLIST
 };
 
 int config_load(const char *path, Config *cfg)
@@ -404,6 +437,8 @@ int config_load(const char *path, Config *cfg)
                 section = SECTION_PROTECTED;
             else if (strcmp(s + 1, "allowlist") == 0)
                 section = SECTION_ALLOWLIST;
+            else if (strcmp(s + 1, "unsafe_allowlist") == 0)
+                section = SECTION_UNSAFE_ALLOWLIST;
             else if (strcmp(s + 1, "settings") == 0)
                 section = SECTION_SETTINGS;
             else if (strcmp(s + 1, "denylist") == 0)
@@ -477,6 +512,17 @@ int config_load(const char *path, Config *cfg)
         {
             /* [allowlist] "binary = target" or a bare binary (global). */
             if (add_rule(cfg->allowlist, &cfg->allowlist_count, s) < 0)
+            {
+                log_msg(LOG_ERR, "config_load: out of memory");
+                fclose(fp);
+                return -1;
+            }
+        }
+        else if (section == SECTION_UNSAFE_ALLOWLIST)
+        {
+            /* [unsafe_allowlist]: same format as [allowlist], but grants
+             * skip the binary hash pinning entirely. */
+            if (add_rule(cfg->unsafe_allowlist, &cfg->unsafe_allowlist_count, s) < 0)
             {
                 log_msg(LOG_ERR, "config_load: out of memory");
                 fclose(fp);

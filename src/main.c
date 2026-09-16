@@ -15,6 +15,7 @@
 #include "fanotify.h"
 #include "notify.h"
 #include "persist.h"
+#include "pin.h"
 
 #define DEFAULT_CONFIG "/etc/fileshield.conf"
 #define DEFAULT_TTL 300
@@ -145,6 +146,17 @@ static void load_persisted_state(void)
 }
 
 /*
+ * Load the [allowlist] hash pins (startup and every reload).  A missing
+ * file is normal first use; a damaged or unreadable one is logged by
+ * pin.c and leaves the table untrusted (fail closed), so the ignored
+ * return value needs no special handling here.
+ */
+static void load_pin_state(void)
+{
+    pin_load(PIN_STATE_FILE);
+}
+
+/*
  * Re-register protection after SIGHUP: parse the new config, replace the
  * marks, and roll back to the previous mark set if the new one cannot be
  * installed completely.  Returns 0 to continue, -1 when the daemon must
@@ -160,6 +172,7 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     {
         log_msg(LOG_ERR, "out of memory during reload, keeping old config");
         load_persisted_state();
+        load_pin_state();
         cache_expire();
         return 0;
     }
@@ -169,6 +182,7 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         log_msg(LOG_ERR, "config reload failed, keeping old config");
         free(new_cfg);
         load_persisted_state();
+        load_pin_state();
         cache_expire();
         return 0;
     }
@@ -212,6 +226,7 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         free(new_cfg);
 
         load_persisted_state();
+        load_pin_state();
         cache_expire();
         return g_fatal ? -1 : 0;
     }
@@ -226,6 +241,7 @@ static int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     g_config = *cfg;
 
     load_persisted_state();
+    load_pin_state();
     cache_expire();
     return 0;
 }
@@ -364,13 +380,16 @@ int main(int argc, char *argv[])
                 "direct mark)",
                 mark_skipped);
 
-    log_msg(LOG_INFO, "FileShield started, watching %d paths (%d exclusions)",
+    log_msg(LOG_INFO, "Fileshield started, watching %d paths (%d exclusions)",
             cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
 
     /* Load persisted "Always Allow"/"Always Deny" entries from the
      * previous session.  A read error is treated as an empty list (fail
-     * secure). */
+     * secure).  The hash pins are loaded alongside so a file that is
+     * missing on first boot, or repaired/removed later, is picked up on
+     * SIGHUP as well. */
     load_persisted_state();
+    load_pin_state();
 
     while (g_running)
     {
@@ -381,7 +400,7 @@ int main(int argc, char *argv[])
             break;
     }
 
-    log_msg(LOG_INFO, "FileShield shutting down");
+    log_msg(LOG_INFO, "Fileshield shutting down");
     fanotify_flush_pending(fan_fd);
     close(fan_fd);
     config_reset(cfg);

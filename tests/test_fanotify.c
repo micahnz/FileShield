@@ -36,6 +36,8 @@
 #include "../src/fanotify.h"
 #include "../src/config.h"
 #include "../src/inode.h"
+#include "../src/notify.h"
+#include "../src/pin.h"
 #include "../src/sha512.h"
 #include "../src/utils.h"
 
@@ -303,6 +305,516 @@ static void test_exclusion_is_not_marked(void) {
     int rc = fanotify_add_protected(-1, &pp);
     ASSERT(rc == 0, "exclusion adds no mark (rc 0)");
     ASSERT(fanotify_any_mark_active() == 0, "exclusion adds no mark state");
+}
+
+/*
+ * Part 0h: config rule matching.  [allowlist], [unsafe_allowlist] and
+ * [denylist] accept globs on either side through the same engine as
+ * [protected_paths] (covered above).  Three seams expose the matcher
+ * without a kernel event:
+ *   - fanotify_test_config_allow_match(binary, target, &grant) returns
+ *     the matched LHS pattern (the hash-pin key) or NULL and reports
+ *     the grant scope (NULL for a global rule);
+ *   - fanotify_test_unsafe_allow_match() matches [unsafe_allowlist] only;
+ *   - fanotify_test_config_deny_match() returns the [denylist] verdict.
+ * Covers all four binary/target combinations, the exact-side regression
+ * guarantees (strcmp binary, equal-or-under target), glob boundaries and
+ * section independence.
+ */
+
+/* Build one rule side the way config_load() does: exact copy with
+ * base_len = strlen(); glob with the wildcard-free base length.  The
+ * patterns used here are already canonical, so no resolution is needed. */
+static void set_rule_side(char *dst, size_t dstsz, int *is_glob,
+                          int *base_len, const char *pattern)
+{
+    snprintf(dst, dstsz, "%s", pattern);
+    *is_glob = strchr(dst, '*') != NULL;
+    *base_len = *is_glob ? glob_base_len(dst) : (int)strlen(dst);
+}
+
+/* Fill one rule; a NULL/empty target leaves a global (bare-line) rule. */
+static void set_rule(RuleEntry *e, const char *binary, const char *target)
+{
+    memset(e, 0, sizeof(*e));
+    set_rule_side(e->binary, sizeof(e->binary), &e->binary_is_glob,
+                  &e->binary_base_len, binary);
+    if (target && target[0] != '\0')
+        set_rule_side(e->target_path, sizeof(e->target_path),
+                      &e->target_is_glob, &e->target_base_len, target);
+}
+
+static void test_config_rule_matching(void) {
+    static Config cfg;
+    const char *grant;
+    const char *m;
+
+    memset(&cfg, 0, sizeof(cfg));
+
+    /*
+     * [allowlist]
+     *   0 exact binary + exact target  (historical regression case)
+     *   1 glob binary  + exact target  (AppImage-style mount pattern)
+     *   2 exact binary + glob target
+     *   3 glob binary  + glob target
+     *   4 exact binary + global
+     *   5 glob binary  + global
+     */
+    set_rule(&cfg.allowlist[0], "/usr/bin/opencode", "/home/u/.local");
+    set_rule(&cfg.allowlist[1], "/tmp/.mount_*/openchamber",
+             "/home/u/.local/share/opencode");
+    set_rule(&cfg.allowlist[2], "/usr/bin/glob-target-tool",
+             "/home/u/.local/**");
+    set_rule(&cfg.allowlist[3], "/tmp/.mount_*/widget", "/srv/data/**");
+    set_rule(&cfg.allowlist[4], "/usr/bin/global-tool", NULL);
+    set_rule(&cfg.allowlist[5], "/opt/global_*/tool", NULL);
+    cfg.allowlist_count = 6;
+
+    /* [unsafe_allowlist]: separate section, never hash-pinned. */
+    set_rule(&cfg.unsafe_allowlist[0], "/opt/unsafe-tool", "/etc/unsafe");
+    set_rule(&cfg.unsafe_allowlist[1], "/opt/cache_*/plugin", NULL);
+    cfg.unsafe_allowlist_count = 2;
+
+    /* [denylist]: globs on both sides, no hashing involved. */
+    set_rule(&cfg.denylist[0], "/usr/bin/curl", NULL);
+    set_rule(&cfg.denylist[1], "/tmp/.mount_*/evil", "/etc/**");
+    cfg.denylist_count = 2;
+
+    Config *saved = g_config;
+    g_config = &cfg;
+
+    /* exact + exact: strcmp binary, equal-or-under target (regression) */
+    grant = NULL;
+    m = fanotify_test_config_allow_match("/usr/bin/opencode",
+                                         "/home/u/.local/share/x", &grant);
+    ASSERT(m != NULL && strcmp(m, "/usr/bin/opencode") == 0,
+           "exact+exact returns the configured binary pattern");
+    ASSERT(grant != NULL && strcmp(grant, "/home/u/.local") == 0,
+           "exact target is returned as the grant target");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/opencode",
+                                            "/home/u/.local", &grant) != NULL,
+           "exact target matches the target directory itself");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/opencode-helper",
+                                            "/home/u/.local/share/x",
+                                            &grant) == NULL,
+           "exact binary is strcmp-strict (no prefix match)");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/opencode",
+                                            "/home/u/.localX/y",
+                                            &grant) == NULL,
+           "exact target rejects a sibling prefix");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/opencode",
+                                            "/home/u/other", &grant) == NULL,
+           "exact target rejects an unrelated path");
+
+    /* glob binary + exact target */
+    grant = NULL;
+    m = fanotify_test_config_allow_match(
+            "/tmp/.mount_Ab3xY/openchamber",
+            "/home/u/.local/share/opencode/config.json", &grant);
+    ASSERT(m != NULL && strcmp(m, "/tmp/.mount_*/openchamber") == 0,
+           "glob binary returns the configured pattern (pin key)");
+    ASSERT(grant != NULL &&
+           strcmp(grant, "/home/u/.local/share/opencode") == 0,
+           "glob-binary rule keeps its exact grant target");
+    ASSERT(fanotify_test_config_allow_match(
+               "/tmp/.mount_Ab3xY/openchamber2",
+               "/home/u/.local/share/opencode/cfg", &grant) == NULL,
+           "glob binary rejects a different basename");
+    ASSERT(fanotify_test_config_allow_match(
+               "/var/.mount_Ab3xY/openchamber",
+               "/home/u/.local/share/opencode/cfg", &grant) == NULL,
+           "glob binary base prefilter rejects paths outside its base");
+
+    /* exact binary + glob target */
+    grant = NULL;
+    m = fanotify_test_config_allow_match("/usr/bin/glob-target-tool",
+                                         "/home/u/.local/share/x", &grant);
+    ASSERT(m != NULL && strcmp(m, "/usr/bin/glob-target-tool") == 0,
+           "exact binary + glob target matches the subtree");
+    ASSERT(grant != NULL && strcmp(grant, "/home/u/.local/**") == 0,
+           "glob target is returned verbatim as the grant target");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/glob-target-tool",
+                                            "/home/u/.local", &grant) != NULL,
+           "globstar target matches zero segments");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/glob-target-tool",
+                                            "/home/u/.localX/y",
+                                            &grant) == NULL,
+           "glob target base boundary is respected");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/glob-target-tool",
+                                            "/home/u/other/x",
+                                            &grant) == NULL,
+           "glob target rejects an unrelated path");
+
+    /* glob binary + glob target */
+    m = fanotify_test_config_allow_match("/tmp/.mount_q1/widget",
+                                         "/srv/data/a/b.json", &grant);
+    ASSERT(m != NULL && strcmp(m, "/tmp/.mount_*/widget") == 0,
+           "glob+glob rule matches on both sides");
+    ASSERT(fanotify_test_config_allow_match("/tmp/.mount_q1/sub/widget",
+                                            "/srv/data/a/b.json",
+                                            &grant) == NULL,
+           "single-star binary glob does not cross segments");
+    ASSERT(fanotify_test_config_allow_match("/tmp/.mount_q1/widget",
+                                            "/srv/dataX/a", &grant) == NULL,
+           "glob+glob target boundary is respected");
+
+    /* global rules report a NULL grant target (wildcard cache entry) */
+    grant = "sentinel";
+    m = fanotify_test_config_allow_match("/usr/bin/global-tool", "/etc/x",
+                                         &grant);
+    ASSERT(m != NULL && strcmp(m, "/usr/bin/global-tool") == 0,
+           "global exact rule matches any target");
+    ASSERT(grant == NULL, "global rule reports a NULL grant target");
+    grant = "sentinel";
+    m = fanotify_test_config_allow_match("/opt/global_42/tool", "/home/u/x",
+                                         &grant);
+    ASSERT(m != NULL && strcmp(m, "/opt/global_*/tool") == 0,
+           "global glob rule matches and returns its pattern");
+    ASSERT(grant == NULL, "global glob rule reports a NULL grant target");
+
+    /* [unsafe_allowlist] is a separate section from [allowlist] */
+    m = fanotify_test_unsafe_allow_match("/opt/unsafe-tool", "/etc/unsafe/x");
+    ASSERT(m != NULL && strcmp(m, "/opt/unsafe-tool") == 0,
+           "unsafe seam matches its own section");
+    ASSERT(fanotify_test_config_allow_match("/opt/unsafe-tool",
+                                            "/etc/unsafe/x",
+                                            &grant) == NULL,
+           "unsafe rule is invisible to the allow seam");
+    ASSERT(fanotify_test_unsafe_allow_match(
+               "/usr/bin/opencode", "/home/u/.local/share/x") == NULL,
+           "allowlist rule is invisible to the unsafe seam");
+    m = fanotify_test_unsafe_allow_match("/opt/cache_42/plugin", "/etc/x");
+    ASSERT(m != NULL && strcmp(m, "/opt/cache_*/plugin") == 0,
+           "unsafe seam is glob-capable and global");
+    ASSERT(fanotify_test_unsafe_allow_match("/opt/cache_42/plugin2",
+                                            "/etc/x") == NULL,
+           "unsafe glob binary is segment-bounded");
+
+    /* [denylist] through the deny seam; no hashing needed */
+    ASSERT(fanotify_test_config_deny_match("/usr/bin/curl",
+                                           "/etc/passwd") == 1,
+           "deny seam matches an exact global binary");
+    ASSERT(fanotify_test_config_deny_match("/usr/bin/curl2",
+                                           "/etc/passwd") == 0,
+           "deny seam keeps strcmp-strict exact binaries");
+    ASSERT(fanotify_test_config_deny_match("/tmp/.mount_ZZ/evil",
+                                           "/etc/passwd") == 1,
+           "deny seam matches glob binary + glob target");
+    ASSERT(fanotify_test_config_deny_match("/tmp/.mount_ZZ/good",
+                                           "/etc/passwd") == 0,
+           "deny glob binary rejects a different basename");
+    ASSERT(fanotify_test_config_deny_match("/tmp/.mount_ZZ/evil",
+                                           "/home/u/x") == 0,
+           "deny glob target rejects outside its subtree");
+    ASSERT(fanotify_test_config_allow_match("/usr/bin/curl", "/etc/passwd",
+                                            &grant) == NULL,
+           "deny rule is invisible to the allow seam");
+    ASSERT(fanotify_test_config_deny_match("/opt/unsafe-tool",
+                                           "/etc/unsafe/x") == 0,
+           "allow sections never appear in the deny seam");
+
+    g_config = saved;
+}
+
+/*
+ * Part 0i: [allowlist] hash pinning.  The pin module is controlled with
+ * a per-run temp state file; the seams below run the pipeline's verdict
+ * and first-seen store without a kernel permission event.
+ */
+
+#define PIN_SHA_A \
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define PIN_SHA_B \
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+static char g_pin_dir[256];
+static char g_pin_file[PATH_MAX + 64];
+static int g_pin_fixture_ready = 0;
+
+static int pin_fixture_init(void)
+{
+    if (g_pin_fixture_ready)
+        return 0;
+
+    snprintf(g_pin_dir, sizeof(g_pin_dir),
+             "/tmp/fileshield_fanotify_pin_XXXXXX");
+    if (!mkdtemp(g_pin_dir))
+        return -1;
+    snprintf(g_pin_file, sizeof(g_pin_file), "%s/allowlist-hashes.json",
+             g_pin_dir);
+    g_pin_fixture_ready = 1;
+    return 0;
+}
+
+/* Start from a missing state file (clean first use). */
+static int pin_fixture_reset(void)
+{
+    if (pin_fixture_init() < 0)
+        return -1;
+    unlink(g_pin_file);
+    pin_set_state_file(g_pin_file);
+    return pin_load(g_pin_file);
+}
+
+/* Install raw file content (used for the damaged-file case). */
+static int pin_fixture_write_raw(const char *text)
+{
+    FILE *fp;
+
+    if (pin_fixture_init() < 0)
+        return -1;
+    fp = fopen(g_pin_file, "w");
+    if (!fp)
+        return -1;
+    fputs(text, fp);
+    fclose(fp);
+    pin_set_state_file(g_pin_file);
+    return pin_load(g_pin_file);
+}
+
+static long read_pin_file(char *out, size_t sz)
+{
+    FILE *fp = fopen(g_pin_file, "r");
+    size_t n;
+
+    if (!fp)
+        return -1;
+    n = fread(out, 1, sz - 1, fp);
+    fclose(fp);
+    out[n] = '\0';
+    return (long)n;
+}
+
+static void pin_fixture_cleanup(void)
+{
+    if (!g_pin_fixture_ready)
+        return;
+    unlink(g_pin_file);
+    rmdir(g_pin_dir);
+    pin_set_state_file(NULL);
+    g_pin_fixture_ready = 0;
+}
+
+/* First event for a rule: store immediately, then the digest matches. */
+static void test_pin_first_seen_tofu(void)
+{
+    static Config cfg;
+    Config *saved = g_config;
+    char old[129];
+    struct stat st;
+
+    memset(&cfg, 0, sizeof(cfg));
+    set_rule(&cfg.allowlist[0], "/usr/bin/pinned-tool", "/home/u/secret");
+    cfg.allowlist_count = 1;
+    g_config = &cfg;
+
+    ASSERT(pin_fixture_reset() == 0, "missing pin file is a clean first use");
+    ASSERT(pin_damaged() == 0, "missing pin file is not damaged");
+
+    ASSERT(fanotify_test_pin_first_seen("/usr/bin/pinned-tool", PIN_SHA_A,
+                                        "/home/u/secret") == 0,
+           "first-seen store succeeds");
+
+    ASSERT(stat(g_pin_file, &st) == 0 && st.st_size > 0,
+           "pin file exists on disk immediately");
+    ASSERT(pin_load(g_pin_file) == 0, "freshly written pin file reloads");
+    ASSERT(pin_check("/usr/bin/pinned-tool", PIN_SHA_A, old) ==
+               PIN_CHECK_MATCH,
+           "pin_check matches the stored digest");
+    ASSERT(old[0] == '\0', "pin match leaves old_out empty");
+
+    /* With a pin present the pipeline takes the changed path instead. */
+    ASSERT(fanotify_test_pin_first_seen("/usr/bin/pinned-tool", PIN_SHA_B,
+                                        "/home/u/secret") == -1,
+           "first-seen seam refuses once a pin exists");
+    ASSERT(pin_check("/usr/bin/pinned-tool", PIN_SHA_A, old) ==
+               PIN_CHECK_MATCH,
+           "refused store left the existing pin untouched");
+
+    ASSERT(fanotify_test_pin_first_seen("/usr/bin/other", PIN_SHA_A,
+                                        "/home/u/secret") == -1,
+           "first-seen seam requires a matching allowlist rule");
+
+    g_config = saved;
+}
+
+/* Rule verdicts: no match, first use, match, changed, unavailable. */
+static void test_allowlist_pin_verdict_codes(void)
+{
+    static Config cfg;
+    Config *saved = g_config;
+    char old[129];
+
+    memset(&cfg, 0, sizeof(cfg));
+    set_rule(&cfg.allowlist[0], "/usr/bin/pinned-tool", "/home/u/secret");
+    cfg.allowlist_count = 1;
+    g_config = &cfg;
+
+    old[0] = 'x';
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/other", PIN_SHA_A,
+                                           "/home/u/secret", old) == 3,
+           "unmatched binary reports NO_MATCH");
+    ASSERT(old[0] == '\0', "NO_MATCH clears old_out");
+
+    /*
+     * First use: the pipeline stores the digest and grants, so the seam
+     * reports ALLOW; the verdict call itself must not write a pin.
+     */
+    ASSERT(pin_fixture_reset() == 0, "clean first-use state");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", PIN_SHA_A,
+                                           "/home/u/secret", old) == 0,
+           "first-use rule reports ALLOW");
+    ASSERT(pin_check("/usr/bin/pinned-tool", PIN_SHA_A, old) ==
+               PIN_CHECK_FIRST_USE,
+           "verdict is side-effect free (pin still absent)");
+
+    ASSERT(fanotify_test_pin_first_seen("/usr/bin/pinned-tool", PIN_SHA_A,
+                                        "/home/u/secret") == 0,
+           "store the pin for the match/change cases");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", PIN_SHA_A,
+                                           "/home/u/secret", old) == 0,
+           "matching pin reports ALLOW");
+    ASSERT(old[0] == '\0', "pin match leaves old_out empty");
+
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", PIN_SHA_B,
+                                           "/home/u/secret", old) == 1,
+           "changed digest reports CHANGED");
+    ASSERT(strcmp(old, PIN_SHA_A) == 0,
+           "CHANGED returns the previously pinned digest");
+    ASSERT(pin_check("/usr/bin/pinned-tool", PIN_SHA_A, old) ==
+               PIN_CHECK_MATCH,
+           "the CHANGED verdict did not touch the pin");
+
+    /* An accepted update (what the dialog path does on Yes) replaces the
+     * pin, and the next verdict is ALLOW again. */
+    ASSERT(pin_store("/usr/bin/pinned-tool", PIN_SHA_B) == 0,
+           "accepted update stores the new digest");
+    ASSERT(pin_check("/usr/bin/pinned-tool", PIN_SHA_B, old) ==
+               PIN_CHECK_MATCH,
+           "pin_check matches the new digest after the update");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", PIN_SHA_B,
+                                           "/home/u/secret", old) == 0,
+           "new digest reports ALLOW after the update");
+
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", "",
+                                           "/home/u/secret", old) == 2,
+           "empty digest reports NO_SILENT_GRANT");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", NULL,
+                                           "/home/u/secret", old) == 2,
+           "missing digest reports NO_SILENT_GRANT");
+
+    g_config = saved;
+}
+
+/* A damaged pin file fails closed and is never rewritten. */
+static void test_pin_damaged_falls_through(void)
+{
+    static Config cfg;
+    Config *saved = g_config;
+    char old[129];
+    char before[64];
+    char after[64];
+
+    memset(&cfg, 0, sizeof(cfg));
+    set_rule(&cfg.allowlist[0], "/usr/bin/pinned-tool", "/home/u/secret");
+    cfg.allowlist_count = 1;
+    g_config = &cfg;
+
+    ASSERT(pin_fixture_write_raw("this is not json\n") == -1,
+           "garbage pin file loads as damaged (fail closed)");
+    ASSERT(pin_damaged() == 1, "damaged flag is set");
+
+    ASSERT(read_pin_file(before, sizeof(before)) > 0,
+           "read the damaged file before the verdict calls");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", PIN_SHA_A,
+                                           "/home/u/secret", old) == 2,
+           "damaged table reports NO_SILENT_GRANT");
+    ASSERT(fanotify_test_allowlist_verdict("/usr/bin/pinned-tool", "",
+                                           "/home/u/secret", old) == 2,
+           "empty digest reports NO_SILENT_GRANT while damaged");
+    ASSERT(read_pin_file(after, sizeof(after)) > 0, "re-read the file");
+    ASSERT(strcmp(before, after) == 0,
+           "no pin write happened while the table was damaged");
+
+    ASSERT(pin_fixture_reset() == 0 && pin_damaged() == 0,
+           "a missing file reloads clean (admin recovery)");
+
+    g_config = saved;
+}
+
+/* The unsafe section wins over the pinned one and skips pin machinery. */
+static void test_unsafe_allowlist_skips_pins(void)
+{
+    static Config cfg;
+    Config *saved = g_config;
+    const char *pattern = "/tmp/.mount_*/opencode";
+    const char *grant = NULL;
+    const char *binary = "/tmp/.mount_abc/opencode";
+    const char *target = "/home/u/.local/share/x";
+    char old[129];
+
+    memset(&cfg, 0, sizeof(cfg));
+    /*
+     * The same binary pattern is deliberately present in both sections.
+     * This pins the matcher invariant that the unsafe path is independent
+     * of the safe section and never reads or writes a pin; the pipeline's
+     * unsafe-first order is enforced in event_runtime_allowed() and
+     * covered by the verdict seam tests.
+     */
+    set_rule(&cfg.unsafe_allowlist[0], pattern, "/home/u/.local");
+    cfg.unsafe_allowlist_count = 1;
+    set_rule(&cfg.allowlist[0], pattern, "/home/u/.local");
+    cfg.allowlist_count = 1;
+    g_config = &cfg;
+
+    ASSERT(pin_fixture_reset() == 0, "clean pin state for the order test");
+
+    ASSERT(fanotify_test_unsafe_allow_match(binary, target) != NULL,
+           "unsafe seam matches the rule shared by both sections");
+    ASSERT(fanotify_test_config_allow_match(binary, target, &grant) != NULL,
+           "the pinned seam would also match (unsafe wins by order)");
+
+    /* Nothing in the unsafe path reads or writes a pin, so the matching
+     * key is still unpinned while the safe seam only compares. */
+    ASSERT(pin_check(pattern, PIN_SHA_A, old) == PIN_CHECK_FIRST_USE,
+           "no pin was written for the unsafe hit");
+
+    g_config = saved;
+}
+
+/* The hash-change prompt must fail closed on a NULL request. */
+static void test_hash_change_null_request_denies(void)
+{
+    ASSERT(notify_ask_hash_change(NULL) == NOTIFY_DENY,
+           "NULL hash-change request denies (fail closed)");
+}
+
+/* A glob deny rule beats a glob allow rule (deny is evaluated first). */
+static void test_glob_deny_beats_glob_allow(void)
+{
+    static Config cfg;
+    Config *saved = g_config;
+    const char *grant = NULL;
+    const char *binary = "/tmp/.mount_abc/opencode";
+    const char *target = "/home/u/.local/share/opencode/x";
+
+    memset(&cfg, 0, sizeof(cfg));
+    set_rule(&cfg.allowlist[0], "/tmp/.mount_*/opencode", "/home/u/.local");
+    cfg.allowlist_count = 1;
+    set_rule(&cfg.denylist[0], "/tmp/.mount_*/open*", "/home/u/.local/**");
+    cfg.denylist_count = 1;
+    g_config = &cfg;
+
+    ASSERT(fanotify_test_config_deny_match(binary, target) == 1,
+           "glob deny rule matches the access");
+    ASSERT(fanotify_test_config_allow_match(binary, target, &grant) != NULL,
+           "glob allow rule also matches the same access");
+    /* event_load_binary() runs the deny match before every grant stage
+     * and before hashing, so the deny wins and no pin work is done. */
+
+    g_config = saved;
 }
 
 /*
@@ -799,12 +1311,20 @@ int main(void) {
     test_glob_missing_base_is_skipped();
     test_exclusions_deny_wins();
     test_exclusion_is_not_marked();
+    test_config_rule_matching();
+    test_pin_first_seen_tofu();
+    test_allowlist_pin_verdict_codes();
+    test_pin_damaged_falls_through();
+    test_unsafe_allowlist_skips_pins();
+    test_hash_change_null_request_denies();
+    test_glob_deny_beats_glob_allow();
     test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_kernel_bounded_queue_overflow();
+    pin_fixture_cleanup();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

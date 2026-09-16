@@ -21,6 +21,7 @@
 #include "notify.h"
 #include "sha512.h"
 #include "persist.h"
+#include "pin.h"
 
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_need_reload;
@@ -131,43 +132,83 @@ static int read_cmdline_fingerprint(pid_t pid, char hex_out[129])
 }
 
 /*
- * Config rule matching.  A rule matches when the binary path is equal and
- * the opened target is equal to or under the rule's target path; a rule
- * with an empty target_path is global and matches every protected path.
- * path_under() from utils provides the equal-or-under semantics.
+ * Config rule matching.  Each side is exact or glob, prepared by
+ * config_load(): exact sides keep their historical semantics (binary by
+ * strcmp; target by path_under(), i.e. equal or under) and glob sides
+ * use the same cheap path_under_len() prefilter on their cached
+ * wildcard-free base that protected-path globs use, then the full
+ * glob_match_path() verdict.  An empty target_path makes the rule
+ * global: it matches every protected path.
  */
 static int rule_matches(const RuleEntry *e, const char *binary,
                         const char *target)
 {
-    if (strcmp(e->binary, binary) != 0)
+    if (e->binary_is_glob)
+    {
+        if (!path_under_len(binary, e->binary, (size_t)e->binary_base_len))
+            return 0;
+        if (!glob_match_path(e->binary, binary))
+            return 0;
+    }
+    else if (strcmp(e->binary, binary) != 0)
+    {
         return 0;
-    return e->target_path[0] == '\0' || path_under(target, e->target_path);
+    }
+
+    if (e->target_path[0] == '\0')
+        return 1;
+    if (e->target_is_glob)
+    {
+        if (!path_under_len(target, e->target_path,
+                            (size_t)e->target_base_len))
+            return 0;
+        return glob_match_path(e->target_path, target);
+    }
+    return path_under(target, e->target_path);
 }
 
 /*
- * Config [allowlist]: an explicit admin opt-in.  On a match, grant_target
- * receives the rule's target for the file-cache insert, or NULL for a
- * global rule (wildcard cache entry).
+ * Config [allowlist]: an explicit admin opt-in.  Returns the matched
+ * rule (NULL = no match) so the caller can derive the hash-pin key from
+ * rule->binary and the file-cache grant target from rule->target_path
+ * (NULL for a global rule = wildcard cache entry).
  */
-static int allowlist_match(const char *binary, const char *target,
-                           const char **grant_target)
+static const RuleEntry *allowlist_match(const char *binary,
+                                        const char *target)
 {
     if (!g_config)
-        return 0;
+        return NULL;
     for (int i = 0; i < g_config->allowlist_count; i++)
     {
         const RuleEntry *e = &g_config->allowlist[i];
         if (rule_matches(e, binary, target))
-        {
-            *grant_target = e->target_path[0] ? e->target_path : NULL;
-            return 1;
-        }
+            return e;
     }
-    return 0;
+    return NULL;
 }
 
-/* Config [denylist]: static admin-denied binary/target pairs, checked
- * before every grant so a denial always wins. */
+/*
+ * Config [unsafe_allowlist]: same matching as [allowlist] but these
+ * rules skip hash pinning entirely.  The event pipeline evaluates this
+ * section before [allowlist] and grants a hit silently.
+ */
+static const RuleEntry *unsafe_allowlist_match(const char *binary,
+                                               const char *target)
+{
+    if (!g_config)
+        return NULL;
+    for (int i = 0; i < g_config->unsafe_allowlist_count; i++)
+    {
+        const RuleEntry *e = &g_config->unsafe_allowlist[i];
+        if (rule_matches(e, binary, target))
+            return e;
+    }
+    return NULL;
+}
+
+/* Config [denylist]: static admin-denied binary/target pairs (globs
+ * included through rule_matches()), checked before every grant so a
+ * denial always wins.  Deny rules are never hash-pinned. */
 static int denylist_match(const char *binary, const char *target)
 {
     if (!g_config)
@@ -1656,10 +1697,174 @@ static int event_runtime_denied(EventCtx *c)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  [allowlist] hash-pin verdict and change prompt                    */
+/* ------------------------------------------------------------------ */
+/*
+ * config_allow_pin_verdict() result codes.  FIRST_USE is distinct from
+ * MATCH because the store belongs to the caller: the verdict helper only
+ * compares, so it stays side-effect free.
+ */
+#define ALLOWLIST_PIN_MATCH 0     /* stored pin matches: grant now         */
+#define ALLOWLIST_PIN_CHANGED 1   /* stored digest differs: ask the user   */
+#define ALLOWLIST_PIN_NO_GRANT 2  /* damaged table / no digest: prompt     */
+#define ALLOWLIST_PIN_FIRST_USE 3 /* no pin yet: caller stores then grants */
+
+/*
+ * Hash-pin verdict for one matching [allowlist] rule, side-effect free.
+ * An empty or missing bin_sha512 (fork/exec/timeout failure, or a binary
+ * under a protected path so the pipeline skipped hashing) never grants
+ * silently, and a damaged pin table is never trusted: both fall through
+ * to the normal dialog with no re-TOFU, so damage cannot silently reset
+ * every pin.  old_out receives the stored digest only for
+ * ALLOWLIST_PIN_CHANGED; it is cleared on every other return path.
+ */
+static int config_allow_pin_verdict(const RuleEntry *e,
+                                    const char *bin_sha512,
+                                    char old_out[129])
+{
+    if (old_out)
+        old_out[0] = '\0';
+
+    if (!e || !bin_sha512 || bin_sha512[0] == '\0')
+        return ALLOWLIST_PIN_NO_GRANT;
+
+    switch (pin_check(e->binary, bin_sha512, old_out))
+    {
+    case PIN_CHECK_MATCH:
+        return ALLOWLIST_PIN_MATCH;
+    case PIN_CHECK_FIRST_USE:
+        return ALLOWLIST_PIN_FIRST_USE;
+    case PIN_CHECK_CHANGED:
+        return ALLOWLIST_PIN_CHANGED;
+    default:
+        return ALLOWLIST_PIN_NO_GRANT; /* PIN_CHECK_DAMAGED */
+    }
+}
+
+/*
+ * First-seen store for one matching rule: pin_store() writes the state
+ * file immediately and atomically.  A failed store is a warning, not a
+ * denial (the access is still granted and the next daemon start
+ * re-TOFUs), so an unwritable state directory cannot block legitimate
+ * first use.  Returns pin_store()'s result (0 or -1).
+ */
+static int config_allow_pin_first_seen(const RuleEntry *e,
+                                       const char *bin_sha512)
+{
+    if (pin_store(e->binary, bin_sha512) < 0)
+    {
+        log_msg(LOG_WARNING,
+                "allowlist rule %s: first-seen hash could not be stored; "
+                "allowing this access (the next start re-TOFUs)",
+                e->binary);
+        return -1;
+    }
+    log_msg(LOG_INFO, "config allowlist first seen, hash pinned: rule %s",
+            e->binary);
+    return 0;
+}
+
+/*
+ * Shared grant for a matching [allowlist] rule: exactly the historical
+ * config-allowlist branch -- a cache entry scoped to the rule's target
+ * (NULL for a global rule = wildcard) with the configured user_ttl.
+ */
+static void config_allow_grant(EventCtx *c, const RuleEntry *e)
+{
+    /*
+     * A glob target pattern can never equal a concrete lookup path, so
+     * cache the concrete file that just matched; exact targets keep the
+     * historical rule-scoped entry (NULL for a global rule = wildcard).
+     */
+    const char *grant;
+    int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
+
+    if (e->target_is_glob)
+        grant = c->target;
+    else
+        grant = e->target_path[0] ? e->target_path : NULL;
+
+    cache_insert(c->ev->pid, c->binary, grant, user_ttl);
+    ctx_respond(c, FAN_ALLOW);
+}
+
+/*
+ * A matching [allowlist] rule's binary no longer matches the pinned
+ * digest: ask the user whether the new binary may replace it.  The
+ * existing dialog rate limiter gates the prompt first, so a tampered
+ * binary cannot flood the user with change prompts.  The limiter is
+ * keyed on the rule's binary pattern (the pin key), not on the concrete
+ * path, so glob rules whose mount paths churn cannot reset the quota.
+ * Yes = update the pin and grant; No, Cancel, window close, timeout and kdialog failure
+ * deny this attempt only and keep the old pin, so the next access
+ * re-prompts subject to the rate limiter.  The full old and new digests
+ * go to the journal; the dialog shows their 16-hex prefixes only.
+ * Returns 1 (the event was decided), the caller's convention.
+ */
+static int config_allow_hash_change(EventCtx *c, const RuleEntry *e,
+                                    const char *old_sha512)
+{
+    if (dialog_rate_limited(e->binary))
+    {
+        log_msg(LOG_WARNING,
+                "denying hash-change prompt for rule %s (%s): "
+                "dialog rate limited",
+                e->binary, c->binary);
+        ctx_respond(c, FAN_DENY);
+        return 1;
+    }
+
+    log_msg(LOG_WARNING,
+            "allowlist rule %s: binary hash changed for %s "
+            "(old %s, new %s); asking the user",
+            e->binary, c->binary, old_sha512, c->bin_sha512);
+
+    NotifyHashChange req;
+    memset(&req, 0, sizeof(req));
+    req.rule_pattern = e->binary;
+    req.exe = c->binary;
+    req.old_hash = old_sha512;
+    req.new_hash = c->bin_sha512;
+    req.path = c->target;
+    req.cmdline = c->cmdline;
+    req.pid = c->ev->pid;
+    req.user_uid = proc_uid(c->ev->pid);
+
+    int decision = notify_ask_hash_change(&req);
+    log_msg(LOG_INFO, "[dialog] hash-change prompt for rule %s (%s): %s",
+            e->binary, c->binary, notify_decision_name(decision));
+
+    if (decision == NOTIFY_ALLOW_ALWAYS)
+    {
+        if (pin_store(e->binary, c->bin_sha512) < 0)
+            log_msg(LOG_WARNING,
+                    "allowlist rule %s: hash update approved but the new "
+                    "pin could not be stored; granting this access (the new "
+                    "digest is active in memory until restart, the on-disk "
+                    "pin is unchanged)",
+                    e->binary);
+        else
+            log_msg(LOG_INFO,
+                    "allowlist rule %s: hash update approved, new digest "
+                    "pinned",
+                    e->binary);
+        config_allow_grant(c, e);
+        return 1;
+    }
+
+    log_msg(LOG_WARNING,
+            "hash change denied for allowlist rule %s (%s); old pin kept",
+            e->binary, c->binary);
+    ctx_respond(c, FAN_DENY);
+    return 1;
+}
+
 /*
  * Stage 6: grants, in order: file cache ("Allow Once" and fast paths),
- * session allowlist, dynamic allowlist ("Allow Always"), config
- * allowlist.  The config allowlist is last: a denial always wins, and
+ * session allowlist, dynamic allowlist ("Allow Always"), unsafe config
+ * allowlist ([unsafe_allowlist], no pinning), hash-pinned config
+ * allowlist.  The config sections are last: a denial always wins, and
  * the deny checks above needed the hashes gathered in stage 4.
  * Returns 1 when the event was allowed.
  */
@@ -1701,19 +1906,68 @@ static int event_runtime_allowed(EventCtx *c)
         return 1;
     }
 
-    /* Config allowlist: an explicit admin opt-in, scoped to a target
-     * file/folder or global for a bare entry.  A global rule inserts a
-     * wildcard cache entry (grant == NULL). */
+    /*
+     * Config [unsafe_allowlist]: an explicit admin opt-in that skips
+     * hash checking and pinning entirely.  Evaluated before the
+     * hash-pinned [allowlist]; a hit grants silently with the rule's
+     * target scope and never touches the pin state.
+     */
     {
-        const char *grant = NULL;
-        if (allowlist_match(c->binary, c->target, &grant))
+        const RuleEntry *unsafe = unsafe_allowlist_match(c->binary,
+                                                         c->target);
+        if (unsafe)
         {
-            int user_ttl = g_config ? g_config->user_ttl_seconds : 300;
-            cache_insert(c->ev->pid, c->binary, grant, user_ttl);
-            log_msg(LOG_INFO, "config allowlist hit: %s (pid %d) -> %s",
+            log_msg(LOG_INFO, "unsafe allowlist hit: %s (pid %d) -> %s",
                     c->binary, (int)c->ev->pid, c->target);
-            ctx_respond(c, FAN_ALLOW);
+            config_allow_grant(c, unsafe);
             return 1;
+        }
+    }
+
+    /*
+     * Config [allowlist], hash-pinned: a pin match grants; a first event
+     * stores the digest immediately and grants; a changed digest asks
+     * the user; a damaged table or an unavailable digest falls through
+     * to the normal dialog (fail closed, no silent re-TOFU).
+     */
+    {
+        const RuleEntry *rule = allowlist_match(c->binary, c->target);
+        if (rule)
+        {
+            char old_sha512[129];
+            int verdict = config_allow_pin_verdict(rule, c->bin_sha512,
+                                                   old_sha512);
+
+            if (verdict == ALLOWLIST_PIN_FIRST_USE)
+            {
+                config_allow_pin_first_seen(rule, c->bin_sha512);
+                config_allow_grant(c, rule);
+                return 1;
+            }
+            if (verdict == ALLOWLIST_PIN_MATCH)
+            {
+                log_msg(LOG_INFO,
+                        "config allowlist hit (pin match): %s (pid %d) -> %s",
+                        c->binary, (int)c->ev->pid, c->target);
+                config_allow_grant(c, rule);
+                return 1;
+            }
+            if (verdict == ALLOWLIST_PIN_CHANGED)
+                return config_allow_hash_change(c, rule, old_sha512);
+
+            /* ALLOWLIST_PIN_NO_GRANT: damaged table or unavailable hash;
+             * never grant silently and never store a fresh pin. */
+            if (c->bin_sha512[0] == '\0')
+                log_msg(LOG_WARNING,
+                        "allowlist rule %s: binary SHA-512 unavailable for "
+                        "%s; asking the user (no silent grant)",
+                        rule->binary, c->binary);
+            else
+                log_msg(LOG_ERR,
+                        "allowlist rule %s: pin table damaged; asking the "
+                        "user (no silent grant, no re-TOFU)",
+                        rule->binary);
+            return 0;
         }
     }
     return 0;
@@ -1866,10 +2120,12 @@ static void event_ask_user(EventCtx *c)
  * function, and every respond/close/cache side effect happens in the
  * same order.  The decision order is (a denial always wins over a grant):
  *   config deny -> session deny -> permanent deny -> file cache
- *   -> session allow -> permanent allow -> config allow
- *   -> rate limit -> dialog
- * The config allowlist sits after the runtime grants because every deny
- * must be evaluated first, which requires the hashes from stage 4.
+ *   -> session allow -> permanent allow -> unsafe config allow
+ *   -> pinned config allow -> rate limit -> dialog
+ * The config allowlist sections sit after the runtime grants because
+ * every deny must be evaluated first, which requires the hashes from
+ * stage 4.  Inside the pinned section a damaged table or an unavailable
+ * digest falls through to the dialog (fail closed).
  */
 static void process_open_perm(int fan_fd, const struct fanotify_event_metadata *ev)
 {
@@ -2319,4 +2575,102 @@ int fanotify_test_fastpath_allows(dev_t dev, ino_t ino, const char *path)
 int fanotify_test_resolve_path(int fd, char *out, size_t outsz)
 {
     return resolve_fd_path(fd, out, outsz);
+}
+
+/*
+ * Config-section test seams: same matchers the decision pipeline uses,
+ * callable without a kernel permission event.  The allow seam returns
+ * the matched rule's canonical binary pattern (the hash-pin key) or
+ * NULL, and stores the rule's target_path into *grant_target (NULL for
+ * a global rule) when that pointer is non-NULL.  The unsafe seam is
+ * [unsafe_allowlist] only, and the deny seam returns the [denylist]
+ * verdict (non-zero = denied).
+ */
+const char *fanotify_test_config_allow_match(const char *binary,
+                                             const char *target,
+                                             const char **grant_target)
+{
+    const RuleEntry *rule = allowlist_match(binary, target);
+
+    if (grant_target)
+    {
+        *grant_target = NULL;
+        if (rule && rule->target_path[0])
+            *grant_target = rule->target_path;
+    }
+    return rule ? rule->binary : NULL;
+}
+
+const char *fanotify_test_unsafe_allow_match(const char *binary,
+                                             const char *target)
+{
+    const RuleEntry *rule = unsafe_allowlist_match(binary, target);
+
+    return rule ? rule->binary : NULL;
+}
+
+int fanotify_test_config_deny_match(const char *binary, const char *target)
+{
+    return denylist_match(binary, target);
+}
+
+/*
+ * Hash-pin verdict seam: run config_allow_pin_verdict() for the first
+ * [allowlist] rule matching (binary, target).  Return codes:
+ *   0 ALLOW            stored pin matches; a first-use rule is also
+ *                      reported as ALLOW (the pipeline stores the digest
+ *                      and grants -- the store is covered by
+ *                      fanotify_test_pin_first_seen())
+ *   1 CHANGED          stored digest differs; old digest copied to old_out
+ *   2 NO_SILENT_GRANT  pin table damaged or bin_sha512 empty/missing
+ *   3 NO_MATCH         no [allowlist] rule matches
+ * Side-effect free: it never stores a pin and never prompts.
+ */
+int fanotify_test_allowlist_verdict(const char *binary,
+                                    const char *bin_sha512,
+                                    const char *target,
+                                    char old_out[129])
+{
+    const RuleEntry *rule = allowlist_match(binary, target);
+    int verdict;
+
+    if (!rule)
+    {
+        if (old_out)
+            old_out[0] = '\0';
+        return 3; /* NO_MATCH */
+    }
+
+    verdict = config_allow_pin_verdict(rule, bin_sha512, old_out);
+    return verdict == ALLOWLIST_PIN_FIRST_USE ? 0 : verdict;
+}
+
+/*
+ * First-seen store seam: the pipeline's first-use branch exactly --
+ * precondition "no pin for the matched rule", action "immediate atomic
+ * pin_store() of bin_sha512 under the rule's canonical binary pattern".
+ * Returns 0 on success; -1 when no rule matches, the rule already has a
+ * pin (the pipeline would take the changed path instead), or the store
+ * fails.
+ */
+int fanotify_test_pin_first_seen(const char *binary, const char *bin_sha512,
+                                 const char *target)
+{
+    const RuleEntry *rule = allowlist_match(binary, target);
+
+    if (!rule)
+    {
+        log_msg(LOG_WARNING,
+                "pin_first_seen: no allowlist rule matches %s -> %s",
+                binary, target);
+        return -1;
+    }
+    if (pin_check(rule->binary, bin_sha512, NULL) != PIN_CHECK_FIRST_USE)
+    {
+        log_msg(LOG_WARNING,
+                "pin_first_seen: rule %s is not in first-use state",
+                rule->binary);
+        return -1;
+    }
+    return config_allow_pin_first_seen(rule, bin_sha512);
 }

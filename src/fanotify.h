@@ -96,6 +96,59 @@ int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
                                  const char *target, const char *cmdline_fp);
 
 /*
+ * Test seams: evaluate the loaded config rule sections against a
+ * synthetic request.  Unprivileged, no kernel permission event needed.
+ * All three use the same matchers as the pipeline, including glob
+ * binaries/targets.
+ *
+ * fanotify_test_config_allow_match() returns the matched [allowlist]
+ * rule's canonical binary pattern (the hash-pin key), or NULL when no
+ * rule matches.  When grant_target is non-NULL it receives the rule's
+ * target_path, or NULL for a global rule (wildcard cache entry).
+ *
+ * fanotify_test_unsafe_allow_match() does the same for
+ * [unsafe_allowlist], which never participates in hash pinning.
+ *
+ * fanotify_test_config_deny_match() returns the [denylist] verdict:
+ * non-zero when a rule matches (deny wins), 0 otherwise.
+ */
+const char *fanotify_test_config_allow_match(const char *binary,
+                                             const char *target,
+                                             const char **grant_target);
+const char *fanotify_test_unsafe_allow_match(const char *binary,
+                                             const char *target);
+int fanotify_test_config_deny_match(const char *binary, const char *target);
+
+/*
+ * Test seams: the [allowlist] hash-pin verdict without a kernel event.
+ * fanotify_test_allowlist_verdict() runs the same decision the pipeline
+ * uses for the first rule matching (binary, target):
+ *   0 ALLOW            stored pin matches; a first-use rule is also
+ *                      reported as ALLOW because the pipeline stores the
+ *                      digest and grants (the store itself is covered by
+ *                      fanotify_test_pin_first_seen())
+ *   1 CHANGED          stored digest differs; the previous digest is
+ *                      copied into old_out
+ *   2 NO_SILENT_GRANT  pin table damaged or bin_sha512 empty/missing
+ *   3 NO_MATCH         no [allowlist] rule matches
+ * Side-effect free: it never stores a pin and never prompts.
+ *
+ * fanotify_test_pin_first_seen() performs the pipeline's first-seen
+ * store: when (binary, target) matches an [allowlist] rule that has no
+ * pin yet it calls pin_store() on the rule's canonical binary pattern,
+ * which writes the state file immediately and atomically.  Returns 0 on
+ * success; -1 when no rule matches, the rule already has a pin, or the
+ * store fails.
+ */
+int fanotify_test_allowlist_verdict(const char *binary,
+                                    const char *bin_sha512,
+                                    const char *target,
+                                    char old_out[129]);
+int fanotify_test_pin_first_seen(const char *binary,
+                                 const char *bin_sha512,
+                                 const char *target);
+
+/*
  * Test seam: fingerprint a live process's full raw command line the same
  * way the event pipeline does (NUL-separated bytes, bounded).  Returns 0
  * on success and fills hex_out, -1 when the cmdline is unreadable/empty.

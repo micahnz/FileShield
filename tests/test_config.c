@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <pwd.h>
 #include <sys/stat.h>
 
 #include "../src/config.h"
@@ -670,6 +671,416 @@ static void test_exclusion_rejection(void)
     free(path);
 }
 
+/*
+ * Exact rules keep the historical semantics and record is_glob = 0 with
+ * base_len == strlen(path); a bare global rule has an empty target with
+ * zeroed target metadata.
+ */
+static void test_rule_exact_metadata(void)
+{
+    const char *conf =
+        "[allowlist]\n"
+        "/usr/bin/ssh = /etc/ssl/certs\n"
+        "/usr/bin/git\n"
+        "[denylist]\n"
+        "/usr/bin/curl = /tmp/curl_target\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for exact rule metadata");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load exact rule metadata success");
+    ASSERT(cfg.allowlist_count == 2, "exact allowlist rules parsed");
+
+    ASSERT(cfg.allowlist[0].binary_is_glob == 0, "exact binary is not a glob");
+    ASSERT(cfg.allowlist[0].binary_base_len ==
+               (int)strlen(cfg.allowlist[0].binary),
+           "exact binary base_len is the full path");
+    ASSERT(cfg.allowlist[0].target_is_glob == 0, "exact target is not a glob");
+    ASSERT(cfg.allowlist[0].target_base_len ==
+               (int)strlen(cfg.allowlist[0].target_path),
+           "exact target base_len is the full path");
+
+    ASSERT(cfg.allowlist[1].target_path[0] == '\0', "bare rule stays global");
+    ASSERT(cfg.allowlist[1].target_is_glob == 0, "global rule target is not a glob");
+    ASSERT(cfg.allowlist[1].target_base_len == 0, "global rule target base_len 0");
+
+    ASSERT(cfg.denylist_count == 1, "exact denylist rule parsed");
+    ASSERT(cfg.denylist[0].binary_is_glob == 0, "denylist binary is not a glob");
+    ASSERT(cfg.denylist[0].binary_base_len ==
+               (int)strlen(cfg.denylist[0].binary),
+           "denylist binary base_len is the full path");
+    ASSERT(cfg.denylist[0].target_is_glob == 0, "denylist target is not a glob");
+    ASSERT(cfg.denylist[0].target_base_len ==
+               (int)strlen(cfg.denylist[0].target_path),
+           "denylist target base_len is the full path");
+
+    config_reset(&cfg);
+    ASSERT(cfg.allowlist[0].binary_is_glob == 0, "config_reset clears rule glob flag");
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Rule globs: either side of an [allowlist]/[unsafe_allowlist]/[denylist]
+ * line accepts the same '*'/'**' engine as [protected_paths].  The
+ * wildcard-free base is canonicalized, the suffix stays verbatim, and
+ * per-side metadata is recorded for the fanotify matcher.
+ */
+static void test_rule_glob_binary(void)
+{
+    const char *conf =
+        "[allowlist]\n"
+        "/tmp/.mount_*/openchamber = /tmp/rule_glob_bin\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob binary rule");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load glob binary rule success");
+    ASSERT(cfg.allowlist_count == 1, "glob binary rule parsed");
+    ASSERT(cfg.allowlist[0].binary_is_glob == 1, "binary side flagged as glob");
+    ASSERT(strcmp(cfg.allowlist[0].binary, "/tmp/.mount_*/openchamber") == 0,
+           "glob binary pattern preserved verbatim");
+    ASSERT(cfg.allowlist[0].binary_base_len == (int)strlen("/tmp"),
+           "binary glob base is the wildcard-free prefix");
+    ASSERT(cfg.allowlist[0].target_is_glob == 0, "target side stays exact");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, "/tmp/rule_glob_bin") == 0,
+           "exact target canonicalized");
+    ASSERT(cfg.allowlist[0].target_base_len ==
+               (int)strlen(cfg.allowlist[0].target_path),
+           "exact target base_len is the full path");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+static void test_rule_glob_target(void)
+{
+    char base[128];
+    char pat[256];
+    char conf[1024];
+
+    snprintf(base, sizeof(base), "/tmp/fileshield_rtarget_%d", (int)getpid());
+    snprintf(pat, sizeof(pat), "%s/**/*.json", base);
+    snprintf(conf, sizeof(conf),
+             "[allowlist]\n"
+             "/usr/bin/opencode = %s\n",
+             pat);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob target rule");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load glob target rule success");
+    ASSERT(cfg.allowlist_count == 1, "glob target rule parsed");
+    ASSERT(cfg.allowlist[0].binary_is_glob == 0, "binary side stays exact");
+    ASSERT(strcmp(cfg.allowlist[0].binary, "/usr/bin/opencode") == 0,
+           "exact binary canonicalized");
+    ASSERT(cfg.allowlist[0].binary_base_len == (int)strlen("/usr/bin/opencode"),
+           "exact binary base_len is the full path");
+    ASSERT(cfg.allowlist[0].target_is_glob == 1, "target side flagged as glob");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, pat) == 0,
+           "glob target pattern preserved verbatim");
+    ASSERT(cfg.allowlist[0].target_base_len == (int)strlen(base),
+           "target glob base is the wildcard-free prefix");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+static void test_rule_glob_both(void)
+{
+    char base[128];
+    char bin_pat[256];
+    char tgt_pat[256];
+    char conf[1024];
+
+    snprintf(base, sizeof(base), "/tmp/fileshield_rboth_%d", (int)getpid());
+    snprintf(bin_pat, sizeof(bin_pat), "%s/*/app", base);
+    snprintf(tgt_pat, sizeof(tgt_pat), "%s/**", base);
+    snprintf(conf, sizeof(conf),
+             "[allowlist]\n"
+             "%s = %s\n",
+             bin_pat, tgt_pat);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for both-side glob rule");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load both-side glob rule success");
+    ASSERT(cfg.allowlist_count == 1, "both-side glob rule parsed");
+    ASSERT(cfg.allowlist[0].binary_is_glob == 1, "binary glob flagged");
+    ASSERT(cfg.allowlist[0].target_is_glob == 1, "target glob flagged");
+    ASSERT(strcmp(cfg.allowlist[0].binary, bin_pat) == 0,
+           "binary glob pattern preserved");
+    ASSERT(strcmp(cfg.allowlist[0].target_path, tgt_pat) == 0,
+           "target glob pattern preserved");
+    ASSERT(cfg.allowlist[0].binary_base_len == (int)strlen(base),
+           "binary glob base length");
+    ASSERT(cfg.allowlist[0].target_base_len == (int)strlen(base),
+           "target glob base length");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * Malformed rule globs are rejected with a log and skipped (fail closed);
+ * a valid line after a rejected one still loads.  Both sides are checked.
+ */
+static void test_rule_glob_rejection(void)
+{
+    char ok_bin[256];
+    char conf[2048];
+
+    snprintf(ok_bin, sizeof(ok_bin), "/tmp/fileshield_rglob_%d/*/bin", (int)getpid());
+    snprintf(conf, sizeof(conf),
+             "[allowlist]\n"
+             "%s = /tmp/fileshield_rglob_target\n"                /* valid */
+             "relative/*.json = /tmp/x\n"                         /* not absolute */
+             "*.json = /tmp/x\n"                                  /* no static base */
+             "/tmp/fileshield_rglob_%d/../*.json = /tmp/x\n"      /* '..' base */
+             "/tmp/fileshield_rglob_%d/*//x = /tmp/x\n"           /* empty segment */
+             "/tmp/fileshield_rglob_%d/*.json/ = /tmp/x\n"        /* trailing slash */
+             "/usr/bin/exact = relative/*.json\n"                 /* target not absolute */
+             "/usr/bin/exact2 = *.json\n"                         /* target no base */
+             "/usr/bin/exact3 = /tmp/fileshield_rglob_%d/../*.json\n" /* target '..' */
+             "/usr/bin/exact4 = /tmp/fileshield_rglob_%d/*//x\n"  /* target empty segment */
+             "/usr/bin/survivor = /tmp/fileshield_rglob_target\n", /* valid */
+             ok_bin,
+             (int)getpid(), (int)getpid(), (int)getpid(),
+             (int)getpid(), (int)getpid());
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob rule rejection");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load survives rejected glob rules");
+    ASSERT(cfg.allowlist_count == 2, "only the two valid rules survive");
+    ASSERT(strcmp(cfg.allowlist[0].binary, ok_bin) == 0,
+           "valid glob binary before the rejects still loads");
+    ASSERT(cfg.allowlist[0].binary_is_glob == 1, "surviving glob binary flagged");
+    ASSERT(cfg.allowlist[0].binary_base_len ==
+               (int)strlen(ok_bin) - (int)strlen("/*/bin"),
+           "surviving glob binary base length");
+    ASSERT(strcmp(cfg.allowlist[1].binary, "/usr/bin/survivor") == 0,
+           "valid exact rule after the rejects still loads");
+    ASSERT(cfg.allowlist[1].binary_is_glob == 0, "surviving exact binary not a glob");
+    ASSERT(strcmp(cfg.allowlist[1].target_path, "/tmp/fileshield_rglob_target") == 0,
+           "surviving exact target canonicalized");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * [denylist] gets the same glob handling through the shared add_rule()
+ * path (it never pins hashes, but the parser is identical).
+ */
+static void test_denylist_glob_parse(void)
+{
+    const char *conf =
+        "[denylist]\n"
+        "/tmp/.mount_*/curl = /tmp/deny_glob_target\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for denylist glob");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load denylist glob success");
+    ASSERT(cfg.denylist_count == 1, "denylist glob rule parsed");
+    ASSERT(cfg.denylist[0].binary_is_glob == 1, "denylist binary glob flagged");
+    ASSERT(cfg.denylist[0].binary_base_len == (int)strlen("/tmp"),
+           "denylist binary glob base");
+    ASSERT(cfg.denylist[0].target_is_glob == 0, "denylist target stays exact");
+    ASSERT(strcmp(cfg.denylist[0].target_path, "/tmp/deny_glob_target") == 0,
+           "denylist glob rule target canonicalized");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * The two reported user cases must parse: a glob binary scoped to a
+ * home-directory target, and an exact binary scoped to a parent folder
+ * (the trailing slash is stripped by canonicalization).
+ */
+static void test_reported_user_cases(void)
+{
+    const char *conf =
+        "[allowlist]\n"
+        "/tmp/.mount_*/openchamber = ~/.local/share/opencode/\n"
+        "/usr/bin/opencode = ~/.local/\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for reported user cases");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load reported user cases success");
+    ASSERT(cfg.allowlist_count == 2, "both reported user cases parsed");
+
+    ASSERT(cfg.allowlist[0].binary_is_glob == 1, "AppImage mount path is a glob");
+    ASSERT(strcmp(cfg.allowlist[0].binary, "/tmp/.mount_*/openchamber") == 0,
+           "AppImage mount glob preserved");
+    ASSERT(cfg.allowlist[0].binary_base_len == (int)strlen("/tmp"),
+           "AppImage mount glob base");
+    ASSERT(cfg.allowlist[0].target_is_glob == 0, "opencode data dir stays exact");
+    ASSERT(strstr(cfg.allowlist[0].target_path, "/.local/share/opencode") != NULL,
+           "opencode data dir target canonicalized");
+    size_t len0 = strlen(cfg.allowlist[0].target_path);
+    ASSERT(len0 > 0 && cfg.allowlist[0].target_path[len0 - 1] != '/',
+           "trailing slash stripped from data dir target");
+    ASSERT(cfg.allowlist[0].target_base_len == (int)len0,
+           "exact data dir target base_len");
+
+    ASSERT(strcmp(cfg.allowlist[1].binary, "/usr/bin/opencode") == 0,
+           "exact opencode binary kept");
+    ASSERT(cfg.allowlist[1].binary_is_glob == 0, "exact binary is not a glob");
+    ASSERT(strstr(cfg.allowlist[1].target_path, "/.local") != NULL,
+           "parent folder target canonicalized");
+    size_t len1 = strlen(cfg.allowlist[1].target_path);
+    ASSERT(len1 > 0 && cfg.allowlist[1].target_path[len1 - 1] != '/',
+           "trailing slash stripped from parent folder target");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
+ * [unsafe_allowlist] parses exactly like [allowlist] into its own
+ * section, applies the same glob validation, and leaves the safe
+ * allowlist untouched.
+ */
+static void test_unsafe_allowlist_parse(void)
+{
+    const char *conf =
+        "[unsafe_allowlist]\n"
+        "*.json = /tmp/x\n" /* malformed: rejected like [allowlist] */
+        "/usr/bin/opencode\n"
+        "/tmp/.mount_*/app = /tmp/unsafe_target\n"
+        "[allowlist]\n"
+        "/usr/bin/ssh = /tmp/safe_target\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for unsafe allowlist");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load unsafe allowlist success");
+    ASSERT(cfg.unsafe_allowlist_count == 2, "unsafe allowlist entries parsed");
+    ASSERT(cfg.allowlist_count == 1, "safe allowlist unaffected by unsafe section");
+
+    ASSERT(strcmp(cfg.unsafe_allowlist[0].binary, "/usr/bin/opencode") == 0,
+           "unsafe rule binary parsed");
+    ASSERT(cfg.unsafe_allowlist[0].target_path[0] == '\0',
+           "unsafe bare rule is global");
+    ASSERT(cfg.unsafe_allowlist[0].binary_is_glob == 0,
+           "unsafe exact binary metadata");
+    ASSERT(cfg.unsafe_allowlist[1].binary_is_glob == 1, "unsafe glob binary flagged");
+    ASSERT(cfg.unsafe_allowlist[1].binary_base_len == (int)strlen("/tmp"),
+           "unsafe glob binary base");
+    ASSERT(strcmp(cfg.unsafe_allowlist[1].target_path, "/tmp/unsafe_target") == 0,
+           "unsafe rule target parsed");
+
+    config_reset(&cfg);
+    ASSERT(cfg.unsafe_allowlist_count == 0, "config_reset clears unsafe count");
+    ASSERT(cfg.unsafe_allowlist[0].binary_is_glob == 0,
+           "config_reset clears unsafe glob metadata");
+
+    unlink(path);
+    free(path);
+}
+
+/*
+ * '~' expansion still applies to both sides when one or both carry a
+ * glob suffix, and pairing is unchanged: entry i pairs expanded user i's
+ * binary with expanded user i's target.  The expected count is derived
+ * from the same real-user enumeration so the test is stable on hosts
+ * without any real users (the rule is then skipped as relative).
+ */
+static void test_rule_expansion_with_globs(void)
+{
+    const char *conf =
+        "[allowlist]\n"
+        "~/bin/* = ~/.config/*.conf\n";
+
+    int users = 0;
+    const struct passwd *pw;
+    setpwent();
+    while ((pw = getpwent()) != NULL)
+    {
+        if (pw->pw_uid < 1000 || pw->pw_uid >= 65534)
+            continue;
+        if (!pw->pw_dir || pw->pw_dir[0] == '\0')
+            continue;
+        users++;
+    }
+    endpwent();
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for glob expansion");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load glob expansion success");
+    ASSERT(cfg.allowlist_count == users,
+           "one rule per real user when both sides expand");
+
+    for (int i = 0; i < cfg.allowlist_count; i++)
+    {
+        ASSERT(cfg.allowlist[i].binary_is_glob == 1,
+               "expanded binary keeps its glob");
+        ASSERT(cfg.allowlist[i].target_is_glob == 1,
+               "expanded target keeps its glob");
+        ASSERT(strstr(cfg.allowlist[i].binary, "/bin/*") != NULL,
+               "expanded binary keeps the verbatim suffix");
+        ASSERT(strstr(cfg.allowlist[i].target_path, "/.config/*.conf") != NULL,
+               "expanded target keeps the verbatim suffix");
+        ASSERT(cfg.allowlist[i].binary_base_len ==
+                   (int)strlen(cfg.allowlist[i].binary) - (int)strlen("/*"),
+               "expanded binary base length");
+        ASSERT(cfg.allowlist[i].target_base_len ==
+                   (int)strlen(cfg.allowlist[i].target_path) - (int)strlen("/*.conf"),
+               "expanded target base length");
+    }
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
@@ -689,6 +1100,15 @@ int main(void)
     test_exclusions_parse();
     test_exclusion_rejection();
     test_rule_rejection();
+    test_rule_exact_metadata();
+    test_rule_glob_binary();
+    test_rule_glob_target();
+    test_rule_glob_both();
+    test_rule_glob_rejection();
+    test_denylist_glob_parse();
+    test_reported_user_cases();
+    test_unsafe_allowlist_parse();
+    test_rule_expansion_with_globs();
     test_denylist_parse();
     test_target_trailing_slash();
     test_scoped_missing_target();
