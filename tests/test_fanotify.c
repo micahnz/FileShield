@@ -791,6 +791,39 @@ static void test_hash_change_null_request_denies(void)
            "NULL hash-change request denies (fail closed)");
 }
 
+/*
+ * Notification flood control: identical (kind, binary, target) hits are
+ * suppressed for the dedup window, distinct keys pass, a zero window
+ * notifies every hit, and the global cap bounds a burst of distinct keys.
+ */
+static void test_notify_rate_windows(void)
+{
+    notify_test_reset_rate();
+
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 1,
+           "first notification passes");
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 60, 20) == 0,
+           "identical hit inside the window is suppressed");
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t2", 60, 20) == 1,
+           "a different target passes");
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_ALLOW, "/b", "/t", 60, 20) == 1,
+           "a different kind passes");
+    ASSERT(notify_test_hit_rate(NOTIFY_HIT_UNSAFE, "/b", "/t", 0, 20) == 1,
+           "dedup window 0 notifies every hit");
+
+    /* Configurable global cap: 10 distinct keys, cap 5 -> 5 delivered. */
+    notify_test_reset_rate();
+    int allowed = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        char bin[32];
+        snprintf(bin, sizeof(bin), "/bin/notify-%d", i);
+        allowed += notify_test_hit_rate(NOTIFY_HIT_DENY, bin, "/t", 0, 5);
+    }
+    ASSERT(allowed == 5, "notify_max caps the window at 5");
+    notify_test_reset_rate();
+}
+
 /* A glob deny rule beats a glob allow rule (deny is evaluated first). */
 static void test_glob_deny_beats_glob_allow(void)
 {
@@ -1317,6 +1350,7 @@ int main(void) {
     test_pin_damaged_falls_through();
     test_unsafe_allowlist_skips_pins();
     test_hash_change_null_request_denies();
+    test_notify_rate_windows();
     test_glob_deny_beats_glob_allow();
     test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();

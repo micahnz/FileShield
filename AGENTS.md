@@ -51,7 +51,7 @@ Headers are the source of truth for signatures; this table is the map.
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                |
 | `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                 |
 | `session.c/h`  | POSIX-session-scoped allow/deny entries, leader-lifetime validity                                                                                                                                                                                                                                   |
-| `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes                                                                                                                                                             |
+| `notify.c/h`   | per-prompt session detection, user drop, environment whitelist, kdialog stages (including the hash-change prompt), fail-closed outcomes, fire-and-forget notify-send rule-hit notifications (dedup window + global flood cap)                                                                       |
 | `persist.c/h`  | atomic JSON save (0600, `O_EXCL` temp + rename), tolerant line parser, fail-secure load                                                                                                                                                                                                             |
 | `pin.c/h`      | `[allowlist]` binary SHA-512 pins: strict fail-closed JSON load (missing = TOFU), 256-entry table with oldest-eviction, atomic store, change detection                                                                                                                                              |
 | `sha512.c/h`   | `sha512_file` (forked `sha512sum`, `sha512_last_failure()` reason accessor), `sha512_proc_exe`, in-process `sha512_string`/`sha512_buf`                                                                                                                                                             |
@@ -61,7 +61,8 @@ Headers are the source of truth for signatures; this table is the map.
 
 1. `event_resolve` — fd sanity, resolve target path, cache the protected-prefix verdict.
 2. `event_fastpath` — mount-mark noise (unknown inode, unprotected path), dedup-cache hits.
-3. `event_load_binary` — `/proc/<pid>/exe`; config denylist; hard-link classification.
+3. `event_load_binary` — `/proc/<pid>/exe`; config denylist (with a best-effort
+   notify-send tripwire when `notify_denylist` is on); hard-link classification.
 4. `event_gather_identity` — comm/ppid/cmdline, binary SHA-512 (with its failure reason),
    session id; gathered while the requester is kernel-suspended so `/proc` is still valid.
    The call chain is captured lazily: the runtime matchers request it only after an entry
@@ -73,7 +74,9 @@ Headers are the source of truth for signatures; this table is the map.
    computed lazily only when a runtime list can match).
 6. `event_runtime_allowed` — skipped entirely for hard-link events; otherwise file cache →
    session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]`
-   (first use pins silently, a changed hash prompts).
+   (first use pins silently, a changed hash prompts). Config-rule hits raise a
+   notify-send notification when their `[settings]` toggle is on (unsafe and denylist
+   default on, pinned allowlist off), bounded by `notify_dedup_ttl` and a global cap.
 7. `event_ask_user` — dialog rate limit, kdialog stages, decision recording.
 
 ### `notify.h` decision codes
@@ -170,3 +173,4 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt
 - Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the prompt names the failure reason and points at `[unsafe_allowlist]` for a permanent grant, failed hashes are retried at most once per 60 s, and ancestor hashing is skipped while no runtime _Always_ entries exist; the table is capped at 256 entries (oldest evicted)
 - Denylist rules are never hash-checked, and there is no CLI for pins: updates go through the change dialog, or root edits `/var/lib/fileshield/allowlist-hashes.json` and reloads
+- Rule-hit notifications are best-effort (need a detected desktop session and `notify-send`), attacker-triggerable, deduplicated for `notify_dedup_ttl` and capped at `notify_max` per 60 s window; user dialog decisions never notify and no notification ever affects a decision

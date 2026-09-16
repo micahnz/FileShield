@@ -931,3 +931,224 @@ int notify_ask_hash_change(const NotifyHashChange *req)
             rule, exe);
     return NOTIFY_DENY;
 }
+
+/* ------------------------------------------------------------------ */
+/*  config-rule desktop notifications (notify-send)                    */
+/* ------------------------------------------------------------------ */
+/*
+ * Bounded, spoof-proof tripwire for config-rule hits.  An attacker can
+ * trigger these notifications, so flood control is mandatory: identical
+ * (kind, binary, target) hits are deduplicated for the configured window,
+ * and a global cap bounds a stream of distinct keys.  Both counters are
+ * best-effort side channels, never inputs to the access decision.
+ */
+#define NOTIFY_DEDUP_MAX 128
+/* Defensive fallback only: the effective cap comes from [settings] notify_max. */
+#define NOTIFY_GLOBAL_MAX 20
+#define NOTIFY_GLOBAL_WINDOW_S 60
+#define NOTIFY_SEND_PATH "/usr/bin/notify-send"
+
+typedef struct
+{
+    int kind;
+    char binary[PATH_MAX];
+    char target[PATH_MAX];
+    time_t last;
+} NotifyDedupEntry;
+
+static NotifyDedupEntry g_notify_dedup[NOTIFY_DEDUP_MAX];
+static int g_notify_dedup_count = 0;
+static int g_notify_dedup_next = 0;
+
+static int g_notify_window_count = 0;
+static time_t g_notify_window_start = 0;
+static int g_notify_window_logged = 0;
+
+static int g_notify_send_checked = 0;
+static int g_notify_send_ok = 0;
+
+/* 1 = this hit may be delivered (and is counted / remembered). */
+static int notify_rate_allow(int kind, const char *binary, const char *target,
+                             int dedup_seconds, int max_per_window)
+{
+    time_t now = time(NULL);
+    int cap = max_per_window > 0 ? max_per_window : NOTIFY_GLOBAL_MAX;
+
+    if (now - g_notify_window_start >= NOTIFY_GLOBAL_WINDOW_S)
+    {
+        g_notify_window_start = now;
+        g_notify_window_count = 0;
+        g_notify_window_logged = 0;
+    }
+
+    if (g_notify_window_count >= cap)
+    {
+        if (!g_notify_window_logged)
+        {
+            log_msg(LOG_WARNING,
+                    "notification flood: more than %d in %ds; suppressing "
+                    "further rule notifications for the window",
+                    cap, NOTIFY_GLOBAL_WINDOW_S);
+            g_notify_window_logged = 1;
+        }
+        return 0;
+    }
+
+    if (dedup_seconds > 0)
+    {
+        for (int i = 0; i < g_notify_dedup_count; i++)
+        {
+            NotifyDedupEntry *e = &g_notify_dedup[i];
+            if (e->kind == kind && strcmp(e->binary, binary) == 0 &&
+                strcmp(e->target, target) == 0)
+            {
+                if (now - e->last < dedup_seconds)
+                    return 0;
+                e->last = now;
+                g_notify_window_count++;
+                return 1;
+            }
+        }
+
+        int slot;
+        if (g_notify_dedup_count < NOTIFY_DEDUP_MAX)
+            slot = g_notify_dedup_count++;
+        else
+        {
+            slot = g_notify_dedup_next;
+            g_notify_dedup_next = (g_notify_dedup_next + 1) % NOTIFY_DEDUP_MAX;
+        }
+        NotifyDedupEntry *e = &g_notify_dedup[slot];
+        memset(e, 0, sizeof(*e));
+        e->kind = kind;
+        snprintf(e->binary, sizeof(e->binary), "%s", binary);
+        snprintf(e->target, sizeof(e->target), "%s", target);
+        e->last = now;
+    }
+
+    g_notify_window_count++;
+    return 1;
+}
+
+void notify_rule_hit(const NotifyHit *hit)
+{
+    char title[128];
+    char rule[512], bin[512], comm[64], target[512];
+    char body[2048];
+    const char *urgency;
+    const char *icon;
+
+    if (!hit || hit->uid == (uid_t)-1 || hit->uid == 0)
+        return;
+
+    if (!notify_rate_allow(hit->kind, hit->binary ? hit->binary : "",
+                           hit->target ? hit->target : "",
+                           hit->dedup_seconds, hit->max_per_window))
+        return;
+
+    if (!g_notify_send_checked)
+    {
+        g_notify_send_checked = 1;
+        g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
+        if (!g_notify_send_ok)
+            log_msg(LOG_WARNING,
+                    "notify_rule_hit: %s not found; rule notifications "
+                    "disabled (see README)",
+                    NOTIFY_SEND_PATH);
+    }
+    if (!g_notify_send_ok)
+        return;
+
+    /* Per-field sanitation: newlines inside fields must not forge lines. */
+    sanitize_text(hit->rule ? hit->rule : "(unknown)", rule, sizeof(rule));
+    sanitize_text(hit->binary ? hit->binary : "(unknown)", bin, sizeof(bin));
+    sanitize_text(hit->comm ? hit->comm : "", comm, sizeof(comm));
+    sanitize_text(hit->target ? hit->target : "(unknown)", target,
+                  sizeof(target));
+
+    if (hit->kind == NOTIFY_HIT_UNSAFE)
+    {
+        snprintf(title, sizeof(title),
+                 "Fileshield: unsafe allowlist rule used");
+        urgency = "critical";
+        icon = "security-high";
+    }
+    else if (hit->kind == NOTIFY_HIT_DENY)
+    {
+        snprintf(title, sizeof(title),
+                 "Fileshield: denylist blocked an access");
+        urgency = "critical";
+        icon = "security-high";
+    }
+    else
+    {
+        snprintf(title, sizeof(title), "Fileshield: allowlist rule used");
+        urgency = "normal";
+        icon = "dialog-information";
+    }
+
+    snprintf(body, sizeof(body),
+             "rule:   %s\nbinary: %s (pid %d%s%s)\ntarget: %s",
+             rule, bin, (int)hit->pid, comm[0] != '\0' ? ", " : "", comm,
+             target);
+
+    DisplaySession session;
+    if (!detect_display_session(hit->uid, &session))
+    {
+        log_msg(LOG_DEBUG,
+                "notify_rule_hit: no desktop session for uid %d; "
+                "notification skipped",
+                (int)hit->uid);
+        return;
+    }
+
+    /*
+     * Double fork: the grandchild is reparented to init and delivers the
+     * notification, the intermediate exits immediately, and the daemon
+     * only reaps the intermediate (no zombie, no event-loop stall).
+     */
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        log_msg(LOG_WARNING, "notify_rule_hit: fork failed: %m");
+        return;
+    }
+
+    if (pid == 0)
+    {
+        pid_t g = fork();
+        if (g < 0)
+            _exit(127);
+        if (g > 0)
+            _exit(0);
+
+        setsid();
+        drop_to_session_user(&session);
+        apply_display_env(&session);
+        close_fds_from(3);
+        execl(NOTIFY_SEND_PATH, "notify-send", "-a", "Fileshield",
+              "-u", urgency, "-i", icon, title, body, (char *)NULL);
+        _exit(127);
+    }
+
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
+}
+
+int notify_test_hit_rate(int kind, const char *binary, const char *target,
+                         int dedup_seconds, int max_per_window)
+{
+    return notify_rate_allow(kind, binary ? binary : "",
+                             target ? target : "", dedup_seconds,
+                             max_per_window);
+}
+
+void notify_test_reset_rate(void)
+{
+    memset(g_notify_dedup, 0, sizeof(g_notify_dedup));
+    g_notify_dedup_count = 0;
+    g_notify_dedup_next = 0;
+    g_notify_window_count = 0;
+    g_notify_window_start = 0;
+    g_notify_window_logged = 0;
+}

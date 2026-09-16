@@ -77,4 +77,43 @@ int notify_ask_hash_change(const NotifyHashChange *req);
 /* Human-readable name of a NOTIFY_* decision code ("Allow Once"). */
 const char *notify_decision_name(int decision);
 
+/*
+ * Desktop notifications for config-rule hits (notify-send).  The daemon
+ * runs as root, so delivery reuses the dialog session detection and drops
+ * to the requesting user's session; the call is fire-and-forget and never
+ * affects the access decision.
+ */
+
+/* Notification kinds: title, urgency and icon differ per kind. */
+#define NOTIFY_HIT_ALLOW 0  /* hash-pinned [allowlist] hit */
+#define NOTIFY_HIT_UNSAFE 1 /* [unsafe_allowlist] hit      */
+#define NOTIFY_HIT_DENY 2   /* [denylist] block            */
+
+typedef struct
+{
+    uid_t uid;         /* requester's real uid (session to notify)    */
+    int kind;          /* NOTIFY_HIT_*                                 */
+    const char *rule;  /* matched config rule pattern                  */
+    const char *binary; /* concrete binary path                        */
+    pid_t pid;
+    const char *comm;  /* process name; may be NULL/""                 */
+    const char *target; /* file the request was for                    */
+    int dedup_seconds; /* identical-hit suppression window; 0 = all    */
+    int max_per_window; /* global cap per 60 s window; <= 0 = default  */
+} NotifyHit;
+
+/*
+ * Fire-and-forget notification for one config-rule hit.  Identical
+ * (kind, binary, target) hits inside dedup_seconds are suppressed, as is a
+ * flood of distinct keys; a missing notify-send or an undetectable desktop
+ * session logs once / at DEBUG and drops the notification.  Never blocks
+ * the event loop and never changes the decision.
+ */
+void notify_rule_hit(const NotifyHit *hit);
+
+/* Test seams: exercise the rate/dedup window without a desktop session. */
+int notify_test_hit_rate(int kind, const char *binary, const char *target,
+                         int dedup_seconds, int max_per_window);
+void notify_test_reset_rate(void);
+
 #endif

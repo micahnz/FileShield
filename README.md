@@ -34,6 +34,7 @@ explicit approval is given.
 - **Interactive prompts**: Two-stage `kdialog` popups ask for permission before any data is exposed; the dialog inherits your session's Qt theme, fonts and scaling.
 - **Scoped decisions**: _Allow Once_ is file-scoped with a `user_ttl`; _Allow Session_ is scoped to that binary and exact file for the lifetime of the shell session (optionally capped by `session_ttl`); _Allow Always_ is a persistent rule bound to the binary hash, call chain, exact file and exact command line. Matching deny scopes exist too.
 - **Hash-pinned allowlists**: `[allowlist]` rules record the binary's SHA-512 on first use and require an explicit popup approval if it ever changes; `[unsafe_allowlist]` opts tools with unpinnable binaries (AppImages, tmp mounts) out of hash checking.
+- **Security tripwires**: `[unsafe_allowlist]` and `[denylist]` hits raise a critical desktop notification naming the rule, binary and target, so an impersonated binary exploiting a broad unsafe rule is visible immediately. Deduplicated per key with a configurable window and a global flood cap; the pinned `[allowlist]` can notify too, off by default.
 - **SRE secrets covered by default**: AWS, kubeconfig, SSH keys, GCP, Azure,
   Vault token, Docker config, and more — out of the box. Please feel free to
   open an issue suggesting additional defaults.
@@ -45,6 +46,7 @@ explicit approval is given.
 - Linux kernel **5.0+** (5.1+ recommended)
 - **`kdialog`** (for GUI popups; part of KDE but works in other desktop environments too)
 - On non-KDE desktops, a Qt platform theme integration (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`) if you want the dialog to match the system theme; without one kdialog falls back to Qt's default light theme
+- **`notify-send`** (libnotify) for the optional rule-hit notifications. Without it, or without a detectable desktop session, notifications are skipped and access decisions are unaffected
 
 ---
 
@@ -160,6 +162,18 @@ Use it only for tools whose binary genuinely cannot be pinned — AppImages or o
 
 This is the escape hatch for the pin's one real trade-off (see [Allowlist](#allowlist)): a glob rule pins its pattern, so every binary matching it shares one pin and switching between them prompts. Prefer `[allowlist]` whenever the binary is stable enough to pin.
 
+#### Handle with caution
+
+Because an unsafe rule never checks the binary hash, it is only as narrow as its pattern. Any process that can create a path matching the rule and name its binary accordingly inherits the grant. The concrete attack this section was written for: a rule such as
+
+```ini
+/tmp/.mount_*/openchamber = ~/.local/share/opencode/
+```
+
+grants any binary called `openchamber` under a matching `/tmp/.mount_*` directory access to the opencode data directory. An attacker who knows or guesses that such a pattern exists can create a lookalike mount directory and binary and read the secrets through it. The configuration file is root-owned and read-only, but the *pattern* is guessable, and no hash check stands in the way.
+
+Treat `[unsafe_allowlist]` as a deliberate hole: use it only when the matching binary genuinely cannot be pinned, and keep patterns as narrow as the tool allows. The mitigation is visibility — `notify_unsafe_allowlist` is **on by default**, so every matching hit raises a `critical` desktop notification naming the rule pattern, the concrete binary, its PID and the target file (subject to the [flood control](#notifications)). If a notification appears for a binary you did not launch, treat it as a security incident: read the journal, find the process, and tighten or remove the rule.
+
 ### Allowlist
 
 The `[allowlist]` section rules are **hash-pinned**. Pre-allowlisting a binary by path is still a conscious trust decision: the first matching access silently records the binary's SHA-512, and every later access must match it, so a replaced or tampered binary cannot inherit the rule without an explicit prompt.
@@ -238,7 +252,46 @@ session_ttl = 0
 # addition to the one-line-per-access INFO record.  Off by default; the
 # daemon's -d/--debug flag enables the same thing for a single run.
 debug = no
+
+# Desktop notifications (notify-send) on config-rule hits.  The unsafe
+# allowlist and the denylist warn by default; the hash-pinned allowlist is
+# opt-in.  See "Notifications" below.
+notify_unsafe_allowlist = yes
+notify_allowlist = no
+notify_denylist = yes
+
+# Identical (list, binary, target) notifications are suppressed for this
+# many seconds; 0 notifies on every hit.
+notify_dedup_ttl = 60
+
+# Global cap: at most this many notifications per 60-second window, after
+# which the flood is logged once and further notifications are dropped for
+# the window.  Must be >= 1.
+notify_max = 20
 ```
+
+### Notifications
+
+Fileshield can raise a desktop notification through `notify-send` whenever a **config rule** resolves an access — not for user dialog decisions, which are already explicit. Three settings control it:
+
+| Setting                   | Default | Notifies on                                    |
+| ------------------------- | ------- | ---------------------------------------------- |
+| `notify_unsafe_allowlist` | `yes`   | `[unsafe_allowlist]` grant                     |
+| `notify_allowlist`        | `no`    | `[allowlist]` grant (pin match or first use)   |
+| `notify_denylist`         | `yes`   | `[denylist]` block                             |
+
+The `[unsafe_allowlist]` and `[denylist]` defaults are the security tripwires: an unsafe hit is a grant that skipped hash pinning (see [Handle with caution](#handle-with-caution)), and a denylist hit is an access someone tried to make. Both use `critical` urgency; the optional allowlist notification is `normal`.
+
+A notification names the matched rule pattern, the concrete binary (PID and process name) and the target file:
+
+```text
+Fileshield: unsafe allowlist rule used
+rule:   /tmp/.mount_*/openchamber
+binary: /tmp/.mount_Ab3xY/openchamber (pid 4321, openchamber)
+target: /home/user/.local/share/opencode/auth.json
+```
+
+An attacker can trigger these notifications, so delivery is bounded by two settings: identical `(list, binary, target)` hits are suppressed for `notify_dedup_ttl` seconds (default 60; `0` notifies every hit), and `notify_max` (default 20) caps how many notifications are delivered per 60-second window — a burst of distinct keys beyond the cap is logged once and dropped for the window. Notifications are best-effort: without a detectable desktop session or without `notify-send`, they are skipped and the access decision is unchanged. The journal remains the authoritative record — a notification is a heads-up, not an audit trail.
 
 ### Example Workflow
 
@@ -404,6 +457,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 - **Allowlisted binaries must be hashable**: a binary under a protected path is deliberately not hashed, and a fork/exec failure or timeout leaves the digest unavailable — in both cases an `[allowlist]` match falls back to the normal prompt instead of granting silently, and the prompt states the reason and points at `[unsafe_allowlist]` for a permanent grant. A damaged or unreadable `allowlist-hashes.json` fails closed the same way until it is repaired or removed. A failed hash is retried at most once per minute per binary (keyed by mount identity, or by process identity when the executable cannot be stat'ed), and the `sha512` log line names the failing path and reason; ancestor hashes are computed only when a runtime _Always_ entry passes the path/digest checks and the chain comparison is actually needed — or when a prompt is shown.
 - **Denylist rules are never hash-checked**: pinning exists to detect a replaced allowlisted binary; a deny is enforced regardless of which binary matches.
 - **No pin-management CLI**: `[allowlist]` pins can only be updated through the change dialog. Root can inspect or edit `/var/lib/fileshield/allowlist-hashes.json` directly; a repaired, replaced or removed file takes effect on the next reload.
+- **Notifications are best-effort and attacker-triggerable**: they need a detectable desktop session and `notify-send`; otherwise they are skipped (access decisions are unaffected). Anyone who can trigger a rule can also trigger a notification, so delivery is deduplicated and capped (20 per 60 s), and the notification is only a heads-up — the journal is the record. User dialog decisions (Allow/Deny Once/Session/Always) never notify, because the user just made them.
 
 ---
 

@@ -209,16 +209,16 @@ static const RuleEntry *unsafe_allowlist_match(const char *binary,
 /* Config [denylist]: static admin-denied binary/target pairs (globs
  * included through rule_matches()), checked before every grant so a
  * denial always wins.  Deny rules are never hash-pinned. */
-static int denylist_match(const char *binary, const char *target)
+static const RuleEntry *denylist_match(const char *binary, const char *target)
 {
     if (!g_config)
-        return 0;
+        return NULL;
     for (int i = 0; i < g_config->denylist_count; i++)
     {
         if (rule_matches(&g_config->denylist[i], binary, target))
-            return 1;
+            return &g_config->denylist[i];
     }
-    return 0;
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1672,6 +1672,58 @@ typedef struct
 } EventCtx;
 
 /*
+ * Desktop tripwire for one config-rule hit ([allowlist], [unsafe_allowlist]
+ * or [denylist]).  Purely advisory: it is rate-limited under the
+ * configurable notification window, a missing desktop or notify-send drops
+ * it, and it never changes the decision.  comm may be NULL (stage 3 has not
+ * read it yet), in which case it is read here.
+ */
+static void config_rule_notify(EventCtx *c, const RuleEntry *e, int kind,
+                               const char *comm)
+{
+    char comm_buf[256];
+
+    if (!g_config || !e)
+        return;
+
+    int enabled;
+    switch (kind)
+    {
+    case NOTIFY_HIT_UNSAFE:
+        enabled = g_config->notify_unsafe_allow;
+        break;
+    case NOTIFY_HIT_DENY:
+        enabled = g_config->notify_deny;
+        break;
+    default:
+        enabled = g_config->notify_allow;
+        break;
+    }
+    if (!enabled)
+        return;
+
+    if (!comm)
+    {
+        memset(comm_buf, 0, sizeof(comm_buf));
+        read_comm(c->ev->pid, comm_buf, sizeof(comm_buf));
+        comm = comm_buf;
+    }
+
+    NotifyHit hit;
+    memset(&hit, 0, sizeof(hit));
+    hit.uid = proc_uid(c->ev->pid);
+    hit.kind = kind;
+    hit.rule = e->binary;
+    hit.binary = c->binary;
+    hit.pid = c->ev->pid;
+    hit.comm = comm;
+    hit.target = c->target;
+    hit.dedup_seconds = g_config->notify_dedup_seconds;
+    hit.max_per_window = g_config->notify_max;
+    notify_rule_hit(&hit);
+}
+
+/*
  * Capture the requester's ancestor chain on demand.  The chain is only
  * consumed by the runtime "Always" matchers and recorders: matchers ask
  * for it through event_chain_provider() after an entry has passed every
@@ -1834,10 +1886,13 @@ static int event_load_binary(EventCtx *c)
     /* Config denylist: a static admin denial always wins over every
      * grant.  Checked before hashing so denied binaries never pay for
      * binary/ancestor SHA-512 computation. */
-    if (denylist_match(c->binary, c->target))
+    const RuleEntry *deny_rule = denylist_match(c->binary, c->target);
+    if (deny_rule)
     {
         log_msg(LOG_INFO, "config denylist hit: %s (pid %d) -> %s",
                 c->binary, (int)c->ev->pid, c->target);
+        /* Stage 4 has not read comm yet; the notify helper reads it. */
+        config_rule_notify(c, deny_rule, NOTIFY_HIT_DENY, NULL);
         ctx_respond(c, FAN_DENY);
         return 1;
     }
@@ -2150,6 +2205,9 @@ static int event_runtime_allowed(EventCtx *c)
         {
             log_msg(LOG_INFO, "unsafe allowlist hit: %s (pid %d) -> %s",
                     c->binary, (int)c->ev->pid, c->target);
+            /* Unsafe hits are the ones most worth surfacing: the rule
+             * skips hash pinning, so an impersonated binary matches. */
+            config_rule_notify(c, unsafe, NOTIFY_HIT_UNSAFE, c->comm);
             config_allow_grant(c, unsafe);
             return 1;
         }
@@ -2172,6 +2230,7 @@ static int event_runtime_allowed(EventCtx *c)
             if (verdict == ALLOWLIST_PIN_FIRST_USE)
             {
                 config_allow_pin_first_seen(rule, c->bin_sha512);
+                config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
                 config_allow_grant(c, rule);
                 return 1;
             }
@@ -2180,6 +2239,7 @@ static int event_runtime_allowed(EventCtx *c)
                 log_msg(LOG_INFO,
                         "config allowlist hit (pin match): %s (pid %d) -> %s",
                         c->binary, (int)c->ev->pid, c->target);
+                config_rule_notify(c, rule, NOTIFY_HIT_ALLOW, c->comm);
                 config_allow_grant(c, rule);
                 return 1;
             }
@@ -2871,7 +2931,7 @@ const char *fanotify_test_unsafe_allow_match(const char *binary,
 
 int fanotify_test_config_deny_match(const char *binary, const char *target)
 {
-    return denylist_match(binary, target);
+    return denylist_match(binary, target) != NULL;
 }
 
 /*

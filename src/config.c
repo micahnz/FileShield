@@ -25,6 +25,27 @@ static char *trim(char *s)
 }
 
 /*
+ * parse_bool: accept the same spellings as [settings] debug (and the
+ * notification toggles).  Returns 1 and sets *out when recognized.
+ */
+static int parse_bool(const char *val, int *out)
+{
+    if (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 ||
+        strcmp(val, "1") == 0)
+    {
+        *out = 1;
+        return 1;
+    }
+    if (strcmp(val, "no") == 0 || strcmp(val, "false") == 0 ||
+        strcmp(val, "0") == 0)
+    {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * canonicalize_path: resolve symlinks so path comparisons against
  * /proc/self/fd/N paths (which are always canonical) cannot be bypassed
  * by a symlinked home/config directory.  If the path does not exist yet,
@@ -408,6 +429,18 @@ int config_load(const char *path, Config *cfg)
 
     memset(cfg, 0, sizeof(*cfg));
 
+    /*
+     * Notification defaults, documented in the shipped fileshield.conf:
+     * the hash-pinned [allowlist] is silent (an expected, admin-opted-in
+     * grant); [unsafe_allowlist] and [denylist] notify so an impersonated
+     * binary or an unexpected block is visible.
+     */
+    cfg->notify_unsafe_allow = 1;
+    cfg->notify_allow = 0;
+    cfg->notify_deny = 1;
+    cfg->notify_dedup_seconds = NOTIFY_DEDUP_DEFAULT_S;
+    cfg->notify_max = NOTIFY_MAX_DEFAULT;
+
     while (fgets(line, sizeof(line), fp))
     {
         if (!strchr(line, '\n') && !feof(fp))
@@ -577,15 +610,73 @@ int config_load(const char *path, Config *cfg)
             else if (strcmp(key, "debug") == 0)
             {
                 /* Enables the per-event LOG_DEBUG firehose at runtime. */
-                if (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 ||
-                    strcmp(val, "1") == 0)
-                    log_set_debug(1);
-                else if (strcmp(val, "no") == 0 || strcmp(val, "false") == 0 ||
-                         strcmp(val, "0") == 0)
-                    log_set_debug(0);
+                int on;
+                if (parse_bool(val, &on))
+                    log_set_debug(on);
                 else
                     log_msg(LOG_ERR,
                             "config_load: invalid debug value (yes|no): %s",
+                            val);
+            }
+            else if (strcmp(key, "notify_unsafe_allowlist") == 0)
+            {
+                int on;
+                if (parse_bool(val, &on))
+                    cfg->notify_unsafe_allow = on;
+                else
+                    log_msg(LOG_ERR,
+                            "config_load: invalid notify_unsafe_allowlist "
+                            "(yes|no): %s", val);
+            }
+            else if (strcmp(key, "notify_allowlist") == 0)
+            {
+                int on;
+                if (parse_bool(val, &on))
+                    cfg->notify_allow = on;
+                else
+                    log_msg(LOG_ERR,
+                            "config_load: invalid notify_allowlist (yes|no): %s",
+                            val);
+            }
+            else if (strcmp(key, "notify_denylist") == 0)
+            {
+                int on;
+                if (parse_bool(val, &on))
+                    cfg->notify_deny = on;
+                else
+                    log_msg(LOG_ERR,
+                            "config_load: invalid notify_denylist (yes|no): %s",
+                            val);
+            }
+            else if (strcmp(key, "notify_dedup_ttl") == 0)
+            {
+                /* Seconds an identical (list, binary, target) notification is
+                 * suppressed; 0 notifies on every hit. */
+                int ttl;
+                if (sscanf(val, "%d", &ttl) == 1 && ttl >= 0)
+                {
+                    if (ttl > FS_MAX_TTL_SECONDS)
+                    {
+                        log_msg(LOG_WARNING,
+                                "config_load: notify_dedup_ttl %d clamped to "
+                                "%d seconds", ttl, FS_MAX_TTL_SECONDS);
+                        ttl = FS_MAX_TTL_SECONDS;
+                    }
+                    cfg->notify_dedup_seconds = ttl;
+                }
+                else
+                    log_msg(LOG_ERR, "config_load: invalid notify_dedup_ttl: %s",
+                            val);
+            }
+            else if (strcmp(key, "notify_max") == 0)
+            {
+                /* Global cap per 60 s window; the dedup window bounds each
+                 * key, this bounds a burst of distinct keys. */
+                int max;
+                if (sscanf(val, "%d", &max) == 1 && max >= 1)
+                    cfg->notify_max = max;
+                else
+                    log_msg(LOG_ERR, "config_load: invalid notify_max (>= 1): %s",
                             val);
             }
         }

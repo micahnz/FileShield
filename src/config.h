@@ -7,6 +7,11 @@
 #define MAX_PATHS 1024
 #define MAX_RULES 128 /* per section: [allowlist], [unsafe_allowlist], [denylist] */
 
+/* Default suppression window (seconds) for identical desktop notifications. */
+#define NOTIFY_DEDUP_DEFAULT_S 60
+/* Default global notification cap per 60-second window. */
+#define NOTIFY_MAX_DEFAULT 20
+
 /*
  * One [protected_paths] entry.  Exact entries keep the historical
  * "equal or under" prefix semantics; glob entries ('*' present) are
@@ -62,6 +67,17 @@ typedef struct
                                 config sets 300)                              */
     int session_ttl_seconds; /* TTL cap for session decisions; 0 = for as long
                                 as the session leader (shell) lives          */
+    /*
+     * Desktop notifications on config-rule hits (notify-send).  Defaults are
+     * applied by config_load() when a key is absent: the unsafe allowlist
+     * (no hash pinning) and the denylist notify by default, the pinned
+     * allowlist does not.
+     */
+    int notify_unsafe_allow;   /* [unsafe_allowlist] hit; default on  */
+    int notify_allow;          /* [allowlist] hit; default off        */
+    int notify_deny;           /* [denylist] hit; default on          */
+    int notify_dedup_seconds;  /* per (list, binary, target); 0 = every hit */
+    int notify_max;            /* global cap per 60 s window; >= 1     */
 } Config;
 
 int config_load(const char *path, Config *cfg);

@@ -219,6 +219,86 @@ static void test_settings_invalid_user_ttl(void)
 }
 
 /*
+ * Notification toggles: unsafe_allowlist and denylist on by default,
+ * allowlist off; notify_dedup_ttl defaults to 60 s.  Explicit values use
+ * the same yes/no/true/false/1/0 spellings as debug; invalid values are
+ * rejected and the default is kept.
+ */
+static void test_settings_notifications(void)
+{
+    Config cfg;
+
+    /* Defaults with no keys present. */
+    char *path = write_temp("[settings]\n");
+    ASSERT(path != NULL, "write temp config for notification defaults");
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load notification defaults");
+    ASSERT(cfg.notify_unsafe_allow == 1, "unsafe allowlist notify defaults on");
+    ASSERT(cfg.notify_allow == 0, "allowlist notify defaults off");
+    ASSERT(cfg.notify_deny == 1, "denylist notify defaults on");
+    ASSERT(cfg.notify_dedup_seconds == NOTIFY_DEDUP_DEFAULT_S,
+           "notify_dedup_ttl defaults to 60 s");
+    ASSERT(cfg.notify_max == NOTIFY_MAX_DEFAULT,
+           "notify_max defaults to 20 per window");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    /* Explicit values, mixed accepted spellings. */
+    path = write_temp("[settings]\n"
+                      "notify_unsafe_allowlist = no\n"
+                      "notify_allowlist = true\n"
+                      "notify_denylist = 0\n"
+                      "notify_dedup_ttl = 15\n"
+                      "notify_max = 5\n");
+    ASSERT(path != NULL, "write temp config for notification values");
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load notification values");
+    ASSERT(cfg.notify_unsafe_allow == 0, "notify_unsafe_allowlist = no");
+    ASSERT(cfg.notify_allow == 1, "notify_allowlist = true");
+    ASSERT(cfg.notify_deny == 0, "notify_denylist = 0");
+    ASSERT(cfg.notify_dedup_seconds == 15, "notify_dedup_ttl = 15");
+    ASSERT(cfg.notify_max == 5, "notify_max = 5");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    /* Invalid values and out-of-range numbers keep the defaults. */
+    path = write_temp("[settings]\n"
+                      "notify_unsafe_allowlist = maybe\n"
+                      "notify_denylist = nope\n"
+                      "notify_dedup_ttl = -5\n"
+                      "notify_max = 0\n");
+    ASSERT(path != NULL, "write temp config for invalid notifications");
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load invalid notifications");
+    ASSERT(cfg.notify_unsafe_allow == 1, "invalid toggle keeps default on");
+    ASSERT(cfg.notify_deny == 1, "invalid toggle keeps default on");
+    ASSERT(cfg.notify_dedup_seconds == NOTIFY_DEDUP_DEFAULT_S,
+           "invalid notify_dedup_ttl keeps the default");
+    ASSERT(cfg.notify_max == NOTIFY_MAX_DEFAULT,
+           "invalid notify_max keeps the default");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+
+    /* 0 disables the suppression window (notify on every hit). */
+    path = write_temp("[settings]\n"
+                      "notify_dedup_ttl = 0\n");
+    ASSERT(path != NULL, "write temp config for dedup zero");
+
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "config_load dedup zero");
+    ASSERT(cfg.notify_dedup_seconds == 0, "notify_dedup_ttl = 0 accepted");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
  * Absurd TTL values must be clamped (to one year) so cache expiry
  * arithmetic cannot overflow on any time_t width.
  */
@@ -1092,6 +1172,7 @@ int main(void)
     test_settings_session_ttl_value();
     test_settings_invalid_session_ttl();
     test_settings_invalid_user_ttl();
+    test_settings_notifications();
     test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
