@@ -362,6 +362,11 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
    Each row repeats its scope's concise description inline, so the
    decision never depends on re-reading the block above.
 
+   The description is rendered as left-aligned rich text: keys (*Binary*,
+   *Command*, *Path*) and the scope names are bold, and every value is
+   HTML-escaped before it is shown, so a crafted file name cannot forge
+   markup inside the prompt.
+
    The selection is reported by kdialog on **stdout** (the chosen row's
    tag) together with a zero exit code — the only way a grant can happen.
    Every failure mode (cancel, window close, timeout, runtime error, even

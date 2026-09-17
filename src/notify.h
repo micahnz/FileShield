@@ -150,4 +150,12 @@ int notify_test_menu_choice(const char *token);
  */
 void notify_test_set_kdialog_path(const char *path);
 
+/*
+ * Test seam: the prompt-body HTML escaper used for the styled --menu
+ * description (& < > -> entities, newlines -> <br>).  Returns 0 on
+ * success; -1 with out[0] == '\0' when outsz cannot hold the result,
+ * in which case the caller passes the plain-text body instead.
+ */
+int notify_test_html_escape(const char *in, char *out, size_t outsz);
+
 #endif

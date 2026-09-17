@@ -736,6 +736,78 @@ static int run_kdialog(const DisplaySession *session,
 }
 
 /*
+ * Escape a plain string for safe embedding in the prompt's rich text.
+ *
+ * The --menu body renders as HTML (KListBoxDialog uses a plain QLabel
+ * with Qt::AutoText), which widens the injection surface beyond control
+ * characters: sanitize_text() neutralizes those but NOT '&', '<' or '>',
+ * all legal in file names and comm.  Without this escape a crafted path
+ * like "<img src=y onerror=...>" would execute markup INSIDE a security
+ * prompt.  Newlines become <br> (the only multi-line inputs we escape
+ * are daemon-built, e.g. the hash-unavailable note; requester fields
+ * are already \n-stripped by sanitize_text).  UTF-8 bytes pass verbatim:
+ * continuation bytes are >= 0x80 and never collide with the escaped set.
+ *
+ * Returns 0 on success; on ANY capacity shortfall returns -1 with
+ * out[0] == '\0' so callers fall back to the plain-text body rather
+ * than emit a half-written markup document.
+ */
+static int html_escape(const char *in, char *out, size_t outsz)
+{
+    size_t j = 0;
+    size_t i;
+
+    if (outsz == 0)
+        return -1;
+    out[0] = '\0';
+
+    for (i = 0; in[i] != '\0'; i++)
+    {
+        const char *rep = NULL;
+        size_t rl;
+
+        switch (in[i])
+        {
+        case '&':
+            rep = "&amp;";
+            break;
+        case '<':
+            rep = "&lt;";
+            break;
+        case '>':
+            rep = "&gt;";
+            break;
+        case '\n':
+            rep = "<br>";
+            break;
+        default:
+            break;
+        }
+        rl = rep ? strlen(rep) : 1;
+        if (j + rl >= outsz)
+        {
+            out[0] = '\0';
+            return -1;
+        }
+        if (rep)
+        {
+            memcpy(out + j, rep, rl);
+            j += rl;
+        }
+        else
+            out[j++] = in[i];
+        out[j] = '\0';
+    }
+    return 0;
+}
+
+/* Test seam (notify.h): the prompt-body HTML escaper. */
+int notify_test_html_escape(const char *in, char *out, size_t outsz)
+{
+    return html_escape(in, out, outsz);
+}
+
+/*
  * One choice row of a kdialog --menu prompt: the tag is what kdialog
  * echoes to stdout when the user picks the row; the label is the
  * descriptive text the user reads.
@@ -1155,8 +1227,81 @@ int notify_ask(const NotifyRequest *req)
         { "deny-always",   label_deny_always },
     };
 
+    /*
+     * Styled rich-text body: left-aligned paragraphs, bold keys, the
+     * protected path in larger monospace, bold scope names.  kdialog
+     * renders the --menu label as rich text (Qt::AutoText QLabel), so
+     * every interpolated value goes through html_escape first — after
+     * sanitize_text removed control characters, < > & are the remaining
+     * markup-injection channel and must not survive into the document.
+     *
+     * Any escape failure or snprintf truncation leaves `body` on the
+     * plain msg built above: readable, unstyled, never half-markup.
+     */
+    char e_comm[64 * 5 + 1];
+    char e_pcomm[64 * 5 + 1];
+    char e_exe[512 * 5 + 1];
+    char e_cmd[256 * 5 + 1];
+    char e_path[512 * 5 + 1];
+    char e_note[280 * 5 + 1];
+    char html[8192];
+    const char *body = msg;
+
+    if (html_escape(t.comm, e_comm, sizeof(e_comm)) == 0 &&
+        html_escape(t.pcomm, e_pcomm, sizeof(e_pcomm)) == 0 &&
+        html_escape(t.exe, e_exe, sizeof(e_exe)) == 0 &&
+        html_escape(t.cmd, e_cmd, sizeof(e_cmd)) == 0 &&
+        html_escape(t.path, e_path, sizeof(e_path)) == 0 &&
+        html_escape(t.note, e_note, sizeof(e_note)) == 0)
+    {
+        /* Body bullets reuse the same shared descriptions as the rows. */
+        char once_scope[192];
+        char session_scope[192];
+
+        snprintf(once_scope, sizeof(once_scope),
+                 "\xe2\x80\xa2 <b>Allow Once</b> \xe2\x80\x94 %s<br>",
+                 once_desc);
+        snprintf(session_scope, sizeof(session_scope),
+                 "\xe2\x80\xa2 <b>Allow Session</b> \xe2\x80\x94 %s<br>",
+                 session_desc);
+
+        char note_para[1450];
+
+        if (e_note[0] != '\0')
+            /* The note is daemon-generated but escaped like everything
+             * else; its leading \n\n already became <br><br>. */
+            snprintf(note_para, sizeof(note_para), "<p><i>%s</i></p>",
+                     e_note);
+        else
+            note_para[0] = '\0';
+
+        int need = snprintf(
+            html, sizeof(html),
+            "<div align=\"left\">"
+            "<p><b>Process %s</b> (PID %d, parent: %s, PID %d) "
+            "wants to read:</p>"
+            "<p><b>Binary:</b> <tt>%s</tt><br>"
+            "<b>Command:</b> <tt>%s</tt><br>"
+            "<b>Path:</b> <tt>%s</tt></p>"
+            "%s" /* note paragraph (empty when the hash is known) */
+            "<p>%s"  /* once scope */
+            "%s"     /* session scope */
+            "\xe2\x80\xa2 <b>Allow Always</b> \xe2\x80\x94 %s<br>"
+            "\xe2\x80\xa2 <b>Deny</b> rows block with the same scopes</p>"
+            "<p><i>Cancelling or closing this dialog, or any failure, "
+            "denies this attempt only.</i></p></div>",
+            e_comm, (int)req->pid, e_pcomm, (int)req->ppid,
+            e_exe, e_cmd, e_path, note_para, once_scope, session_scope,
+            always_desc);
+
+        /* Use the styled body only when it rendered completely; a
+         * truncation keeps the plain fallback already pointed to. */
+        if (need >= 0 && (size_t)need < sizeof(html))
+            body = html;
+    }
+
     char token[DIALOG_TOKEN_MAX];
-    int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, msg,
+    int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body,
                              items, (int)(sizeof(items) / sizeof(items[0])),
                              token, sizeof(token));
     if (r != 1)

@@ -1289,28 +1289,38 @@ static void test_menu_end_to_end(void) {
     }
     dump[dlen] = '\0';
     ASSERT(dlen > 0, "rendered body dump written");
-    ASSERT(strstr(dump, "Binary:   /bin/fake") != NULL,
-           "binary line present");
-    ASSERT(strstr(dump, "Command:  fake --arg\n"
-                        "Path:     /tmp/fake-secret") != NULL,
+    ASSERT(strstr(dump, "<div align=\"left\">") != NULL,
+           "body pinned left-aligned against kdialog's center label");
+    ASSERT(strstr(dump, "font-size") == NULL,
+           "no font-size overrides: one uniform text size");
+    ASSERT(strstr(dump, "What each row means") == NULL,
+           "row-meaning heading removed");
+    ASSERT(strstr(dump, "<b>Binary:</b>") != NULL &&
+               strstr(dump, "<b>Command:</b>") != NULL &&
+               strstr(dump, "<b>Path:</b>") != NULL,
+           "binary/command/path keys present");
+    ASSERT(strstr(dump, "<b>Command:</b> <tt>fake --arg</tt><br>"
+                        "<b>Path:</b> <tt>/tmp/fake-secret</tt>") != NULL,
            "Path follows Command immediately (no blank line)");
     {
-        const char *pbin = strstr(dump, "Binary:");
-        const char *pcmd = strstr(dump, "Command:");
-        const char *ppth = strstr(dump, "Path:");
+        const char *pbin = strstr(dump, "<b>Binary:</b>");
+        const char *pcmd = strstr(dump, "<b>Command:</b>");
+        const char *ppth = strstr(dump, "<b>Path:</b>");
         ASSERT(pbin != NULL && pcmd != NULL && ppth != NULL &&
                    pbin < pcmd && pcmd < ppth,
                "field order: Binary, Command, Path");
     }
-    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Once: this file and process")
-               != NULL,
-           "Allow Once description present");
-    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Session: this binary and file")
-               != NULL,
-           "Allow Session description present");
-    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Always: saved permanently for "
-                        "this command and file") != NULL,
-           "Allow Always description is the concise one");
+    ASSERT(strstr(dump, "<b>Allow Once</b> \xe2\x80\x94 "
+                        "this file and process") != NULL,
+           "Allow Once: description inline after the name");
+    ASSERT(strstr(dump, "<b>Allow Session</b> \xe2\x80\x94 "
+                        "this binary and file") != NULL,
+           "Allow Session: description inline after the name");
+    ASSERT(strstr(dump, "<b>Allow Always</b> \xe2\x80\x94 saved "
+                        "permanently for this command and file") != NULL,
+           "Allow Always description is the concise inline line");
+    ASSERT(strstr(dump, "&nbsp;") == NULL,
+           "no indentation entities: descriptions sit inline");
     ASSERT(strstr(dump, "call chain") == NULL,
            "old wordy Allow Always description is gone");
 
@@ -1336,6 +1346,44 @@ static void test_menu_end_to_end(void) {
     unlink(script);
 }
 
+/*
+ * The styled description renders as rich text, so escaping is the
+ * injection defense: file names and comm are attacker-controlled and
+ * may legally contain < > &, which must arrive as entities, while UTF-8
+ * (bullets, em-dash) passes verbatim.  A buffer that cannot hold the
+ * escaped result must yield NO output at all (the caller falls back to
+ * the plain body rather than emit half a document).
+ */
+static void test_html_escape(void) {
+    char out[512];
+
+    ASSERT(notify_test_html_escape("a & b < c > d\ne", out, sizeof(out)) == 0,
+           "escape succeeds");
+    ASSERT(strcmp(out, "a &amp; b &lt; c &gt; d<br>e") == 0,
+           "amp/lt/gt escaped, newline became <br>");
+
+    /* Injection attempt through a crafted file name: must render text. */
+    ASSERT(notify_test_html_escape("/x/<img src=y onerror=pwn()> <b>ALLOW</b>",
+                                   out, sizeof(out)) == 0,
+           "hostile name escapes");
+    ASSERT(strstr(out, "<img") == NULL, "no live <img> tag emitted");
+    ASSERT(strstr(out, "<b>") == NULL, "no forged bold tag emitted");
+    ASSERT(strstr(out, "&lt;img") != NULL, "angle brackets neutralized");
+
+    /* UTF-8 (em-dash, bullet) survives byte-for-byte. */
+    ASSERT(notify_test_html_escape("\xe2\x80\x94 \xe2\x80\xa2 ok", out,
+                                   sizeof(out)) == 0,
+           "utf-8 body escapes cleanly");
+    ASSERT(strstr(out, "\xe2\x80\x94 \xe2\x80\xa2 ok") != NULL,
+           "utf-8 passes verbatim");
+
+    /* Truncation: nothing is emitted, contract says plain fallback. */
+    char tiny[8];
+    ASSERT(notify_test_html_escape("far too long to fit", tiny,
+                                   sizeof(tiny)) == -1,
+           "undersized buffer reports truncation");
+    ASSERT(tiny[0] == '\0', "truncated output is emptied, not half-written");
+}
 
 /*
  * Part 1: fill the deferred queue to capacity, verify a full queue
@@ -2388,6 +2436,7 @@ int main(void) {
     test_kdialog_status_mapping();
     test_menu_choice_mapping();
     test_menu_end_to_end();
+    test_html_escape();
     test_verdict_stage_order();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
