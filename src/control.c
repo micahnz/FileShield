@@ -450,7 +450,21 @@ static int dispatch_prune(int fd, int list)
     {
         removed = 0;
         if (fanotify_prune_dyn_list(1, &removed) < 0)
+        {
+            /* A both-list request may already have pruned the allow side;
+             * say so rather than reporting a blanket failure. */
+            if (list == -1 && total > 0)
+            {
+                char msg[96];
+
+                snprintf(msg, sizeof(msg),
+                         "pruned %d always-allow rule(s), then failed to "
+                         "prune always-deny rules",
+                         total);
+                return reply_err(fd, msg);
+            }
             return reply_err(fd, "failed to prune always-deny rules");
+        }
         total += removed;
     }
     return reply_scalar(fd, total);
@@ -542,8 +556,10 @@ int control_setup_at(const char *path)
     size_t path_len;
     int fd;
 
-    g_bound_path[0] = '\0';
-
+    /* g_bound_path is deliberately NOT cleared here: a failed call (for
+     * example the live-listener refusal) must not make a later
+     * control_teardown() of a still-live listener forget the path it
+     * owns.  A successful bind overwrites it below. */
     if (!path || path[0] == '\0')
     {
         log_msg(LOG_ERR, "control: empty socket path");
@@ -575,6 +591,43 @@ int control_setup_at(const char *path)
                     path, (unsigned)st.st_uid, (unsigned)geteuid());
             return -1;
         }
+
+        /* A socket we own may still have a live listener: a second
+         * daemon must not silently take over the path, because the CLI
+         * would then manage a process whose in-memory lists are not the
+         * ones enforcing.  Probe with a non-blocking connect: refused or
+         * absent means stale; a successful connect (or any other errno,
+         * including a full backlog) means a listener and startup fails
+         * closed. */
+        {
+            int probe = socket(AF_UNIX,
+                               SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+            struct sockaddr_un paddr;
+            int prc;
+            int saved;
+
+            if (probe < 0)
+            {
+                log_msg(LOG_ERR, "control: probe socket: %s", strerror(errno));
+                return -1;
+            }
+            memset(&paddr, 0, sizeof(paddr));
+            paddr.sun_family = AF_UNIX;
+            memcpy(paddr.sun_path, path, path_len + 1);
+            prc = connect(probe, (struct sockaddr *)&paddr, sizeof(paddr));
+            saved = errno;
+            close(probe);
+            errno = saved;
+            if (prc == 0 || (errno != ECONNREFUSED && errno != ENOENT))
+            {
+                log_msg(LOG_ERR,
+                        "control: another daemon is already listening on %s; "
+                        "refusing to take over",
+                        path);
+                return -1;
+            }
+        }
+
         if (unlink(path) < 0)
         {
             log_msg(LOG_ERR, "control: cannot remove stale socket %s: %s",

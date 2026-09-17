@@ -481,34 +481,49 @@ static void apply_entry_field(const char *filepath, PersistEntry *e,
                    sizeof(e->chain_sha512[idx]), value);
 }
 
-/* Apply the numeric fields (chain_depth, created_at) of one line. */
+/*
+ * Apply the numeric fields (chain_depth, created_at) of one line.
+ * strtol (not sscanf %d/%ld): an out-of-range value in a hand-edited or
+ * corrupt file is undefined behavior with scanf conversions, while
+ * ERANGE is a defined rejection here.  The same reason pin.c parses its
+ * numeric fields with strtol.
+ */
 static void apply_entry_number(PersistEntry *e, const char *line)
 {
     char key_buf[256];
-    int tmp_int;
-    long created_tmp;
+    const char *rest;
+    char *end;
+    long value;
+    int pos = 0;
 
-    if (sscanf(line, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
-        strcmp(key_buf, "chain_depth") == 0)
+    if (sscanf(line, " \"%255[^\"]\": %n", key_buf, &pos) != 1)
+        return;
+    rest = line + pos;
+    errno = 0;
+    value = strtol(rest, &end, 10);
+    if (end == rest || errno == ERANGE)
+        return; /* malformed or out of range: leave the field untouched */
+
+    if (strcmp(key_buf, "chain_depth") == 0)
     {
         /* chain_depth is used as an array bound: reject anything outside
          * [0, PERSIST_CHAIN_MAX] at the parse boundary. */
-        if (tmp_int >= 0 && tmp_int <= PERSIST_CHAIN_MAX)
+        if (value >= 0 && value <= PERSIST_CHAIN_MAX)
         {
-            e->chain_depth = tmp_int;
+            e->chain_depth = (int)value;
         }
         else
         {
             log_msg(LOG_WARNING,
-                    "persist_load: chain_depth %d out of range [0,%d], clamping",
-                    tmp_int, PERSIST_CHAIN_MAX);
-            e->chain_depth = tmp_int < 0 ? 0 : PERSIST_CHAIN_MAX;
+                    "persist_load: chain_depth %ld out of range [0,%d], "
+                    "clamping",
+                    value, PERSIST_CHAIN_MAX);
+            e->chain_depth = value < 0 ? 0 : PERSIST_CHAIN_MAX;
         }
     }
-    else if (sscanf(line, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
-             strcmp(key_buf, "created_at") == 0)
+    else if (strcmp(key_buf, "created_at") == 0)
     {
-        e->created_at = (time_t)created_tmp;
+        e->created_at = (time_t)value;
     }
 }
 

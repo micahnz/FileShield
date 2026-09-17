@@ -124,9 +124,10 @@ void fanotify_drain_and_deny(int fan_fd);
  * into the in-memory lists (called on daemon startup and reload).
  *
  * Each admitted entry keeps its stored rule_id (16 lowercase hex chars)
- * and created_at.  A legacy entry without an ID -- or with a malformed
- * one -- gets an ID generated from its identity, unique within the same
- * list (allow and deny are independent ID namespaces).  When at least
+ * and created_at.  A legacy entry with no ID gets one generated from its
+ * identity, unique within the same list (allow and deny are independent
+ * ID namespaces); a malformed stored ID never reaches this layer because
+ * persist_load() drops that entry whole (fail closed).  When at least
  * one ID was regenerated the migrated list is written back to that
  * side's state file immediately (through the path set by
  * fanotify_set_state_files()), so the file gains the IDs at the first

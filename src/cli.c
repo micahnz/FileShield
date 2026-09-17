@@ -30,9 +30,14 @@
 
 #define CLI_VERSION "2.0.0"
 
-/* The session payload of a worst-case table is a few MB; the CLI can
- * afford one generous buffer instead of a growable one. */
-#define CLI_RESP_MAX (4 * 1024 * 1024)
+/*
+ * `session list` can show both 256-entry tables at once.  A payload line
+ * is worst-case binary+target each escaped sixfold (a path of raw
+ * control bytes), so one generous buffer sized for the full 512-record,
+ * all-control-bytes case replaces a growable read.
+ */
+#define CLI_SESSION_MAX (2 * CONTROL_PAYLOAD_MAX)
+#define CLI_RESP_MAX (CLI_SESSION_MAX * (6 * 2 * PATH_MAX + 512))
 
 static int g_yes;  /* -y/--yes: skip confirmations */
 static int g_wide; /* --wide: no binary/args/target truncation */ 
@@ -154,6 +159,33 @@ static int load_pins(PinRecord **out, int *count_out)
     *out = rows;
     *count_out = count;
     return 0;
+}
+
+/*
+ * persist_load() rejects an entry whose stored rule_id is present but
+ * empty, so a direct-file fallback write must never emit one.  A file
+ * written before the rule-ID upgrade holds empty IDs until the daemon
+ * migrates it at load; the CLI cannot invent matching IDs (the daemon's
+ * nonce assignment depends on its own list state), so the fallback
+ * refuses and tells the user to start the daemon once instead of
+ * silently dropping every survivor on the next load.
+ */
+static int entries_all_have_ids(const PersistEntry *entries, int count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (entries[i].rule_id[0] == '\0')
+            return 0;
+    }
+    return 1;
+}
+
+static void refuse_legacy_write(int deny)
+{
+    fprintf(stderr,
+            "error: %s holds entries without rule IDs; start fileshield "
+            "once to migrate them, then retry\n",
+            rule_path(deny));
 }
 
 /* ------------------------------------------------------------------ */
@@ -644,6 +676,12 @@ static int fallback_remove_rules(int deny,
             w++;
         }
     }
+    if (!entries_all_have_ids(entries, w))
+    {
+        refuse_legacy_write(deny);
+        free(entries);
+        return -1;
+    }
     int rc = persist_save(path, entries, w);
     free(entries);
     if (rc < 0)
@@ -1075,10 +1113,25 @@ static int prune_apply_local(int deny)
     }
     ngroups = prune_find(entries, count, groups, count, removals, count,
                          &nremovals);
-    if (ngroups > 0 &&
-        prune_apply(entries, count, removals, nremovals, &new_count) >= 0)
+    if (ngroups < 0)
     {
-        if (persist_save(rule_path(deny), entries, new_count) < 0)
+        fprintf(stderr, "error: could not analyze %s\n", rule_path(deny));
+        rc = -1;
+    }
+    else if (ngroups > 0)
+    {
+        if (prune_apply(entries, count, removals, nremovals, &new_count) < 0)
+        {
+            fprintf(stderr, "error: could not apply the prune to %s\n",
+                    rule_path(deny));
+            rc = -1;
+        }
+        else if (!entries_all_have_ids(entries, new_count))
+        {
+            refuse_legacy_write(deny);
+            rc = -1;
+        }
+        else if (persist_save(rule_path(deny), entries, new_count) < 0)
         {
             fprintf(stderr, "error: failed to write %s\n", rule_path(deny));
             rc = -1;
@@ -1090,11 +1143,6 @@ static int prune_apply_local(int deny)
                     rule_path(deny));
             rc = nremovals;
         }
-    }
-    else if (ngroups < 0)
-    {
-        fprintf(stderr, "error: could not analyze %s\n", rule_path(deny));
-        rc = -1;
     }
     free(groups);
     free(removals);
@@ -1121,7 +1169,10 @@ static int cmd_prune(const char *which)
     }
 
     /* The pre-confirmation report is the dry run: always computed from
-     * the files, then discarded unless the user confirms. */
+     * the files, then discarded unless the user confirms.  A live daemon
+     * can hold entries whose state-file write failed earlier, so its
+     * prune may remove a group this report never showed; the daemon's
+     * removed count (printed below) stays authoritative. */
     if (want_allow && prune_list(0) < 0)
         return 1;
     if (want_deny && prune_list(1) < 0)
@@ -1370,6 +1421,13 @@ static void format_expiry(long ttl, char *out, size_t outsz)
 static void session_describe_one(const CliSessionRow *row, int first)
 {
     char expiry[96];
+    char binary[PATH_MAX];
+    char target[PATH_MAX];
+
+    /* Paths can carry control bytes; the table renderer sanitizes and so
+     * must this one, or a rule's target could drive the user's terminal. */
+    cli_ui_sanitize(row->binary, binary, sizeof(binary));
+    cli_ui_sanitize(row->target, target, sizeof(target));
 
     if (!first)
         putchar('\n');
@@ -1377,8 +1435,8 @@ static void session_describe_one(const CliSessionRow *row, int first)
     printf("ID:         %s\n", row->id);
     printf("Type:       %s\n", row->is_deny ? "DENY" : "ALLOW");
     printf("Session:    SID %d\n", (int)row->sid);
-    printf("Binary:     %s\n", row->binary);
-    printf("Target:     %s\n", row->target);
+    printf("Binary:     %s\n", binary);
+    printf("Target:     %s\n", target);
     printf("Expires:    %s\n", expiry);
 }
 
@@ -1400,7 +1458,7 @@ static int session_list_cmd(const char *list, const char *id, int describe)
         want_deny = parsed == 1;
     }
 
-    SessionStore *store = calloc(CONTROL_PAYLOAD_MAX, sizeof(*store));
+    SessionStore *store = calloc(CLI_SESSION_MAX, sizeof(*store));
     int count = 0;
 
     if (!store)
@@ -1409,9 +1467,9 @@ static int session_list_cmd(const char *list, const char *id, int describe)
         return 1;
     }
     if ((want_allow &&
-         session_fetch(0, store, CONTROL_PAYLOAD_MAX, &count) < 0) ||
+         session_fetch(0, store, CLI_SESSION_MAX, &count) < 0) ||
         (want_deny &&
-         session_fetch(1, store, CONTROL_PAYLOAD_MAX, &count) < 0))
+         session_fetch(1, store, CLI_SESSION_MAX, &count) < 0))
     {
         free(store);
         return 1;
@@ -1496,7 +1554,7 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         want_deny = parsed == 1;
     }
 
-    SessionStore *store = calloc(CONTROL_PAYLOAD_MAX, sizeof(*store));
+    SessionStore *store = calloc(CLI_SESSION_MAX, sizeof(*store));
     int count = 0, removed = 0;
 
     if (!store)
@@ -1505,9 +1563,9 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         return 1;
     }
     if ((want_allow &&
-         session_fetch(0, store, CONTROL_PAYLOAD_MAX, &count) < 0) ||
+         session_fetch(0, store, CLI_SESSION_MAX, &count) < 0) ||
         (want_deny &&
-         session_fetch(1, store, CONTROL_PAYLOAD_MAX, &count) < 0))
+         session_fetch(1, store, CLI_SESSION_MAX, &count) < 0))
     {
         free(store);
         return 1;
@@ -1561,7 +1619,16 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         snprintf(request, sizeof(request), "SESSION_REMOVE\t%s\t%s",
                  store[indices[i]].row.is_deny ? "deny" : "allow",
                  store[indices[i]].row.id);
-        if (ctl_call(request, &resp) < 0)
+        int rc = ctl_call(request, &resp);
+
+        if (rc == 1)
+        {
+            fprintf(stderr, "error: the fileshield daemon is not running\n");
+            free(store);
+            free(indices);
+            return 1;
+        }
+        if (rc < 0)
         {
             free(store);
             free(indices);
@@ -1603,7 +1670,14 @@ static int session_clear_cmd(const char *list)
 
     snprintf(request, sizeof(request), "SESSION_CLEAR\t%s",
              both ? "both" : session_label(deny));
-    if (ctl_call(request, &resp) < 0)
+    int rc = ctl_call(request, &resp);
+
+    if (rc == 1)
+    {
+        fprintf(stderr, "error: the fileshield daemon is not running\n");
+        return 1;
+    }
+    if (rc < 0)
         return 1;
     printf("cleared the session rules\n");
     return 0;

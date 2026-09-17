@@ -49,11 +49,13 @@ typedef struct
  * groups/max_groups and removals/max_removals are caller-supplied
  * buffers.  On success groups[0..returned-1] describes each duplicate
  * group (ordered by its first member) and removals[0..*removal_count_out-1]
- * lists every doomed index in ascending order; group g's removals are
- * removals[remove_offset .. remove_offset+remove_count-1].  A caller
- * sizing for the worst case needs count/2 groups (each group keeps one
- * member) and count-1 removals; capacities that are too small fail the
- * call instead of truncating silently.
+ * lists every doomed index; group g's removals are the ascending slice
+ * removals[remove_offset .. remove_offset+remove_count-1].  The flat
+ * array is NOT globally ascending when two groups interleave (A,B,A,A,B
+ * yields A's slice before B's), so consumers must treat it as a set;
+ * prune_apply() does.  A caller sizing for the worst case needs count/2
+ * groups (each group keeps one member) and count-1 removals; capacities
+ * that are too small fail the call instead of truncating silently.
  *
  * Returns the number of groups on success (0 when nothing is a
  * duplicate, including count == 0), or -1 on invalid arguments or
@@ -68,14 +70,15 @@ int prune_find(const PersistEntry *entries, int count,
 /*
  * Remove the reported entries from entries[0..count) in place, moving
  * the survivors down in their original relative order.  removals holds
- * the indices reported by prune_find (any strictly ascending list of
- * unique, in-range indices is accepted); entries[new_count..count) are
- * left unspecified.  An empty list is a no-op.
+ * the indices reported by prune_find: any order and any grouping is
+ * accepted as long as every index is unique and in range (the flat array
+ * is not globally sorted when groups interleave); entries[new_count..count)
+ * are left unspecified.  An empty list is a no-op.
  *
  * Every index is validated before anything is modified, so a rejected
  * call leaves entries untouched.  Returns the number of entries removed
  * (0 for a no-op), or -1 on invalid arguments (NULL entries/output,
- * count < 0, out-of-range, duplicate or unsorted indices).
+ * count < 0, out-of-range or duplicate indices).
  */
 int prune_apply(PersistEntry *entries, int count, const int *removals,
                 int removal_count, int *new_count_out);

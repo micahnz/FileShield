@@ -962,6 +962,18 @@ static void test_setup_teardown(void)
         ASSERT(lstat(sock, &st) != 0, "socket gone after teardown");
     }
 
+    /* A live listener is never displaced: a second daemon would then
+     * enforce different in-memory lists than the CLI manages. */
+    fd = control_setup_at(sock);
+    ASSERT(fd >= 0, "setup for live test");
+    if (fd >= 0)
+    {
+        ASSERT(control_setup_at(sock) == -1, "live listener not replaced");
+        ASSERT(lstat(sock, &st) == 0 && S_ISSOCK(st.st_mode),
+               "live socket path untouched");
+        control_teardown(fd);
+    }
+
     /* A regular file is never unlinked. */
     fd = open(sock, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     ASSERT(fd >= 0, "create regular file");

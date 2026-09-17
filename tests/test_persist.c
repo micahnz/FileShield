@@ -398,6 +398,27 @@ static int test_persist_malformed_depth(void)
     ASSERT(out[0].chain_depth == 0, "garbage depth ignored");
     free(out);
 
+    /* A value beyond long's range must be a defined rejection (strtol
+     * ERANGE), not scanf's undefined behavior; both numeric fields are
+     * left at their defaults. */
+    const char *overflow =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": 999999999999999999999999,\n"
+        "      \"created_at\": 999999999999999999999999\n"
+        "    }\n  ]\n}\n";
+
+    ASSERT(write_raw_file(path, overflow) == 0, "write overflow file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc overflow output");
+
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "overflow entry still loads");
+    ASSERT(out[0].chain_depth == 0, "overflow depth ignored");
+    ASSERT(out[0].created_at == 0, "overflow created_at ignored");
+    free(out);
+
     unlink(path);
     TEST_PASS("malformed chain_depth handling");
     return 0;

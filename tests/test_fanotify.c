@@ -531,6 +531,9 @@ static void test_config_rule_matching(void) {
 #define PIN_SHA_B \
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define PIN_SHA_C \
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 static char g_pin_dir[256];
 static char g_pin_file[PATH_MAX + 64];
@@ -1397,6 +1400,56 @@ static void test_dyn_prune(void)
     /* NULL removed_out is accepted (the count is only logged). */
     ASSERT(fanotify_prune_dyn_list(1, NULL) == 0,
            "prune accepts a NULL removed_out");
+}
+
+/*
+ * Interleaved groups: prune_find emits per-group removal slices, so the
+ * flat list is not globally ascending (A,B,A,A,B -> [0,2,1]).  The
+ * daemon compaction must treat it as a set or it silently keeps a
+ * duplicate while reporting it removed.
+ */
+static void test_dyn_prune_interleaved(void)
+{
+    PersistEntry e[5];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int removed = -1;
+    int n;
+
+    dyn_fixture_reset();
+
+    /* Key A at 0,2,3 (keep 3); key B at 1,4 (keep 4). */
+    dyn_entry_fill(&e[0], "/usr/bin/ia", PIN_SHA_A, "/home/u/ia",
+                   "ia --read", "aaaaaaaaaaaaaaa1", (time_t)1700040000);
+    dyn_entry_fill(&e[1], "/usr/bin/ib", PIN_SHA_A, "/home/u/ib",
+                   "ib --read", "bbbbbbbbbbbbbbb1", (time_t)1700040001);
+    dyn_entry_fill(&e[2], "/usr/bin/ia", PIN_SHA_B, "/home/u/ia",
+                   "ia --read", "aaaaaaaaaaaaaaa2", (time_t)1700040002);
+    dyn_entry_fill(&e[3], "/usr/bin/ia", PIN_SHA_C, "/home/u/ia",
+                   "ia --read", "aaaaaaaaaaaaaaa3", (time_t)1700040003);
+    dyn_entry_fill(&e[4], "/usr/bin/ib", PIN_SHA_B, "/home/u/ib",
+                   "ib --read", "bbbbbbbbbbbbbbb2", (time_t)1700040004);
+    fanotify_load_dyn_allowlist(e, 5);
+
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == 0 && removed == 3,
+           "interleaved prune removes three entries");
+
+    ASSERT(test_match_allow("/usr/bin/ia", PIN_SHA_C, "/home/u/ia",
+                            "ia --read") == 1,
+           "the newest A survives");
+    ASSERT(test_match_allow("/usr/bin/ib", PIN_SHA_B, "/home/u/ib",
+                            "ib --read") == 1,
+           "the newest B survives");
+    ASSERT(test_match_allow("/usr/bin/ia", PIN_SHA_B, "/home/u/ia",
+                            "ia --read") == 0,
+           "the middle A is gone");
+    ASSERT(test_match_allow("/usr/bin/ib", PIN_SHA_A, "/home/u/ib",
+                            "ib --read") == 0,
+           "the older B is gone");
+
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2 && strcmp(out[0].rule_id, "aaaaaaaaaaaaaaa3") == 0 &&
+               strcmp(out[1].rule_id, "bbbbbbbbbbbbbbb2") == 0,
+           "the kept pair was persisted in order");
 }
 
 /*
@@ -2974,6 +3027,7 @@ int main(void) {
     test_dyn_remove_by_id();
     test_dyn_clear();
     test_dyn_prune();
+    test_dyn_prune_interleaved();
     test_dyn_write_failure_restores();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();

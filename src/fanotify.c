@@ -967,25 +967,33 @@ static int persist_dyn_list(int deny, const DynEntry *entries, int count)
 }
 
 /*
- * Remove the ascending, unique indices in removals from a DynEntry list
- * in place, preserving survivor order; the vacated tail is zeroed so a
- * later append cannot resurrect a removed entry.  Indices come from
- * prune_find() (or one lookup result) and are never mutated here.
- * Returns the new count.
+ * Remove the unique indices in removals from a DynEntry list in place,
+ * preserving survivor order; the vacated tail is zeroed so a later
+ * append cannot resurrect a removed entry.  Indices come from
+ * prune_find() (whose flat list is not globally ascending when groups
+ * interleave) or from one lookup result, and are never mutated here, so
+ * membership is tested per entry instead of assuming an order.  Returns
+ * the new count.
  */
 static int dyn_compact(DynEntry *list, int count, const int *removals,
                        int removal_count)
 {
     int kept = 0;
-    int r = 0;
 
     for (int i = 0; i < count; i++)
     {
-        if (r < removal_count && removals[r] == i)
+        int drop = 0;
+
+        for (int t = 0; t < removal_count; t++)
         {
-            r++;
-            continue;
+            if (removals[t] == i)
+            {
+                drop = 1;
+                break;
+            }
         }
+        if (drop)
+            continue;
         if (kept != i)
             list[kept] = list[i];
         kept++;
@@ -4863,6 +4871,7 @@ int fanotify_prune_dyn_list(int deny, int *removed_out)
     memcpy(g_dyn_snapshot, list, sizeof(g_dyn_snapshot));
     snap_count = *count;
     *count = dyn_compact(list, *count, removals, removal_count);
+    int removed_now = snap_count - *count;
 
     if (persist_dyn_list(deny, list, *count) < 0)
     {
@@ -4876,9 +4885,9 @@ int fanotify_prune_dyn_list(int deny, int *removed_out)
                 g_dyn_snapshot[removals[i]].rule_id,
                 g_dyn_snapshot[removals[i]].binary);
     log_msg(LOG_INFO, "prune %s: removed %d duplicate rule(s), %d kept",
-            name, removal_count, *count);
+            name, removed_now, *count);
     if (removed_out)
-        *removed_out = removal_count;
+        *removed_out = removed_now;
     rc = 0;
 
 out:

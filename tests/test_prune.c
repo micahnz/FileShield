@@ -403,6 +403,52 @@ static int test_prune_find_does_not_mutate(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  interleaved groups: the flat removal list follows group order      */
+/* ------------------------------------------------------------------ */
+
+static int test_prune_interleaved_flat_order(void)
+{
+    PersistEntry e[5];
+    PruneGroup groups[2];
+    int removals[5];
+    int removal_count = -1;
+    int new_count = -1;
+    int n;
+
+    /* A at 0,2,3 and B at 1,4: group A's slice [0,2] precedes group B's
+     * [1], so the flat list is [0,2,1] -- deliberately not ascending.
+     * Consumers that assumed global order silently pruned the wrong
+     * set; apply must treat the list as a set of indices. */
+    make_entry(&e[0], "/usr/bin/a", "/p/a", "a run", 0);
+    make_entry(&e[1], "/usr/bin/b", "/p/b", "b run", 0);
+    make_entry(&e[2], "/usr/bin/a", "/p/a", "a run", 0);
+    make_entry(&e[3], "/usr/bin/a", "/p/a", "a run", 0);
+    make_entry(&e[4], "/usr/bin/b", "/p/b", "b run", 0);
+
+    n = prune_find(e, 5, groups, 2, removals, 5, &removal_count);
+    ASSERT(n == 2, "two interleaved groups");
+    ASSERT(removal_count == 3, "three removals");
+    ASSERT(removals[0] == 0 && removals[1] == 2 && removals[2] == 1,
+           "flat list follows group order, not global order");
+    ASSERT(groups[0].keep_index == 3 && groups[0].remove_offset == 0 &&
+               groups[0].remove_count == 2,
+           "group A owns its slice");
+    ASSERT(groups[1].keep_index == 4 && groups[1].remove_offset == 2 &&
+               groups[1].remove_count == 1,
+           "group B owns its slice");
+
+    ASSERT(prune_apply(e, 5, removals, removal_count, &new_count) == 3,
+           "apply accepts the grouped list");
+    ASSERT(new_count == 2, "two survivors");
+    ASSERT(strcmp(e[0].binary, "/usr/bin/a") == 0 &&
+               strcmp(e[1].binary, "/usr/bin/b") == 0,
+           "the kept members survive in order");
+
+    TEST_PASS("interleaved flat removal order");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  capacity handling: fail, never truncate                            */
 /* ------------------------------------------------------------------ */
 
@@ -491,8 +537,16 @@ static int test_prune_apply_rejects_bad_input(void)
     make_entry(&e[2], "/usr/bin/c", "/p/c", "c run", 0);
     memcpy(before, e, sizeof(e));
 
-    ASSERT(prune_apply(e, 3, unsorted, 2, &new_count) == -1,
-           "unsorted removal indices rejected");
+    /* prune_find emits per-group slices, so the flat list is not
+     * globally sorted when groups interleave; apply must treat it as a
+     * set.  This check mutates e, so restore it before the rejection
+     * cases below. */
+    ASSERT(prune_apply(e, 3, unsorted, 2, &new_count) == 2,
+           "unsorted (set) removal indices accepted");
+    ASSERT(new_count == 1 && strcmp(e[0].binary, "/usr/bin/a") == 0,
+           "set apply keeps the surviving entry");
+    memcpy(e, before, sizeof(e));
+
     ASSERT(prune_apply(e, 3, duplicate, 2, &new_count) == -1,
            "duplicate removal indices rejected");
     ASSERT(prune_apply(e, 3, out_of_range, 1, &new_count) == -1,
@@ -504,7 +558,7 @@ static int test_prune_apply_rejects_bad_input(void)
     ASSERT(memcmp(e, before, sizeof(e)) == 0,
            "rejected apply leaves entries untouched");
 
-    TEST_PASS("apply rejects bad input atomically");
+    TEST_PASS("apply validates removal sets");
     return 0;
 }
 
@@ -563,6 +617,7 @@ int main(void)
     failed |= test_prune_malformed_never_grouped();
     failed |= test_prune_chain_depth_boundary();
     failed |= test_prune_find_does_not_mutate();
+    failed |= test_prune_interleaved_flat_order();
     failed |= test_prune_capacity_errors();
     failed |= test_prune_apply_compacts();
     failed |= test_prune_apply_rejects_bad_input();

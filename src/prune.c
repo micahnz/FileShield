@@ -138,7 +138,6 @@ int prune_apply(PersistEntry *entries, int count, const int *removals,
                 int removal_count, int *new_count_out)
 {
     int kept = 0;
-    int r = 0;
 
     if (count < 0 || !new_count_out || removal_count < 0)
         return -1;
@@ -147,25 +146,36 @@ int prune_apply(PersistEntry *entries, int count, const int *removals,
 
     /* Validate everything before mutating: a mutation either applies in
      * full or not at all, so a rejected call cannot leave a half-pruned
-     * list behind.  The pointer check also covers a NULL list with a
-     * positive count on the first iteration. */
+     * list behind.  prune_find() emits removals as per-group slices, so
+     * the flat list is NOT globally ascending when two groups interleave
+     * (e.g. A,B,A,A,B) -- only range and uniqueness are constraints.
+     * The O(count * removal_count) membership scan is bounded by the
+     * 256-entry state files, and prune must stay allocation-free. */
     for (int t = 0; t < removal_count; t++)
     {
         if (!removals || removals[t] < 0 || removals[t] >= count)
             return -1;
-        if (t > 0 && removals[t] <= removals[t - 1])
-            return -1;
+        for (int u = 0; u < t; u++)
+        {
+            if (removals[u] == removals[t])
+                return -1;
+        }
     }
 
     for (int i = 0; i < count; i++)
     {
-        /* The NULL term is redundant after validation; keeping the
-         * dereference locally guarded avoids relying on that. */
-        if (removals && r < removal_count && removals[r] == i)
+        int drop = 0;
+
+        for (int t = 0; t < removal_count; t++)
         {
-            r++;
-            continue;
+            if (removals[t] == i)
+            {
+                drop = 1;
+                break;
+            }
         }
+        if (drop)
+            continue;
         if (kept != i)
             memmove(&entries[kept], &entries[i], sizeof(PersistEntry));
         kept++;
