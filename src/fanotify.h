@@ -234,6 +234,19 @@ unsigned long long fanotify_test_mount_id(const char *path);
 void fanotify_test_force_mount_id_unavailable(int on);
 
 /*
+ * Test seam: batch_abandon() — claim the records left behind when an
+ * event walk exits early.  ev/remaining describe a synthetic batch (the
+ * walk's current record, already handled by the caller); group_fd may be
+ * ANY writable fd: a pipe stand-in receives the fanotify_response writes
+ * so a test can assert each stranded permission event was denied.  The
+ * seam closes every claimable event fd it passes.  Returns the number of
+ * permission events denied.
+ */
+int fanotify_test_batch_abandon(int group_fd,
+                                const struct fanotify_event_metadata *ev,
+                                ssize_t remaining);
+
+/*
  * Test seams: the recent-decision dedup cache.  The key is
  * (pid, process start time, resolved binary, dev, ino, resolved path); a
  * newer decision replaces an older one for the same key, and a reload

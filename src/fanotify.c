@@ -79,6 +79,12 @@ static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
  * responses. */
 static void unanswered_retry(int fan_fd);
 
+/* Defined with fanotify_respond; claims the records left behind when an
+ * event walk exits early (see batch_abandon). */
+static int batch_abandon(int fan_fd,
+                         const struct fanotify_event_metadata *ev,
+                         ssize_t remaining);
+
 /* ------------------------------------------------------------------ */
 /*  proc helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -3519,11 +3525,19 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 /* A metadata-version mismatch means the event stream
                  * cannot be interpreted at all (fanotify(7)): abandon
                  * the group and let the supervisor restart cleanly.
-                 * Closing a possibly-permission event fd without a
-                 * response hangs that caller, but continuing to parse
-                 * an unreadable stream is worse. */
+                 * Deny before closing: the fd field sits at a fixed
+                 * offset that has never moved, so a DENY is fail-closed
+                 * even if the rest of this record is misread — a
+                 * misrouted DENY denies some other pending event (the
+                 * correct direction), while closing without any response
+                 * only hangs this caller until close(fan_fd) auto-ALLOWS
+                 * the open.  The records behind this one are claimed by
+                 * batch_abandon() at the loop exit. */
                 if (ev->fd != FAN_NOFD)
-                    close((int)ev->fd);
+                {
+                    if (fanotify_respond(fan_fd, ev, FAN_DENY) != -1)
+                        close((int)ev->fd);
+                }
                 log_msg(LOG_ERR,
                         "fanotify metadata version mismatch; stopping");
                 g_fatal = 1;
@@ -3571,7 +3585,14 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 break;
         }
         if (g_fatal)
+        {
+            /* Claim the records this walk exited in front of before
+             * abandoning the group: their fds are already duplicated
+             * into this process and their permission events would
+             * otherwise auto-ALLOW at close(fan_fd). */
+            batch_abandon(fan_fd, ev, remaining);
             break;
+        }
     }
 
     return responded;
@@ -3820,6 +3841,64 @@ static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev
     return -2;
 }
 
+/*
+ * Claim the records left behind when an event walk exits early (fatal
+ * response failure or metadata-version mismatch).  read(2) duplicated an
+ * event fd for EVERY record in the batch, so every later record is now
+ * open in this process with its permission event unanswered: an fd
+ * nobody answers hangs its caller's open() until close(fan_fd) makes the
+ * kernel AUTO-ALLOW it — the fail-open hole this closes — and an fd
+ * nobody closes leaks descriptors.  Walk behind the caller's current
+ * record, deny every permission event through fanotify_respond()'s
+ * ownership contract (a queued retry keeps the fd open; the retry path
+ * and the shutdown flush answer it), and close every other claimed fd.
+ * A record whose length is malformed makes the rest of the batch
+ * unlocatable; log that loudly rather than guessing positions.  Returns
+ * the number of permission events denied.
+ */
+static int batch_abandon(int fan_fd,
+                         const struct fanotify_event_metadata *ev,
+                         ssize_t remaining)
+{
+    const struct fanotify_event_metadata *next = event_next(ev, &remaining);
+    int denied = 0;
+
+    while (next)
+    {
+        if (!FAN_EVENT_OK(next, (size_t)remaining))
+        {
+            log_msg(LOG_ERR,
+                    "abandoned fanotify batch: malformed record length %llu; "
+                    "the rest of the batch (%zd bytes) cannot be claimed",
+                    (unsigned long long)next->event_len, remaining);
+            break;
+        }
+        if (next->vers == FANOTIFY_METADATA_VERSION &&
+            (next->mask & FAN_OPEN_PERM) && next->fd != FAN_NOFD)
+        {
+            log_msg(LOG_DEBUG, "[abandon] DENY fd=%d pid=%d (walk abandoned)",
+                    (int)next->fd, (int)next->pid);
+            if (fanotify_respond(fan_fd, next, FAN_DENY) == -1)
+                log_msg(LOG_INFO, "[abandon] DENY queued for retry fd=%d",
+                        (int)next->fd); /* the retry queue owns the fd */
+            else
+                close((int)next->fd);
+            denied++;
+        }
+        else if (next->fd != FAN_NOFD)
+        {
+            close((int)next->fd);
+        }
+        next = event_next(next, &remaining);
+    }
+
+    if (denied > 0)
+        log_msg(LOG_WARNING,
+                "abandoned fanotify batch: denied %d unclaimed permission "
+                "event(s) (fail closed)", denied);
+    return denied;
+}
+
 /* Decide all permission events that fanotify_pump() had to defer. */
 static int fanotify_process_pending(int fan_fd)
 {
@@ -4053,9 +4132,17 @@ void fanotify_loop(int fd, int wake_fd)
                     /* A metadata-version mismatch means the event stream
                      * cannot be interpreted at all (fanotify(7)):
                      * abandon the group and let the supervisor restart
-                     * cleanly instead of parsing an unreadable stream. */
+                     * cleanly instead of parsing an unreadable stream.
+                     * Deny before closing (the fd offset never moved;
+                     * close-without-response only postpones the decision
+                     * to the kernel's auto-ALLOW at group close).  The
+                     * records behind this one are claimed at the
+                     * g_fatal exit below. */
                     if (ev->fd != FAN_NOFD)
-                        close((int)ev->fd);
+                    {
+                        if (fanotify_respond(fd, ev, FAN_DENY) != -1)
+                            close((int)ev->fd);
+                    }
                     log_msg(LOG_ERR,
                             "fanotify metadata version mismatch; stopping");
                     g_fatal = 1;
@@ -4086,7 +4173,14 @@ void fanotify_loop(int fd, int wake_fd)
                 }
 
                 if (g_fatal)
+                {
+                    /* Claim the records this walk exited in front of:
+                     * their fds are already duplicated into this process
+                     * and their permission events would otherwise
+                     * auto-ALLOW at close(fan_fd) during shutdown. */
+                    batch_abandon(fd, ev, remaining);
                     break;
+                }
                 ev = event_next(ev, &remaining);
                 if (!ev)
                     break;
@@ -4172,6 +4266,20 @@ int fanotify_test_resolve_path(int fd, char *out, size_t outsz)
 int fanotify_test_unsafe_first_hit(pid_t pid)
 {
     return unsafe_first_hit(pid);
+}
+
+/*
+ * Test seam (fanotify.h): run batch_abandon() on a synthetic batch the
+ * caller assembled.  Passing a pipe write-end as group_fd makes every
+ * fanotify_respond() write succeed (returns 0, no retry queue, no g_fatal
+ * side effect), so the seam denies and closes each claimed event fd in
+ * isolation.  Returns the number of permission events denied.
+ */
+int fanotify_test_batch_abandon(int group_fd,
+                                const struct fanotify_event_metadata *ev,
+                                ssize_t remaining)
+{
+    return batch_abandon(group_fd, ev, remaining);
 }
 
 /*

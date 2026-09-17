@@ -559,6 +559,77 @@ static void test_path_canonicalization(void)
 }
 
 /*
+ * H2 regression: an entry with TWO missing levels under a symlinked
+ * parent is the fresh-install case (~/.aws/credentials before ~/.aws
+ * exists).  The old one-level realpath fallback stored the raw string
+ * when its parent was missing too — under a symlinked home that never
+ * matches the canonical /proc/<pid>/fd target paths, silently leaving
+ * the file unprotected with no prompt and no log.  canonicalize_path
+ * must walk up to the deepest existing ancestor and re-attach the
+ * stripped tail, so the stored pattern keeps the canonical (real)
+ * prefix for both exact entries and glob static bases.
+ */
+static void test_canonicalization_missing_levels_under_symlink(void)
+{
+    char real_dir[128];
+    char link_dir[128];
+    char conf[4096];
+
+    snprintf(real_dir, sizeof(real_dir), "/tmp/fileshield_canon2_real_%d",
+             (int)getpid());
+    snprintf(link_dir, sizeof(link_dir), "/tmp/fileshield_canon2_link_%d",
+             (int)getpid());
+
+    ASSERT(mkdir(real_dir, 0700) == 0, "create real dir");
+    unlink(link_dir);
+    ASSERT(symlink(real_dir, link_dir) == 0, "create symlink");
+
+    snprintf(conf, sizeof(conf),
+             "[protected_paths]\n"
+             "%s/.aws/credentials\n"
+             "%s/.mozilla/**/*.ini\n", link_dir, link_dir);
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write two-missing-level config");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load succeeds");
+    ASSERT(cfg.protected_count == 2, "both entries loaded");
+
+    /* Exact entry: canonical real prefix survives the missing parent. */
+    ASSERT(strncmp(cfg.protected[0].path, real_dir, strlen(real_dir)) == 0,
+           "exact entry canonicalized through symlinked missing parent");
+    ASSERT(strncmp(cfg.protected[0].path, link_dir, strlen(link_dir)) != 0,
+           "raw symlinked prefix must not survive");
+    ASSERT(strstr(cfg.protected[0].path, "/.aws/credentials") != NULL,
+           "both stripped levels re-attached");
+    ASSERT(cfg.protected[0].is_glob == 0 &&
+               cfg.protected[0].base_len ==
+                   (int)strlen(cfg.protected[0].path),
+           "exact entry keeps a full-length base");
+
+    /* Glob entry: the static base canonicalizes the same way. */
+    ASSERT(strncmp(cfg.protected[1].path, real_dir, strlen(real_dir)) == 0,
+           "glob base canonicalized through symlinked missing parent");
+    const char *suf = strstr(cfg.protected[1].path, "/.mozilla/**/*.ini");
+    ASSERT(suf != NULL, "glob suffix preserved verbatim after canonical base");
+    ASSERT(cfg.protected[1].is_glob == 1 &&
+               cfg.protected[1].base_len ==
+                   (suf ? (int)(suf - cfg.protected[1].path) +
+                              (int)strlen("/.mozilla")
+                        : -1),
+           "glob base_len covers the canonical base incl. the missing dir");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+    unlink(link_dir);
+    rmdir(real_dir);
+}
+
+/*
  * Legacy-format safety: "binary = ttl_seconds" entries must be rejected
  * with a warning, and an '=' with an empty right side is a parse error.
  * Neither may produce a rule.
@@ -1596,6 +1667,7 @@ int main(void)
     test_ttl_clamping();
     test_whitespace_lines();
     test_path_canonicalization();
+    test_canonicalization_missing_levels_under_symlink();
     test_glob_protected_paths();
     test_glob_root_based();
     test_glob_rejection();

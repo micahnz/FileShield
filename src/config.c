@@ -69,41 +69,62 @@ static int parse_int_setting(const char *val, int *out)
  * canonicalize_path: resolve symlinks so path comparisons against
  * /proc/self/fd/N paths (which are always canonical) cannot be bypassed
  * by a symlinked home/config directory.  If the path does not exist yet,
- * resolve its parent and keep the basename.
+ * strip trailing components one at a time until realpath(3) resolves,
+ * then re-attach everything stripped since the first cut.  One level was
+ * not enough: a fresh install has ~/.aws/credentials missing together
+ * with ~/.aws itself, and storing the raw string in that case yields a
+ * non-canonical pattern under a symlinked home — one the canonical
+ * event paths never match, silently leaving the file unprotected.
+ * Reaching the deepest existing ancestor keeps the pattern canonical.
+ * Only a path with no leading '/' at all (rejected by every caller) or
+ * a realpath("/") failure can still fall through to the raw string.
  */
 static void canonicalize_path(const char *in, char *out, size_t outsz)
 {
+    char trimmed[PATH_MAX];
     char buf[PATH_MAX];
-    size_t len;
-    char *resolved;
+    size_t len, cut;
+    char *resolved = NULL;
 
-    snprintf(buf, sizeof(buf), "%s", in);
-    len = strlen(buf);
-    while (len > 1 && buf[len - 1] == '/')
-        buf[--len] = '\0';
+    snprintf(trimmed, sizeof(trimmed), "%s", in);
+    len = strlen(trimmed);
+    while (len > 1 && trimmed[len - 1] == '/')
+        trimmed[--len] = '\0';
+    snprintf(buf, sizeof(buf), "%s", trimmed);
+    cut = len; /* no component stripped yet: the tail is empty */
 
-    resolved = realpath(buf, NULL);
-    if (resolved)
+    for (;;)
     {
-        snprintf(out, outsz, "%s", resolved);
-        free(resolved);
-        return;
-    }
-
-    char *slash = strrchr(buf, '/');
-    if (slash && slash != buf)
-    {
-        *slash = '\0';
         resolved = realpath(buf, NULL);
         if (resolved)
-        {
-            if (resolved[1] == '\0')
-                snprintf(out, outsz, "/%s", slash + 1);
-            else
-                snprintf(out, outsz, "%s/%s", resolved, slash + 1);
-            free(resolved);
-            return;
-        }
+            break;
+        char *slash = strrchr(buf, '/');
+        if (!slash)
+            break; /* relative junk: only the raw string can represent it */
+        cut = (size_t)(slash - buf);
+        if (slash == buf)
+            buf[1] = '\0'; /* reduce "/x" to "/" and let "/" resolve */
+        else
+            *slash = '\0';
+    }
+
+    if (resolved)
+    {
+        const char *tail = trimmed + cut; /* slash position, or len when */
+        if (cut < len)                    /* no cut: tail stays empty    */
+            tail++;                       /* start after the cut slash   */
+        int need;
+
+        if (tail[0] == '\0')
+            need = snprintf(out, outsz, "%s", resolved);
+        else if (resolved[1] == '\0') /* resolved is exactly "/": */
+            need = snprintf(out, outsz, "/%s", tail); /* tail starts after */
+        else                           /* the removed '/' so no "//".     */
+            need = snprintf(out, outsz, "%s/%s", resolved, tail);
+        free(resolved);
+        if (need < 0 || (size_t)need >= outsz)
+            snprintf(out, outsz, "%s", in); /* never emit half a path */
+        return;
     }
 
     snprintf(out, outsz, "%s", in);
@@ -111,11 +132,11 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
 
 /*
  * True when a supposedly canonical path still contains a "." or ".."
- * segment.  canonicalize_path() leaves those behind only when the path
- * (or its parent) does not exist and the raw string survives the
- * fallback; a /proc/<pid>/fd target is always canonical, so such a
- * pattern can never match.  Rejecting it at load time keeps a typo from
- * silently protecting nothing.
+ * segment.  canonicalize_path() leaves those behind only when no
+ * ancestor resolves and the raw string survives the fallback; a
+ * /proc/<pid>/fd target is always canonical, so such a pattern can never
+ * match.  Rejecting it at load time keeps a typo from silently
+ * protecting nothing.
  */
 static int has_unresolved_dot_segment(const char *path)
 {

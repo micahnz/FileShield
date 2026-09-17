@@ -1384,6 +1384,96 @@ static void test_respond_failure_retry(void) {
 }
 
 /*
+ * Part 0c: batch_abandon claims the records stranded when an event walk
+ * exits early (fatal response failure or metadata-version mismatch).
+ * read(2) duplicates an fd for EVERY record in the batch, so every
+ * record behind the walk's current one sits open and unanswered: the
+ * kernel AUTO-ALLOWS an unanswered permission event when the group fd
+ * closes (the fail-open this closes).  A pipe stands in for the group:
+ * every write succeeds, so the seam denies + closes without touching
+ * the retry queue or g_fatal.
+ */
+static void test_batch_abandon_claims_stranded(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before fd juggling");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create abandon-response pipe");
+
+    /* Assemble a synthetic batch; the walk's "current" record (already
+     * handled by its caller) leads, and the records behind it are the
+     * stranded ones batch_abandon must claim. */
+    static char raw[6 * 64]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    const size_t HDR = sizeof(struct fanotify_event_metadata);
+    int efd_perm1 = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int efd_notif = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int efd_perm2 = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int efd_bad = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd_perm1 >= 0 && efd_notif >= 0 && efd_perm2 >= 0 &&
+               efd_bad >= 0,
+           "open stranded-record fds");
+
+    struct fanotify_event_metadata *rec =
+        (struct fanotify_event_metadata *)raw;
+    for (int i = 0; i < 6; i++) {
+        memset(&rec[i], 0, HDR);
+        rec[i].event_len = HDR;
+        rec[i].vers = FANOTIFY_METADATA_VERSION;
+        rec[i].metadata_len = HDR;
+        rec[i].pid = (int)getpid();
+    }
+    rec[0].mask = FAN_OPEN_PERM;         /* current record: never claimed */
+    rec[0].fd = FAN_NOFD;
+    rec[1].mask = FAN_OPEN_PERM;         /* stranded: deny + close        */
+    rec[1].fd = efd_perm1;
+    rec[2].mask = 0;                     /* stranded notif: close only    */
+    rec[2].fd = efd_notif;
+    rec[3].mask = FAN_OPEN_PERM;         /* stranded, kernel had no fd    */
+    rec[3].fd = FAN_NOFD;
+    rec[4].mask = FAN_OPEN_PERM;         /* stranded: deny + close        */
+    rec[4].fd = efd_perm2;
+    rec[5].event_len = 8;                /* malformed tail: unclaimable   */
+    rec[5].fd = efd_bad;
+
+    int denied = fanotify_test_batch_abandon(
+        group[1], rec, (ssize_t)(6 * HDR));
+    ASSERT(denied == 2, "both stranded permission events denied");
+    ASSERT(fcntl(efd_perm1, F_GETFD) == -1 && errno == EBADF,
+           "stranded permission fd 1 closed after DENY");
+    ASSERT(fcntl(efd_notif, F_GETFD) == -1 && errno == EBADF,
+           "stranded notification fd closed");
+    ASSERT(fcntl(efd_perm2, F_GETFD) == -1 && errno == EBADF,
+           "stranded permission fd 2 closed after DENY");
+    ASSERT(fcntl(efd_bad, F_GETFD) != -1,
+           "record past a malformed length is not guessed at (fd untouched)");
+    ASSERT(g_fatal == 0, "abandon via a healthy pipe stays non-fatal");
+
+    /* The two DENY responses must have reached the group in order. */
+    struct fanotify_response r1, r2;
+    ssize_t got = read(group[0], &r1, sizeof(r1));
+    ASSERT(got == (ssize_t)sizeof(r1) && r1.fd == efd_perm1 &&
+               r1.response == FAN_DENY,
+           "first response is the stranded permission event's DENY");
+    got = read(group[0], &r2, sizeof(r2));
+    ASSERT(got == (ssize_t)sizeof(r2) && r2.fd == efd_perm2 &&
+               r2.response == FAN_DENY,
+           "second response is the second stranded DENY");
+
+    close(efd_bad);
+    close(group[0]);
+    close(group[1]);
+
+    /* A batch whose last record IS the current one strands nothing;
+     * an exhausted walk never touches the group fd, so -1 is safe. */
+    memset(&rec[0], 0, HDR);
+    rec[0].event_len = HDR;
+    rec[0].vers = FANOTIFY_METADATA_VERSION;
+    rec[0].fd = FAN_NOFD;
+    ASSERT(fanotify_test_batch_abandon(-1, rec, (ssize_t)HDR) == 0,
+           "an exhausted batch abandons nothing");
+}
+
+/*
  * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
  * retried on the next clear) instead of being forgotten, which would
  * leave an untracked kernel mark behind.  A negative fd means no group
@@ -2088,6 +2178,7 @@ int main(void) {
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_respond_failure_retry();
+    test_batch_abandon_claims_stranded();
     test_clear_marks_retains_failures();
     test_cmdline_fingerprint_overflow();
     test_drain_and_deny();
