@@ -83,8 +83,19 @@ pid_t get_ppid(pid_t pid)
     f = fopen(path, "r");
     if (!f)
         return 0;
-    while (fgets(line, sizeof(line), f))
+    for (;;)
     {
+        if (!fgets(line, sizeof(line), f))
+        {
+            /* SIGHUP can interrupt the read (no SA_RESTART): retry
+             * rather than degrade the identity to "unknown". */
+            if (ferror(f) && errno == EINTR)
+            {
+                clearerr(f);
+                continue;
+            }
+            break;
+        }
         if (sscanf(line, "PPid:\t%d", &ppid) == 1)
             break;
     }
@@ -105,8 +116,17 @@ int read_comm(pid_t pid, char *out, size_t size)
     f = fopen(path, "r");
     if (!f)
         return -1;
-    if (!fgets(out, (int)size, f))
+    for (;;)
     {
+        if (fgets(out, (int)size, f))
+            break;
+        /* Interrupted by SIGHUP (no SA_RESTART): retry, do not degrade
+         * the comm to "unknown". */
+        if (ferror(f) && errno == EINTR)
+        {
+            clearerr(f);
+            continue;
+        }
         fclose(f);
         return -1;
     }

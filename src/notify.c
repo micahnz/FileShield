@@ -165,18 +165,30 @@ static int read_proc_environ(pid_t pid, char *buf, size_t bufsz)
 {
     char path[64];
     int fd;
-    ssize_t n;
+    ssize_t total = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", (int)pid);
     fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    n = read(fd, buf, bufsz - 1);
+
+    /* Drain what fits: a short read is not EOF on procfs, and SIGHUP
+     * (handlers run without SA_RESTART) must not silently drop the
+     * user's environment -- the dialog would lose its theme variables. */
+    while (total < (ssize_t)bufsz - 1)
+    {
+        ssize_t n = read(fd, buf + total, bufsz - 1 - (size_t)total);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        total += n;
+    }
     close(fd);
-    if (n <= 0)
+    if (total <= 0)
         return -1;
-    buf[n] = '\0';
-    return (int)n;
+    buf[total] = '\0';
+    return (int)total;
 }
 
 /*
