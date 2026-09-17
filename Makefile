@@ -11,10 +11,12 @@ SRCDIR  := src
 OBJDIR  := build
 TSTDIR  := tests
 BINDIR  := /usr/local/sbin
+CLIBINDIR := /usr/local/bin
 ETCDIR  := /etc
 SYSDDIR := /etc/systemd/system
 
 TARGET  := fileshield
+CLITGT  := fileshield-cli
 
 # `make install` never replaces an existing /etc/fileshield.conf (upgrades
 # keep local rules). Set REPLACE_CONFIG=1, or run `make install-config`,
@@ -33,17 +35,32 @@ SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/ruleid.c $(SRCDIR)/prune.c $(SRCDIR)/control.c \
            $(SRCDIR)/control_client.c
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-DEPS    := $(OBJS:.o=.d)
+
+# The CLI's objects are deliberately disjoint from the daemon's: cli.c owns
+# the CLI's main() (linking it into fileshield would collide with main.c),
+# and cli_ui.c/control_client.c are client-side modules.  All are built by
+# the pattern rule; DEPS tracks them so header edits rebuild them too.
+CLIOBJS := $(OBJDIR)/cli.o $(OBJDIR)/cli_ui.o $(OBJDIR)/control_client.o \
+           $(OBJDIR)/persist.o $(OBJDIR)/pin.o $(OBJDIR)/prune.o \
+           $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o
+DEPS    := $(sort $(OBJS:.o=.d) $(CLIOBJS:.o=.d))
 
 TESTS   := test_cache test_config test_reload test_utils test_persist test_pin test_session test_sha512 test_inode test_fanotify \
            test_ruleid test_prune test_cli_ui test_control
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
-all: $(OBJDIR)/$(TARGET)
+all: $(OBJDIR)/$(TARGET) $(OBJDIR)/$(CLITGT)
 
 $(OBJDIR)/$(TARGET): $(OBJS)
 	@mkdir -p $(OBJDIR)
 	$(CC) $(LDFLAGS) $(OBJS) -o $@
+
+# The CLI links only the client-side and file-state modules: cli.c stays
+# linkable without the daemon's fanotify/notify/config/cache/session/
+# inode/control/reload halves (CLIOBJS is the exhaustive prerequisite set).
+$(OBJDIR)/$(CLITGT): $(CLIOBJS)
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(CLIOBJS) -o $@
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(OBJDIR)
@@ -177,6 +194,7 @@ bench: all $(OBJDIR)/bench_hotpath
 
 install: all
 	install -m 0755 -D $(OBJDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 0755 -D $(OBJDIR)/$(CLITGT) $(DESTDIR)$(CLIBINDIR)/$(CLITGT)
 	@if [ "$(REPLACE_CONFIG)" = "1" ]; then \
 		install -m 0640 -D fileshield.conf "$(DESTDIR)$(ETCDIR)/fileshield.conf"; \
 		echo "installed default config (overwrote $(DESTDIR)$(ETCDIR)/fileshield.conf)"; \
@@ -209,7 +227,7 @@ install: all
 install-config:
 	$(MAKE) install REPLACE_CONFIG=1
 
-# Remove the installed binary and unit.  Never touches /etc/fileshield.conf
+# Remove the installed binaries and unit.  Never touches /etc/fileshield.conf
 # or the state and pins under /var/lib/fileshield.  Stops and disables the
 # unit first so a running daemon does not outlive its binary.
 uninstall:
@@ -217,9 +235,10 @@ uninstall:
 		systemctl disable --now fileshield || true; \
 	fi
 	rm -f "$(DESTDIR)$(BINDIR)/$(TARGET)"
+	rm -f "$(DESTDIR)$(CLIBINDIR)/$(CLITGT)"
 	rm -f "$(DESTDIR)$(SYSDDIR)/fileshield.service"
 	@if [ -z "$(DESTDIR)" ]; then systemctl daemon-reload; fi
-	@echo "removed $(DESTDIR)$(BINDIR)/$(TARGET) and $(DESTDIR)$(SYSDDIR)/fileshield.service"
+	@echo "removed $(DESTDIR)$(BINDIR)/$(TARGET), $(DESTDIR)$(CLIBINDIR)/$(CLITGT) and $(DESTDIR)$(SYSDDIR)/fileshield.service"
 	@echo "left /etc/fileshield.conf and /var/lib/fileshield untouched"
 
 clean:
