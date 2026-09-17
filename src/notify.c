@@ -885,13 +885,20 @@ int notify_test_menu_choice(const char *token)
  * ..., no numeric geometry args); an older kdialog misparses the pairs
  * and emits no valid token — every failure path denies.
  *
+ * default_label (optional) names the row preselected via --default: a
+ * confirm without any deliberate selection emits that row's tag.  The
+ * caller passes the Deny Once label, so an accidental Enter/confirm can
+ * never grant — it denies this attempt.  This also avoids kdialog's own
+ * out-of-bounds read (args[currentItem()*2] with currentRow == -1) when
+ * OK is pressed with no current row, keeping the failure defined.
+ *
  * Returns 1 when the child exited normally with code 0 (a tag should be
  * in token; menu_token_to_decision still vets it), 0 for any other
  * normal exit (cancel/error), -1 for timeout, shutdown or spawn failure.
  */
 static int run_kdialog_menu(const DisplaySession *session,
                             const DialogEnvSetting *env, int env_count,
-                            const char *text,
+                            const char *text, const char *default_label,
                             const DialogMenuItem *items, int nitems,
                             char *token, size_t tokensz)
 {
@@ -936,7 +943,7 @@ static int run_kdialog_menu(const DisplaySession *session,
          * --menu tag/item pairs by one (a selected row would then echo a
          * wrong token and deny — the exact bug an earlier build shipped
          * with).  The KF6 --menu shape is: --menu TEXT tag item [...]. */
-        char *argv[7 + 2 * DIALOG_MENU_MAX_ITEMS + 1];
+        char *argv[7 + 2 * DIALOG_MENU_MAX_ITEMS + 2 + 1];
         int n = 0;
         argv[n++] = "/usr/bin/timeout";
         argv[n++] = "30";
@@ -949,6 +956,13 @@ static int run_kdialog_menu(const DisplaySession *session,
         {
             argv[n++] = (char *)items[i].tag;
             argv[n++] = (char *)items[i].label;
+        }
+        if (default_label)
+        {
+            /* Preselect the deny row: a confirm with no deliberate
+             * selection emits its tag (deny once), never a grant. */
+            argv[n++] = "--default";
+            argv[n++] = (char *)default_label;
         }
         argv[n] = NULL;
 
@@ -1302,6 +1316,7 @@ int notify_ask(const NotifyRequest *req)
 
     char token[DIALOG_TOKEN_MAX];
     int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body,
+                             label_deny,
                              items, (int)(sizeof(items) / sizeof(items[0])),
                              token, sizeof(token));
     if (r != 1)

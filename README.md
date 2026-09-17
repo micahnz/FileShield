@@ -362,6 +362,10 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
    Each row repeats its scope's concise description inline, so the
    decision never depends on re-reading the block above.
 
+   The **Deny Once** row is the dialog's preselected default (`--default`):
+   confirming without a deliberate selection — including an accidental
+   Enter — denies this attempt rather than granting anything.
+
    The description is rendered as left-aligned rich text: keys (*Binary*,
    *Command*, *Path*) and the scope names are bold, and every value is
    HTML-escaped before it is shown, so a crafted file name cannot forge

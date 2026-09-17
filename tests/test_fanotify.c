@@ -1211,15 +1211,19 @@ static void test_menu_end_to_end(void) {
         return;
     /* timeout execs the script with argv[0] = script path, so:
      * $1=--title $2=Fileshield $3=--menu $4=BODY $5=first TAG $6=first
-     * label ... $16=last label => 16 positional args.  Asserting the
-     * TAG sits at $5 is what pins the real kdialog contract: the earlier
-     * bug (an extra argv element shifting the pairs) still matched a
-     * naive count check but broke the tag/item alignment. */
+     * label ... $16=last label, then $17=--default $18=deny label
+     * => 18 positional args.  Asserting the TAG sits at $5 is what pins
+     * the real kdialog contract: the earlier bug (an extra argv element
+     * shifting the pairs) still matched a naive count check but broke
+     * the tag/item alignment.  The --default pair must name the Deny
+     * Once row so a confirm with no selection denies instead of
+     * granting. */
     fputs("#!/bin/sh\n"
-          "[ \"$#\" -eq 16 ] || exit 0\n"
+          "[ \"$#\" -eq 18 ] || exit 0\n"
           "[ \"$1\" = \"--title\" ] || exit 0\n"
           "[ \"$3\" = \"--menu\" ] || exit 0\n"
           "[ \"$5\" = \"once\" ] || exit 0\n"
+          "[ \"${17}\" = \"--default\" ] || exit 0\n"
           "case \"$FAKE_KDIALOG_MODE\" in\n"
           "  pick) echo once; exit 0 ;;\n"
           "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
@@ -1227,6 +1231,8 @@ static void test_menu_end_to_end(void) {
           "  dump) printf '%s' \"$4\" > /tmp/fileshield_body_dump; "
           "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
           "\"${14}\" \"${16}\" > /tmp/fileshield_labels_dump; "
+          "printf '%s|%s' \"${17}\" \"${18}\" "
+          "> /tmp/fileshield_default_dump; "
           "echo once; exit 0 ;;\n"
           "esac\n"
           "exit 1\n",
@@ -1341,6 +1347,20 @@ static void test_menu_end_to_end(void) {
                   "Deny Always - block permanently for this command and file")
                == 0,
            "rows carry the concise inline descriptions, hyphen separated");
+
+    /* A confirm with no deliberate selection must deny, not grant: the
+     * --default row is the deny row. */
+    char defdump[128];
+    size_t fllen = 0;
+    FILE *ddf = fopen("/tmp/fileshield_default_dump", "r");
+    if (ddf) {
+        fllen = fread(defdump, 1, sizeof(defdump) - 1, ddf);
+        fclose(ddf);
+    }
+    defdump[fllen] = '\0';
+    ASSERT(strcmp(defdump,
+                  "--default|Deny Once - block this access only") == 0,
+           "no-selection confirm defaults to Deny Once (deny, never allow)");
 
     notify_test_set_kdialog_path(NULL);
     unlink(script);

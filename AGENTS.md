@@ -114,7 +114,9 @@ requires KF6 kdialog argv shape (`--menu TEXT tag item [tag item] ...`);
 an older kdialog misparses it and denies (fail closed).  Each scope
 (the six rows and the body bullets) pairs its name inline with a concise
 description: session = this binary and file until the session ends;
-always = saved permanently for this command and file.
+always = saved permanently for this command and file.  The Deny Once row
+is preselected via `--default`: confirming with no deliberate selection
+denies this attempt -- an accidental Enter can never grant.
 
 The dialog child forwards a whitelist of the user's session appearance
 variables (desktop identity, Qt theme/scale, locale, cursor) read from
