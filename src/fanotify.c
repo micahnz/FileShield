@@ -631,11 +631,21 @@ static int g_dyn_deny_count = 0;
 /*
  * A process can exec itself repeatedly (new PID each time) so that the
  * per-PID cache never helps, flooding the user with dialogs while each
- * open is suspended.  Bound prompts per binary path and fail closed
- * (deny) for a cooldown window once the bound is exceeded.
+ * open is suspended.  Two bounds, both fail closed (deny) for a cooldown
+ * window once exceeded:
+ *   - per binary path: DIALOG_RATE_PROMPTS prompts per window;
+ *   - globally across all binaries: DIALOG_RATE_GLOBAL_PROMPTS, because
+ *     a stream that rotates through distinct paths (`/tmp/.mount_AA/...`,
+ *     `/tmp/.mount_AB/...`, ...) keeps landing in fresh per-binary
+ *     entries and would otherwise never trip the per-binary bound.
+ * When the 16-entry table is full, an idle entry (expired window, no
+ * cooldown) is evicted first; only when every entry is live is the
+ * oldest window evicted, so a rotation cannot cheaply reset a live
+ * entry's quota.
  */
 #define DIALOG_RATE_MAX 16
 #define DIALOG_RATE_PROMPTS 20
+#define DIALOG_RATE_GLOBAL_PROMPTS 40
 #define DIALOG_RATE_WINDOW_S 60
 #define DIALOG_RATE_COOLDOWN_S 30
 
@@ -649,13 +659,23 @@ typedef struct
 
 static DialogRateEntry g_dialog_rate[DIALOG_RATE_MAX];
 static int g_dialog_rate_count = 0;
-static int g_dialog_rate_next = 0;
+static int g_dialog_global_prompts = 0;
+static time_t g_dialog_global_window = 0;
+static time_t g_dialog_global_blocked_until = 0;
 
 /* Returns 1 when the dialog should be skipped (deny) to bound flooding. */
 static int dialog_rate_limited(const char *binary)
 {
     time_t now = time(NULL);
     DialogRateEntry *e = NULL;
+
+    if (now < g_dialog_global_blocked_until)
+        return 1;
+    if (now - g_dialog_global_window > DIALOG_RATE_WINDOW_S)
+    {
+        g_dialog_global_window = now;
+        g_dialog_global_prompts = 0;
+    }
 
     for (int i = 0; i < g_dialog_rate_count; i++)
     {
@@ -669,12 +689,34 @@ static int dialog_rate_limited(const char *binary)
     if (!e)
     {
         int slot;
+
         if (g_dialog_rate_count < DIALOG_RATE_MAX)
+        {
             slot = g_dialog_rate_count++;
+        }
         else
         {
-            slot = g_dialog_rate_next;
-            g_dialog_rate_next = (g_dialog_rate_next + 1) % DIALOG_RATE_MAX;
+            /* Prefer a fully idle slot (window expired and no active
+             * cooldown); otherwise evict the oldest window so a live
+             * entry's quota is the last thing reset. */
+            int oldest_slot = 0;
+
+            slot = -1;
+            for (int i = 0; i < DIALOG_RATE_MAX; i++)
+            {
+                DialogRateEntry *c = &g_dialog_rate[i];
+                if (now >= c->blocked_until &&
+                    now - c->window_start > DIALOG_RATE_WINDOW_S)
+                {
+                    slot = i;
+                    break;
+                }
+                if (c->window_start <
+                    g_dialog_rate[oldest_slot].window_start)
+                    oldest_slot = i;
+            }
+            if (slot < 0)
+                slot = oldest_slot;
         }
         e = &g_dialog_rate[slot];
         memset(e, 0, sizeof(*e));
@@ -703,6 +745,22 @@ static int dialog_rate_limited(const char *binary)
                 "dialog rate limit: %s exceeded %d prompts in %ds; "
                 "denying further prompts for %ds",
                 binary, DIALOG_RATE_PROMPTS, DIALOG_RATE_WINDOW_S,
+                DIALOG_RATE_COOLDOWN_S);
+        return 1;
+    }
+
+    if (++g_dialog_global_prompts > DIALOG_RATE_GLOBAL_PROMPTS)
+    {
+        /* Rotation through many distinct binaries: the per-binary bound
+         * cannot trip, so the global budget does.  Same fresh-window
+         * handling as above. */
+        g_dialog_global_blocked_until = now + DIALOG_RATE_COOLDOWN_S;
+        g_dialog_global_window = g_dialog_global_blocked_until;
+        g_dialog_global_prompts = 0;
+        log_msg(LOG_WARNING,
+                "dialog rate limit: more than %d prompts across all "
+                "binaries in %ds; denying further prompts for %ds",
+                DIALOG_RATE_GLOBAL_PROMPTS, DIALOG_RATE_WINDOW_S,
                 DIALOG_RATE_COOLDOWN_S);
         return 1;
     }
@@ -2710,6 +2768,17 @@ static void event_gather_identity(EventCtx *c)
 int fanotify_test_dialog_rate_limited(const char *binary)
 {
     return dialog_rate_limited(binary);
+}
+
+/* Test seam (fanotify.h): clear the per-binary and global rate state so
+ * limit tests are deterministic regardless of test order. */
+void fanotify_test_reset_dialog_rate(void)
+{
+    memset(g_dialog_rate, 0, sizeof(g_dialog_rate));
+    g_dialog_rate_count = 0;
+    g_dialog_global_prompts = 0;
+    g_dialog_global_window = 0;
+    g_dialog_global_blocked_until = 0;
 }
 
 static int event_runtime_denied(EventCtx *c)

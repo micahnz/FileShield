@@ -286,6 +286,12 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
 int fanotify_test_dialog_rate_limited(const char *binary);
 
 /*
+ * Test seam: clear the dialog rate-limit state (per-binary entries and
+ * the global prompt budget) so limit tests are order-independent.
+ */
+void fanotify_test_reset_dialog_rate(void);
+
+/*
  * Test seam: record a mark-table entry like a real installation (no
  * kernel call), so unprivileged reload tests can start from a state
  * where marks are active and exercise the "rollback left no active

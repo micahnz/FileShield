@@ -2433,6 +2433,8 @@ static void test_unsafe_allowlist_wins_over_pinned(void) {
  * fails closed (deny) for a cooldown window.
  */
 static void test_dialog_rate_limiter(void) {
+    fanotify_test_reset_dialog_rate();
+
     const char *binary = "/tmp/fileshield-rate-test-unique";
 
     for (int i = 0; i < 20; i++)
@@ -2444,6 +2446,27 @@ static void test_dialog_rate_limiter(void) {
            "prompt above the bound is denied (fail closed)");
     ASSERT(fanotify_test_dialog_rate_limited(binary) == 1,
            "cooldown keeps denying");
+
+    /* Rotation through distinct binaries (each landing in a fresh
+     * per-binary entry) must still be bounded: the global prompt budget
+     * denies once it is exceeded, so a flood cannot evade the per-binary
+     * bound by cycling executable paths. */
+    fanotify_test_reset_dialog_rate();
+    int denied_at = -1;
+    for (int i = 0; i < 60; i++)
+    {
+        char b[64];
+        snprintf(b, sizeof(b), "/tmp/fileshield-rotate-%d", i);
+        if (fanotify_test_dialog_rate_limited(b) == 1)
+        {
+            denied_at = i;
+            break;
+        }
+    }
+    ASSERT(denied_at == 40,
+           "41st prompt across distinct binaries is denied by the global cap");
+
+    fanotify_test_reset_dialog_rate();
 }
 
 int main(void) {

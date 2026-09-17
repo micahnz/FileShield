@@ -217,7 +217,7 @@ scope as a safety-critical surface:
 - Mount marks are attached to the init-namespace mounts through `/proc/1/root` (CAP_SYS_PTRACE); mount bookkeeping uses `statx(STATX_MNT_ID)` (Linux 5.8+), falling back to device-level dedupe with a warning when unavailable, and the startup scope guard refuses a config whose own state/config files its marks would intercept
 - Protected-path exclusions (`!pattern`): deny-wins and order-independent — an excluded path is never protected, never marked, and never inode-tracked; matching is path-based
 - TOCTOU on binary identity between `/proc/<pid>/exe` and the hash check (inherent to fanotify permission systems)
-- Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown
+- Dialog rate limiting: 20 prompts per binary within 60 s, then a 30 s deny cooldown; additionally 40 prompts across all binaries within 60 s (a path-rotating flood lands in fresh per-binary entries, so a global budget bounds it), same 30 s cooldown
 - Config reload is not atomic: marks are cleared before the new set is installed, so there is a short unmediated window during an administrator-triggered reload (delta reload is a possible follow-up; it needs the root smoke test because it changes mark bookkeeping)
 - GUI prompts are session-scoped, not process-scoped: a same-uid process can in principle forge GUI input (X11 synthetic events, planted Wayland socket), so GUI consent is not a defense against a fully compromised session
 - The shipped `~/...`-based protected list expands once per real user, so it exceeds `MAX_PATHS` at 12 real users (trim it on shared hosts)
