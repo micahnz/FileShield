@@ -187,6 +187,60 @@ static void test_dead_leader(void)
            "dead leader does not match");
 }
 
+/*
+ * M7 regression: the matchers now drop dead leaders only on the
+ * full-key-match path (no per-event /proc storm), so entries whose
+ * leaders died OUTSIDE their own session linger as used.  Reclaiming
+ * them is the table-full sweep's job: an add at capacity must reuse a
+ * dead slot rather than memmove-evict a live entry.
+ */
+static void test_full_table_reclaims_dead(void)
+{
+    int cap = session_test_max();
+    session_clear();
+
+    pid_t dead = spawn_leader();
+    pid_t live = spawn_leader();
+    pid_t dsid = 0, lsid = 0;
+    unsigned long long dstart = 0, lstart = 0;
+    ASSERT(fixture_session(dead, &dsid, &dstart) == 0, "doomed session");
+    ASSERT(fixture_session(live, &lsid, &lstart) == 0, "live session");
+    if (dead <= 0 || live <= 0) {
+        stop_leader(dead);
+        stop_leader(live);
+        return;
+    }
+
+    /* Slot 0: an entry whose leader dies before the fill below. */
+    session_allow_add(dsid, dstart, "/bin/doomed", "", "/doomed", 0);
+    stop_leader(dead);
+
+    /* Fill the remaining slots with live-session entries. */
+    char target[64];
+    for (int i = 1; i < cap; i++) {
+        snprintf(target, sizeof(target), "/live/%d", i);
+        session_allow_add(lsid, lstart, "/bin/live", "", target, 0);
+    }
+    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/1") == 1,
+           "oldest live entry matches before overflow (memmove victim)");
+
+    /* The overflow add: the sweep must reclaim the doomed slot, keeping
+     * every live entry in place. */
+    session_allow_add(lsid, lstart, "/bin/live", "", "/live/extra", 0);
+
+    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/extra") == 1,
+           "overflow entry stored via dead-slot reclaim");
+    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/1") == 1,
+           "oldest live entry survived the overflow add");
+    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/2") == 1,
+           "second live entry survived the overflow add");
+    ASSERT(session_allow_match(dsid, "/bin/doomed", "", "/doomed") == 0,
+           "doomed entry matches nothing (its session is dead)");
+
+    session_clear();
+    stop_leader(live);
+}
+
 static void test_deny(void)
 {
     session_clear();
@@ -265,6 +319,7 @@ int main(void)
     test_allow_match();
     test_ttl_expiry();
     test_dead_leader();
+    test_full_table_reclaims_dead();
     test_deny();
     test_clear_and_entries();
     if (failures)

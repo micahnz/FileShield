@@ -203,3 +203,12 @@ void cache_expire(void)
     }
 }
 
+void cache_clear(void)
+{
+    if (!cache_initialized)
+        cache_init();
+    else
+        memset(cache, 0, sizeof(cache));
+    cache_high = 0; /* empty table: restart the scan bound at zero */
+}
+

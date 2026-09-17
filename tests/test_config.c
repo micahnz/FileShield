@@ -1071,6 +1071,56 @@ static void test_relative_protected_rejected(void)
 }
 
 /*
+ * M4 regression: '#' is a comment only at line start.  Mid-line it is a
+ * legal path byte — accepting "pattern  # note" verbatim silently
+ * un-protected the files the entry appeared to guard (and the README
+ * once demonstrated that exact style).  Fail the whole config loudly
+ * instead; comments move to their own line.  Trailing junk after a
+ * section header is rejected for the same reason.
+ */
+static void test_inline_hash_rejected(void)
+{
+    struct { const char *conf; const char *what; } reject_cases[] = {
+        { "[protected_paths]\n" "/tmp/a # files inside /tmp/a\n",
+          "protected entry with trailing comment" },
+        { "[protected_paths]\n" "/tmp/a\n"
+          "[allowlist]\n" "/usr/bin/x = /tmp/y # scoped\n",
+          "allowlist rule with trailing comment" },
+        { "[protected_paths]\n" "/tmp/sharp#tag\n",
+          "literal '#' in a path (no silent acceptance)" },
+        { "[settings] tuning\n" "user_ttl = 300\n",
+          "trailing junk after section header" },
+    };
+
+    for (size_t i = 0; i < sizeof(reject_cases) / sizeof(reject_cases[0]); i++) {
+        char *path = write_temp(reject_cases[i].conf);
+        ASSERT(path != NULL, "write temp config");
+        static Config cfg; /* PATH_MAX-wide tables: keep them off the stack */
+        memset(&cfg, 0, sizeof(cfg));
+        int r = config_load(path, &cfg);
+        ASSERT(r == -1, reject_cases[i].what);
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* Control: whole-line comments (also indented) remain fine. */
+    const char *ok = "[protected_paths]\n"
+                     "# leading comment\n"
+                     "   # indented comment\n"
+                     "/tmp/fileshield_hash_ok\n";
+    char *path = write_temp(ok);
+    ASSERT(path != NULL, "write comment control config");
+    static Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    ASSERT(config_load(path, &cfg) == 0, "whole-line comments still load");
+    ASSERT(cfg.protected_count == 1, "control entry parsed");
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+/*
  * Exact rules keep the historical semantics and record is_glob = 0 with
  * base_len == strlen(path); a bare global rule has an empty target with
  * zeroed target metadata.
@@ -1655,6 +1705,7 @@ int main(void)
     test_unknown_setting();
     test_debug_staging();
     test_relative_protected_rejected();
+    test_inline_hash_rejected();
     test_settings_user_ttl();
     test_settings_session_ttl();
     test_settings_session_ttl_value();

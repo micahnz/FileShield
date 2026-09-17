@@ -51,6 +51,25 @@ char *proc_exe_path(pid_t pid)
     if (len < 0 || len >= (ssize_t)sizeof(buf) - 1)
         return NULL;
     buf[len] = '\0';
+
+    /*
+     * Strip the kernel's " (deleted)" marker, mirroring resolve_fd_path()
+     * on the target side.  The suffix must not poison the binary's
+     * identity: a self-unlinking process would otherwise stop matching
+     * every path-keyed rule — a [denylist] entry silently degrading to a
+     * prompt, pinned/unsafe allowlist grants breaking into re-prompt
+     * storms, and cache keys skewing.  Stripping widens matching
+     * symmetrically (a deleted binary can also satisfy allow rules again)
+     * which is the correct direction: hash pinning still validates the
+     * running image via sha512_proc_exe (the deleted inode is readable
+     * through /proc/<pid>/exe), and the path is whatever the admin
+     * approved before the unlink.
+     */
+    static const char deleted[] = " (deleted)";
+    size_t dlen = sizeof(deleted) - 1;
+    if ((size_t)len >= dlen && strcmp(buf + len - dlen, deleted) == 0)
+        buf[len - (ssize_t)dlen] = '\0';
+
     return strdup(buf);
 }
 
@@ -129,29 +148,49 @@ int read_cmdline(pid_t pid, char *out, size_t size)
     return (int)n;
 }
 
+/*
+ * Replace control characters (below 0x20 and DEL) in place with '?'.
+ * Single choke point for every log line: file names, comm names and
+ * command lines are attacker-controlled and reach log_msg() as
+ * interpolated %s arguments, and the journal is the project's declared
+ * authoritative record — an embedded newline would otherwise forge a
+ * plausible extra entry under the daemon's own identity (notify.c
+ * already sanitizes the dialogs; logs are the other exit).  No message
+ * in this codebase embeds control characters on purpose.
+ */
+void log_scrub(char *s)
+{
+    for (; *s != '\0'; s++)
+    {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20 || c == 0x7f)
+            *s = '?';
+    }
+}
+
 void log_msg(int priority, const char *fmt, ...)
 {
-    va_list a1, a2;
+    va_list a1;
 
     /* Debug firehose gate: per-event plumbing stays out of the journal
      * unless the operator explicitly asked for it. */
     if (priority == LOG_DEBUG && !g_log_debug)
         return;
 
+    char msg[2048];
     va_start(a1, fmt);
-    va_copy(a2, a1);
-    vsyslog(priority, fmt, a1);
+    /* vsnprintf guarantees NUL-termination when size > 0. */
+    vsnprintf(msg, sizeof(msg), fmt, a1);
+    log_scrub(msg);
     va_end(a1);
+
+    syslog(priority, "%s", msg);
 
     /* Mirror to stderr only when it is attached to a terminal.  The unit
      * runs with --foreground, and systemd/journald captures stderr too, so
      * an unconditional mirror would duplicate every syslog message. */
     if (g_foreground && isatty(STDERR_FILENO))
-    {
-        vfprintf(stderr, fmt, a2);
-        fputc('\n', stderr);
-    }
-    va_end(a2);
+        fprintf(stderr, "%s\n", msg);
 }
 
 int path_under_len(const char *path, const char *dir, size_t dlen)

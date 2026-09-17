@@ -186,6 +186,14 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     *cfg = new_cfg;
     g_config = *cfg;
 
+    /* The new rule set is now live: replaying cached allow grants that
+     * only the OLD rules covered would keep a just-removed (or
+     * narrowed) grant answering for up to user_ttl seconds after the
+     * admin reloaded to take it away.  Fail closed: drop the cache.
+     * Only this success path clears it — rejected reloads keep the old
+     * config published, so their grants stay earned. */
+    cache_clear();
+
     reload_refresh_state();
     return 0;
 }

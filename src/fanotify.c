@@ -1691,10 +1691,21 @@ unsigned int fanotify_mark_mask(void)
  */
 static int g_hash_wait_fan_fd = -1;
 
+/*
+ * The dialog the current pump stack belongs to (0 = none).  fanotify_pump
+ * publishes its dialog_child_pid for the duration of its own call; this
+ * hook has no pid of its own, so without the handoff the nested pump runs
+ * dialog-blind: the dialog's own protected-path opens (kdialog reads
+ * ~/.config trees) would defer behind the very dialog they must not wait
+ * for, freezing it until the 30 s timeout denies the decision — a
+ * self-inflicted member of the freeze class the mark-scope rules guard.
+ */
+static pid_t g_active_dialog_pid = 0;
+
 static void hash_wait_pump(void)
 {
     if (g_hash_wait_fan_fd >= 0)
-        fanotify_pump(g_hash_wait_fan_fd, 0);
+        fanotify_pump(g_hash_wait_fan_fd, g_active_dialog_pid);
 }
 
 int fanotify_setup(void)
@@ -3501,6 +3512,14 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
     int responded = 0;
 
+    /* Publish the dialog for the duration of this call so the hash-helper
+     * wait hook (hash_wait_pump) stays dialog-aware; save/restore keeps a
+     * nested pump on the enclosing dialog and clears the pid the moment
+     * no dialog pump is on the stack (see g_active_dialog_pid). */
+    pid_t saved_dialog = g_active_dialog_pid;
+    if (dialog_child_pid > 0)
+        g_active_dialog_pid = dialog_child_pid;
+
     /* Deliver any responses the queue is holding; a failed response must
      * not wait for the main loop while a dialog blocks it. */
     unanswered_retry(fan_fd);
@@ -3595,6 +3614,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         }
     }
 
+    g_active_dialog_pid = saved_dialog;
     return responded;
 }
 
@@ -4072,9 +4092,20 @@ void fanotify_loop(int fd, int wake_fd)
         /* A queued response needs periodic retries even on an otherwise
          * idle filesystem; the fanotify poll() does not report POLLOUT. */
         int poll_timeout = (g_unanswered_count > 0) ? 250 : -1;
-        int pr;
-        while ((pr = poll(pfds, nfds, poll_timeout)) < 0 && errno == EINTR)
-            ; /* handler-set flags are re-checked by the outer while */
+        int pr = poll(pfds, nfds, poll_timeout);
+        if (pr < 0 && errno == EINTR)
+        {
+            /* Return to the loop top so g_running/g_need_reload are
+             * re-checked for real.  Retrying poll inline instead would
+             * swallow the wake before the flags can be seen: in the
+             * documented no-wake-pipe degradation (main.c) this EINTR is
+             * the ONLY observable signal delivery, so a swallowed one
+             * leaves an idle daemon ignoring SIGTERM/SIGHUP until the
+             * supervisor escalates to SIGKILL — and close(fan_fd) after
+             * SIGKILL makes the kernel auto-ALLOW every outstanding
+             * permission event. */
+            continue;
+        }
         if (pr <= 0)
             continue;
 
@@ -4280,6 +4311,12 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining)
 {
     return batch_abandon(group_fd, ev, remaining);
+}
+
+/* Test seam (fanotify.h): the pump stack's published dialog pid. */
+pid_t fanotify_test_active_dialog_pid(void)
+{
+    return g_active_dialog_pid;
 }
 
 /*

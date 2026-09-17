@@ -49,4 +49,8 @@ int session_deny_match(pid_t sid, const char *binary, const char *bin_sha512,
 /* Remove every entry (tests / shutdown). */
 void session_clear(void);
 
+/* Test seam: table capacity (SESSION_MAX). The overflow-reclamation
+ * behavior is only observable by filling to the cap. */
+int session_test_max(void);
+
 #endif

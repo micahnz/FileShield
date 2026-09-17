@@ -247,6 +247,14 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining);
 
 /*
+ * Test seam: the dialog pid the current pump stack publishes for the
+ * hash-helper wait hook (g_active_dialog_pid).  0 when no dialog pump is
+ * on the stack; nonzero only DURING a fanotify_pump() call made with a
+ * dialog pid (it must be restored to 0 on return, at every exit path).
+ */
+pid_t fanotify_test_active_dialog_pid(void);
+
+/*
  * Test seams: the recent-decision dedup cache.  The key is
  * (pid, process start time, resolved binary, dev, ino, resolved path); a
  * newer decision replaces an older one for the same key, and a reload

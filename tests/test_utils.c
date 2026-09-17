@@ -1,6 +1,10 @@
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <linux/limits.h>
 #include <pwd.h>
@@ -133,6 +137,105 @@ static void test_proc_exe(void) {
     ASSERT(exe == NULL, "proc_exe_path returns NULL for invalid pid");
 }
 
+/*
+ * M5 regression: the kernel marks a running-but-unlinked binary with a
+ * trailing " (deleted)" in /proc/<pid>/exe.  That marker must never
+ * reach the pipeline's binary identity, or a self-unlinking process
+ * escapes every path-keyed rule ([denylist] demotes from a guaranteed
+ * deny to a prompt; allowlist pins break into re-prompt storms).
+ * A live child covers the whole path: exec a copy, unlink it while
+ * running, and require the stripped identity back.
+ */
+static void test_proc_exe_deleted(void) {
+    const char *srcs[] = { "/bin/sleep", "/usr/bin/sleep" };
+    const char *src = NULL;
+    for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++)
+        if (access(srcs[i], X_OK | R_OK) == 0) { src = srcs[i]; break; }
+    if (!src) {
+        fprintf(stderr, "SKIP: sleep binary unavailable; deleted-exe test skipped\n");
+        return;
+    }
+
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof(copy), "/tmp/fileshield_delexe_%d.bin",
+             (int)getpid());
+    unlink(copy);
+
+    FILE *in = fopen(src, "rb");
+    FILE *out = in ? fopen(copy, "wb") : NULL;
+    char chunk[8192];
+    size_t n;
+    while (in && out && (n = fread(chunk, 1, sizeof(chunk), in)) > 0)
+        fwrite(chunk, 1, n, out) ;
+    if (in)
+        fclose(in);
+    int ok = out != NULL;
+    if (out)
+        ok = fclose(out) == 0;
+    if (!ok) {
+        fprintf(stderr, "SKIP: cannot copy sleep binary; deleted-exe test skipped\n");
+        unlink(copy);
+        return;
+    }
+    chmod(copy, 0755);
+
+    pid_t child = fork();
+    ASSERT(child >= 0, "fork deleted-exe child");
+    if (child == 0) {
+        execl(copy, copy, "30", (char *)NULL);
+        _exit(127);
+    }
+    if (child < 0) { unlink(copy); return; }
+
+    /* Wait for the exec to land: /proc/<child>/exe points at the copy. */
+    char link[64], probe[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/%d/exe", (int)child);
+    int execed = 0;
+    for (int i = 0; i < 200 && !execed; i++) {
+        ssize_t r = readlink(link, probe, sizeof(probe) - 1);
+        if (r > 0) {
+            probe[r] = '\0';
+            execed = strcmp(probe, copy) == 0;
+        }
+        if (!execed)
+            usleep(10000);
+    }
+    if (!execed) {
+        fprintf(stderr, "SKIP: child exec not observable; deleted-exe test skipped\n");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        unlink(copy);
+        return;
+    }
+
+    ASSERT(unlink(copy) == 0, "unlink the running binary");
+
+    /* The kernel must report the marker, or the strip is untested. */
+    int marked = 0;
+    for (int i = 0; i < 200 && !marked; i++) {
+        ssize_t r = readlink(link, probe, sizeof(probe) - 1);
+        if (r > 0) {
+            probe[r] = '\0';
+            marked = strstr(probe, " (deleted)") != NULL;
+        }
+        if (!marked)
+            usleep(10000);
+    }
+    ASSERT(marked, "kernel reports the deleted marker on /proc/<pid>/exe");
+
+    char *exe = proc_exe_path(child);
+    ASSERT(exe != NULL, "proc_exe_path resolves the deleted binary");
+    if (exe) {
+        ASSERT(strcmp(exe, copy) == 0,
+               "deleted marker stripped: identity is the admin-visible path");
+        free(exe);
+    }
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    unlink(copy);
+}
+
 static void test_proc_helpers(void) {
     char comm[64];
     char cmdline[512];
@@ -204,6 +307,36 @@ static void test_expand_home(void) {
     free_string_array(NULL);
 }
 
+/*
+ * M6 regression: every rendered log line passes through log_scrub(), so
+ * an attacker-controlled file name or comm can never forge journal
+ * entries (e.g. "id_rsa\nfileshield[1]: user chose Allow Always ...").
+ */
+static void test_log_scrub(void) {
+    char buf[128];
+
+    snprintf(buf, sizeof(buf), "%s", "plain/path/is_untouched");
+    log_scrub(buf);
+    ASSERT(strcmp(buf, "plain/path/is_untouched") == 0,
+           "printable text survives the scrub");
+
+    snprintf(buf, sizeof(buf), "%s",
+             "/home/u/.ssh/id_rsa\nfileshield[1]: ALLOW /etc/shadow");
+    log_scrub(buf);
+    ASSERT(strchr(buf, '\n') == NULL, "newline forge neutralized");
+    ASSERT(strstr(buf, "/home/u/.ssh/id_rsa") != NULL,
+           "path content preserved");
+    ASSERT(strstr(buf, "ALLOW /etc/shadow") != NULL,
+           "forged text survives as inert content");
+
+    /* Every control byte becomes '?', high bytes and DEL untouched-safe. */
+    char raw[8];
+    memcpy(raw, "a\x01\x1f\x7fz", 6);
+    raw[6] = '\0';
+    log_scrub(raw);
+    ASSERT(strcmp(raw, "a???z") == 0, "control bytes scrubbed");
+}
+
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
@@ -211,8 +344,10 @@ int main(void) {
     test_glob_base_len();
     test_glob_match();
     test_proc_exe();
+    test_proc_exe_deleted();
     test_proc_helpers();
     test_expand_home();
+    test_log_scrub();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

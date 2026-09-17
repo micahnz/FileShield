@@ -25,6 +25,15 @@ void cache_insert(pid_t pid, const char *binary, const char *target,
 void cache_expire(void);
 
 /*
+ * Drop every cached allow grant.  Called when a successful config reload
+ * swaps the rule set: cached grants exist because the rules that were
+ * live when they were inserted covered them, and after a reload the old
+ * rules can no longer vouch for them (a narrowed or removed rule must
+ * take effect immediately, not stay replayable until user_ttl expires).
+ */
+void cache_clear(void);
+
+/*
  * Test seam: insert with an explicit process start time so PID-reuse
  * rejection can be exercised without a recycled PID.  starttime == 0
  * means "unknown".

@@ -336,6 +336,9 @@ static int collect_digest(int fd, pid_t pid, const char *label,
     int timed_out = 0;
     long long deadline = now_ms() + SHA512_TIMEOUT_S * 1000;
 
+    memset(buf, 0, sizeof(buf)); /* validation below must never read a
+                                  * byte this function did not write */
+
     while (total < (ssize_t)sizeof(buf) - 1)
     {
         int remaining_ms = (int)(deadline - now_ms());
@@ -411,8 +414,18 @@ static int collect_digest(int fd, pid_t pid, const char *label,
     }
 
     /* GNU sha512sum prefixes the line with a backslash when the printed
-     * filename contains a backslash or newline; accept and skip it. */
+     * filename contains a backslash or newline; accept and skip it.
+     * The full digest must sit inside what was actually READ (not just
+     * inside the buffer): a read that stopped at exactly 128 bytes with
+     * a backslash prefix has no complete digest. */
     size_t digest_off = (buf[0] == '\\') ? 1 : 0;
+
+    if (total < (ssize_t)(digest_off + 128))
+    {
+        set_failure("sha512sum returned a truncated digest");
+        log_msg(LOG_ERR, "sha512: %s: truncated digest output", label);
+        return -1;
+    }
 
     /* Validate: the 128 digest characters must all be hex digits. */
     for (int i = 0; i < 128; i++)

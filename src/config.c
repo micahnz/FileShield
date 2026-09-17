@@ -838,6 +838,22 @@ int config_load(const char *path, Config *cfg)
         if (*s == '\0' || *s == '#')
             continue;
 
+        /* '#' anywhere else is NOT a comment: '#', spaces and tabs are
+         * all legal path bytes, so treating "path # note" as a trailing
+         * comment would either truncate a real path silently or (as
+         * before) swallow the note into the pattern and protect nothing
+         * while the config loads "fine".  Reject loudly instead; move
+         * the comment to its own line. */
+        if (strchr(s, '#'))
+        {
+            log_msg(LOG_ERR,
+                    "config_load: '#' is only a comment at line start; "
+                    "rejecting entry (put comments on their own line): %s",
+                    s);
+            fclose(fp);
+            return -1;
+        }
+
         if (s[0] == '[')
         {
             char *close = strchr(s, ']');
@@ -848,6 +864,16 @@ int config_load(const char *path, Config *cfg)
                 return -1;
             }
             *close = '\0';
+            /* Anything after the closing bracket is junk the parser
+             * would otherwise ignore while honoring the header. */
+            if (*trim(close + 1) != '\0')
+            {
+                log_msg(LOG_ERR,
+                        "config_load: trailing text after section header: %s",
+                        close + 1);
+                fclose(fp);
+                return -1;
+            }
             if (strcmp(s + 1, "protected_paths") == 0)
                 section = SECTION_PROTECTED;
             else if (strcmp(s + 1, "allowlist") == 0)

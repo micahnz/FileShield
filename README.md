@@ -1,24 +1,25 @@
 # Fileshield
 
 > **Fork notice:** This repository was originally forked from
-> [YoranSys/FileShield](https://github.com/YoranSys/FileShield), but it has
-> diverged significantly and is for all intents and purposes a new project. It
-> uses a different permission model.
+> [YoranSys/FileShield](https://github.com/YoranSys/FileShield), but has
+> diverged significantly and is for all intents and purposes a new project which
+> uses a completely different permission model.
 
 ## Purpose
 
-Fileshield is an additional layer of defense for machines where LLM agents run
-with filesystem access. It watches sensitive files (cloud credentials, SSH
-keys, kubeconfig, API tokens, ...) and asks the operator before a process reads
-one — so an agent accidentally pulling `~/.aws/credentials` into a prompt, an
-upload, or a log is stopped and surfaced instead of going unnoticed.
+Fileshield is an additional layer of defense against supply chain attacks and on
+machines where agents run with filesystem access. It watches sensitive files
+(cloud credentials, SSH keys, kubeconfig, API tokens etc...) and prompts the
+operator before a process can read the file, for example an agent accidentally
+pulling `~/.aws/credentials` into a prompt or a compromised vscode extension or
+npm package scanning for api keys in your home directory.
 
 It is **not a definitive security tool**: I am not a security expert and I
-cannot guarantee that Fileshield cannot be bypassed. It is not a substitute for
-sandboxing, least-privilege users, or a secret manager. Its value is as a
-backstop — when other harness or sandbox measures fail, Fileshield at least
-notifies the operator that a sensitive file is being read and blocks it until
-explicit approval is given.
+cannot guarantee that Fileshield will catch everything and cannot be bypassed.
+It is not a substitute for sandboxing, least-privilege users, or a secret
+manager. Its value is as a backstop for when other harnesses or sandbox measures
+fail, Fileshield notifies the operator that a sensitive file is being read and
+blocks it until explicit approval is given.
 
 ## What it does
 
@@ -165,10 +166,14 @@ Paths listed in `[protected_paths]` that do not exist yet are skipped at startup
 Entries may contain `*` and `**`:
 
 ```ini
-~/.cloudflared/*.json      # files directly inside ~/.cloudflared
-~/.cloudflared/**/*.json   # the same, at any depth (including directly inside)
-~/.ssh/id_*                # key material inside ~/.ssh
+~/.cloudflared/*.json
+~/.cloudflared/**/*.json
+~/.ssh/id_*
 ```
+
+These protect, respectively: files directly inside `~/.cloudflared`; the same at any depth (including directly inside); and key material inside `~/.ssh`.
+
+- Comments start with `#` **only at the beginning of a line** (after optional whitespace). A `#` anywhere else is a literal path byte, not a trailing comment — and because a pattern containing it would then match nothing, the whole config is refused at load with a clear message, rather than silently protecting nothing. Put explanatory comments on their own lines.
 
 - `*` matches any characters **within one path segment** and never crosses `/`. It matches dotfiles too (`.env.local` is covered by `~/.env*`).
 - `**` is a **whole-segment** wildcard that matches zero or more segments: `~/.cloudflared/**/*.json` also matches `~/.cloudflared/a.json`, and `~/.cloudflared/**` protects the whole tree.
@@ -384,7 +389,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 
 Denials are always checked before grants, so a config, session or permanent denial can never be bypassed by an allow rule or a cached _Allow Once_. The decision order is: config denylist → session deny → runtime deny → file cache → session allow → runtime allow → `[unsafe_allowlist]` → hash-pinned `[allowlist]` → dialog. An open that reaches a protected inode through a path outside every protected prefix (a hard link) never takes a grant from those lists: it always shows the dialog, so an approval for the original path cannot silently cover the link. For the same reason a **scoped config deny** does not fire on a hard-link open — the resolved path is the unprotected alias, and the daemon cannot tell which protected path the inode belongs to — so the attempt falls through to the always-prompt path rather than `EPERM`; a bare global deny still applies.
 
-While one decision dialog is open, every *other* open still runs the full pipeline immediately: deny rules deny, and cache/session/rule grants allow — only opens that genuinely need the user queue behind the pending decision. A rule-covered read (for example your shell's history file matching an allowlist) therefore never waits behind another secret's prompt.
+While one decision dialog is open, every _other_ open still runs the full pipeline immediately: deny rules deny, and cache/session/rule grants allow — only opens that genuinely need the user queue behind the pending decision. A rule-covered read (for example your shell's history file matching an allowlist) therefore never waits behind another secret's prompt.
 
 `session_ttl` is configured in `[settings]` and defaults to `0`, meaning session decisions live exactly as long as the shell session itself. A non-zero value additionally expires them after that many seconds.
 
@@ -525,12 +530,12 @@ survive a `SIGHUP` config reload for the settings key.
 
 The daemon logs at the following levels:
 
-| Level     | Events                                                                                                                                                                                                                                                                |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices), config allowlist first-use hash pins                                                                                                           |
-| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug`                                                                                     |
+| Level     | Events                                                                                                                                                                                                                                                                                                                                                |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INFO`    | Start/stop, config load, fanotify marks added/removed, reload, one line per access (rule hits, prompts, user choices), config allowlist first-use hash pins                                                                                                                                                                                           |
+| `DEBUG`   | Per-event plumbing: raw event receipt, target resolution, dedup-cache reuse, pump decisions, dialog child lifecycle. Suppressed unless `debug = yes` in `[settings]` or `--debug`                                                                                                                                                                     |
 | `WARNING` | `[unsafe_allowlist]` grants, first hit per process (rule, binary, PID, target), failed marks (path not found), dialog timeout/failure, session detection unavailable, binary digest unavailable when a prompt is shown (the reason follows on the access line), allowlist hash-change prompts (full old/new digests) and approvals, hard-link prompts |
-| `ERR`     | `fanotify_init` failure, config parse error or limit overflow (config refused), untrackable mark (installation fails, kernel mark removed), fork/exec failure, `sha512` helper timeout/failure (names the path and reason), damaged `allowlist-hashes.json`         |
+| `ERR`     | `fanotify_init` failure, config parse error or limit overflow (config refused), untrackable mark (installation fails, kernel mark removed), fork/exec failure, `sha512` helper timeout/failure (names the path and reason), damaged `allowlist-hashes.json`                                                                                           |
 
 ### Follow live events
 

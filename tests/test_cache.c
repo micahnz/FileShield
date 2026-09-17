@@ -128,6 +128,35 @@ static void test_ttl_clamp(void) {
     cache_expire();
 }
 
+static void test_clear(void) {
+    /*
+     * M1 regression: a config reload swaps the rule set, and grants
+     * cached under the OLD rules must stop replaying immediately (a
+     * narrowed or removed [allowlist] entry would otherwise keep
+     * answering for up to user_ttl seconds).  cache_clear() is the
+     * reload's fail-closed hook.
+     */
+    cache_insert(600, "/bin/old-rule", "/home/u/.aws/credentials", 60);
+    cache_insert(601, "/bin/old-wild", NULL, 60);
+    ASSERT(cache_lookup(600, "/bin/old-rule", "/home/u/.aws/credentials") > 0,
+           "file-scoped grant live before clear");
+    ASSERT(cache_lookup(601, "/bin/old-wild", "/anything/else") > 0,
+           "wildcard grant live before clear");
+
+    cache_clear();
+
+    ASSERT(cache_lookup(600, "/bin/old-rule", "/home/u/.aws/credentials") == 0,
+           "file-scoped grant dropped by clear");
+    ASSERT(cache_lookup(601, "/bin/old-wild", "/anything/else") == 0,
+           "wildcard grant dropped by clear");
+
+    /* The table is reusable after a clear (water mark was reset). */
+    cache_insert(600, "/bin/old-rule", "/home/u/.aws/credentials", 60);
+    ASSERT(cache_lookup(600, "/bin/old-rule", "/home/u/.aws/credentials") > 0,
+           "insert after clear works");
+    cache_expire();
+}
+
 int main(void) {
     printf("=== test_cache ===\n");
     test_insert_lookup();
@@ -140,6 +169,7 @@ int main(void) {
     test_pid_starttime();
     test_pid_reuse();
     test_ttl_clamp();
+    test_clear();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

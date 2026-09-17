@@ -1474,6 +1474,60 @@ static void test_batch_abandon_claims_stranded(void) {
 }
 
 /*
+ * Part 0c-bis: pump-level dialog-group fast path and the M2 publish
+ * contract.  A socketpair stands in for the fanotify group (read and
+ * write share one fd, exactly like the real one).  An event whose pid IS
+ * the dialog pid must be ALLOWed and claimed without touching the
+ * pipeline, and g_active_dialog_pid — the handoff that keeps the
+ * hash-helper wait pump dialog-aware — must be 0 again once the pump
+ * returns at every exit path.
+ */
+static void test_pump_dialog_group_allow(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before pump socketpair");
+
+    int sv[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+           "socketpair as fake fanotify group");
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+
+    int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd >= 0, "open dialog-group event fd");
+
+    static char batch[64]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)batch;
+    memset(batch, 0, sizeof(batch));
+    md->event_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->metadata_len = sizeof(*md);
+    md->mask = FAN_OPEN_PERM;
+    md->fd = efd;
+    md->pid = (int)getpid();
+
+    ssize_t wrote = write(sv[1], batch, sizeof(*md));
+    ASSERT(wrote == (ssize_t)sizeof(*md), "feed one event to the pump");
+
+    int responded = fanotify_pump(sv[0], getpid());
+    ASSERT(responded == 1, "dialog-group event was decided in the pump");
+    ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+           "dialog-group event fd closed after the ALLOW");
+    ASSERT(fanotify_test_active_dialog_pid() == 0,
+           "published dialog pid restored to 0 once the pump returns");
+
+    struct fanotify_response resp;
+    ssize_t got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd &&
+               resp.response == FAN_ALLOW,
+           "dialog-group event was answered FAN_ALLOW");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
  * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
  * retried on the next clear) instead of being forgotten, which would
  * leave an untracked kernel mark behind.  A negative fd means no group
@@ -2155,6 +2209,7 @@ int main(void) {
     test_kdialog_status_mapping();
     test_verdict_stage_order();
     test_pump_defer_contract();
+    test_pump_dialog_group_allow();
     test_pin_change_defers_in_pump();
     test_unsafe_allowlist_wins_over_pinned();
     test_dialog_rate_limiter();

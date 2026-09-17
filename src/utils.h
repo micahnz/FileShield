@@ -41,6 +41,14 @@ char *proc_exe_path(pid_t pid);
 void log_msg(int priority, const char *fmt, ...);
 
 /*
+ * Replace control characters (including newlines) with '?' in place.
+ * log_msg() applies it to every rendered line as a choke point against
+ * log-injection through attacker-controlled paths/comm/cmdline; unit
+ * tests verify the scrub directly.
+ */
+void log_scrub(char *s);
+
+/*
  * Generic /proc readers shared by the event pipeline and the dialog
  * code.  All three return -1 (or 0 for get_ppid) when the process is
  * gone or unreadable; callers treat that as "identity unavailable".

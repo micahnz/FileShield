@@ -94,22 +94,39 @@ static int hash_matches(const SessionEntry *e, const char *bin_sha512)
     return strcmp(e->binary_sha512, bin_sha512) == 0;
 }
 
-/* Common path-level checks shared by all matchers.  Never matches an
- * entry without a target, and lazily drops dead/expired entries. */
+/*
+ * Common path-level checks shared by all matchers.  Never matches an
+ * entry without a target.  Key comparisons come FIRST: the per-event
+ * match must not pay a /proc leader check for every live entry (with
+ * both lists near capacity that is up to 512 /proc opens per protected
+ * open, while the requester is kernel-suspended).  Leader liveness is
+ * therefore verified only on the full-key-match path — the only entries
+ * this scan acts on — and expiry (a cheap time compare) still drops on
+ * sight.  Reclaiming dead leaders' non-matching entries happens in the
+ * table-full sweep of session_add_entry: once per user decision, not
+ * once per event.
+ */
 static int entry_covers(SessionEntry *e, time_t now, pid_t sid,
                         const char *binary, const char *target)
 {
     if (!e->used)
         return 0;
-    if (entry_expired(e, now) || !leader_alive(e->sid, e->leader_start))
+    if (entry_expired(e, now))
     {
         e->used = 0;
         return 0;
     }
     if (!binary || !target || target[0] == '\0')
         return 0;
-    return e->sid == sid && strcmp(e->binary, binary) == 0 &&
-           strcmp(e->target, target) == 0;
+    if (e->sid != sid || strcmp(e->binary, binary) != 0 ||
+        strcmp(e->target, target) != 0)
+        return 0;
+    if (!leader_alive(e->sid, e->leader_start))
+    {
+        e->used = 0; /* this very session asked; its leader is gone */
+        return 0;
+    }
+    return 1;
 }
 
 static int list_match(SessionEntry *list, int count, pid_t sid,
@@ -188,14 +205,27 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
         }
         else
         {
-            /* Full: reclaim a dead hole before dropping a live entry;
-             * only when every slot is live is the oldest (slot 0)
-             * evicted, which the log records. */
+            /* Full: reclaim a hole before dropping a live entry.
+             * Matchers drop dead leaders only on the key-match path now
+             * (no /proc storm per event, see entry_covers), so entries
+             * whose leaders died outside their own session linger as
+             * used here: sweep for expired slots cheaply and consult
+             * leader liveness for the rest — once per user decision,
+             * never per protected open.  Only when every slot is provably
+             * live is the oldest (slot 0) evicted, which the log records. */
             slot = -1;
+            time_t now = mono_seconds();
             for (int i = 0; i < SESSION_MAX; i++)
             {
                 if (!list[i].used)
                 {
+                    slot = i;
+                    break;
+                }
+                if (entry_expired(&list[i], now) ||
+                    !leader_alive(list[i].sid, list[i].leader_start))
+                {
+                    list[i].used = 0;
                     slot = i;
                     break;
                 }
@@ -248,4 +278,10 @@ void session_clear(void)
     memset(g_deny, 0, sizeof(g_deny));
     g_allow_count = 0;
     g_deny_count = 0;
+}
+
+/* Test seam (session.h): table capacity. */
+int session_test_max(void)
+{
+    return SESSION_MAX;
 }
