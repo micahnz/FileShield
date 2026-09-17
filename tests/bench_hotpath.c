@@ -427,6 +427,11 @@ static void bench_dyn_setup(void)
         g_bench_cmd2_fp[0] = '\0';
     snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
              g_bench_cmd_fp);
+    /* A pre-assigned ID (and creation time) keeps the load from migrating
+     * and persisting to the real state directory: the bench must not have
+     * side effects on /var/lib/fileshield. */
+    snprintf(e->rule_id, sizeof(e->rule_id), "0123456789abcdef");
+    e->created_at = 1;
     fanotify_load_dyn_allowlist(e, 1);
 }
 

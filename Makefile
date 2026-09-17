@@ -30,7 +30,7 @@ SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/session.c $(SRCDIR)/notify.c \
            $(SRCDIR)/fanotify.c $(SRCDIR)/inode.c $(SRCDIR)/sha512.c \
            $(SRCDIR)/persist.c $(SRCDIR)/pin.c $(SRCDIR)/reload.c \
-           $(SRCDIR)/ruleid.c
+           $(SRCDIR)/ruleid.c $(SRCDIR)/prune.c
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS    := $(OBJS:.o=.d)
 
@@ -100,12 +100,12 @@ $(OBJDIR)/test_cli_ui: $(OBJDIR)/cli_ui.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o 
 $(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
                          $(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/session.o \
                          $(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
-                         $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
+                         $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
 		$(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/session.o \
 		$(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
-		$(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o -o $@
 
 # Links the reload decision path with fan_fd = -1: every kernel mark fails,
 # so parse failure, reject plus rollback, and rollback failure are exercised
@@ -113,12 +113,12 @@ $(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR
 $(OBJDIR)/test_reload: $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
                        $(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
                        $(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-                       $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
+                       $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
 		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
 		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o -o $@
 
 test: all $(TSTBINS)
 	@failed=0; skips=0; \
@@ -145,12 +145,12 @@ $(OBJDIR)/bench_hotpath: $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
                          $(OBJDIR)/notify.o $(OBJDIR)/config.o \
                          $(OBJDIR)/cache.o $(OBJDIR)/session.o \
                          $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-                         $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
+                         $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
 		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
 		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o -o $@
 
 bench: all $(OBJDIR)/bench_hotpath
 	./$(OBJDIR)/bench_hotpath

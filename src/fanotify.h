@@ -113,6 +113,17 @@ void fanotify_drain_and_deny(int fan_fd);
 /*
  * Dynamic allowlist / denylist persistence: load root-only state files
  * into the in-memory lists (called on daemon startup and reload).
+ *
+ * Each admitted entry keeps its stored rule_id (16 lowercase hex chars)
+ * and created_at.  A legacy entry without an ID -- or with a malformed
+ * one -- gets an ID generated from its identity, unique within the same
+ * list (allow and deny are independent ID namespaces).  When at least
+ * one ID was regenerated the migrated list is written back to that
+ * side's state file immediately (through the path set by
+ * fanotify_set_state_files()), so the file gains the IDs at the first
+ * load.  Grants are kept, never dropped; an entry is only dropped when
+ * no ID can be generated for it (fail closed, logged).  A failed
+ * migration write keeps the in-memory IDs (logs, no rollback).
  */
 
 /* Load persisted entries into the dynamic allowlist. Called on daemon startup. */
@@ -120,6 +131,55 @@ void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count);
 
 /* Load persisted entries into the dynamic denylist. Called on daemon startup. */
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count);
+
+/*
+ * Redirect the state files the runtime lists are written to (adds,
+ * migrations and mutations).  NULL or "" restores the production default
+ * for that side (PERSIST_STATE_FILE / PERSIST_DENY_STATE_FILE); an
+ * over-long path is rejected and leaves the previous value in place.
+ * Test seam: lets unprivileged suites use a temp directory instead of
+ * /var/lib/fileshield.
+ */
+void fanotify_set_state_files(const char *allow_path, const char *deny_path);
+
+/*
+ * Mutation APIs for the in-memory runtime lists.  Each updates memory and
+ * the side's state file atomically, restores the pre-mutation list when
+ * the write fails, and logs the change at LOG_INFO (audit trail).  deny
+ * selects the list: 0 = allowlist, non-zero = denylist.  The other list
+ * is never touched.
+ */
+
+/*
+ * Remove the entry addressed by id: >= RULEID_MIN_PREFIX (8) and at most
+ * RULEID_HEX_LEN (16) lowercase hex chars, an unambiguous prefix of one
+ * stored ID or that ID itself.  Entries with an empty ID do not
+ * participate.  Returns:
+ *    1  removed; memory and the state file no longer hold the entry
+ *    0  no stored ID matches (nothing changed)
+ *   -2  the prefix matches more than one stored ID (nothing removed)
+ *   -1  invalid id, a live entry with an unusable stored ID, or a state
+ *       file write failure (the pre-removal list is restored)
+ */
+int fanotify_remove_dyn_entry(int deny, const char *id);
+
+/*
+ * Clear one runtime list (both memory and state file).  Returns the
+ * number of entries removed, or -1 on a state file write failure (the
+ * pre-clear list is restored).
+ */
+int fanotify_clear_dyn_list(int deny);
+
+/*
+ * Remove duplicate rules from one runtime list: entries sharing binary +
+ * target path + raw command line + call chain keep the newest (last
+ * added) and the older ones are removed (prune.h grouping; digests and
+ * created_at are not part of the key).  *removed_out may be NULL and
+ * otherwise receives the number of entries removed.  Returns 0 on
+ * success (including when there are no duplicates), or -1 on failure
+ * (the pre-prune list is restored).
+ */
+int fanotify_prune_dyn_list(int deny, int *removed_out);
 
 /*
  * Test seams: evaluate the loaded runtime lists against a synthetic

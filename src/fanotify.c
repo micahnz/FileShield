@@ -23,6 +23,8 @@
 #include "sha512.h"
 #include "persist.h"
 #include "pin.h"
+#include "ruleid.h"
+#include "prune.h"
 
 #define BUF_SIZE 4096
 
@@ -609,6 +611,7 @@ static void build_proc_chain(pid_t start_pid, ProcChain *c, int force_retry)
 
 typedef struct
 {
+    char rule_id[RULEID_HEX_LEN + 1];        /* stable stored ID (ruleid.h)     */
     char binary[PATH_MAX];
     char binary_sha512[129];
     char target_path[PATH_MAX];              /* exact file this entry applies to */
@@ -617,6 +620,7 @@ typedef struct
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;
+    time_t created_at;                       /* stamped once at creation         */
 } DynEntry;
 
 static DynEntry g_dyn_allow[DYN_MAX];
@@ -624,6 +628,23 @@ static int g_dyn_allow_count = 0;
 
 static DynEntry g_dyn_deny[DYN_MAX];
 static int g_dyn_deny_count = 0;
+
+/*
+ * State files the runtime lists are written to.  The defaults are the
+ * shipped paths; fanotify_set_state_files() redirects them so the
+ * unprivileged suites never touch /var/lib/fileshield.  They are read at
+ * write time, so one redirect covers adds, migrations and mutations.
+ */
+static char g_dyn_state_file[PATH_MAX] = PERSIST_STATE_FILE;
+static char g_dyn_deny_state_file[PATH_MAX] = PERSIST_DENY_STATE_FILE;
+
+/*
+ * One-list snapshot for the mutation APIs: a failed state write restores
+ * the pre-mutation list exactly (pin.c keeps g_snapshot for the same
+ * guarantee).  The daemon is single-threaded, so one shared buffer is
+ * enough.
+ */
+static DynEntry g_dyn_snapshot[DYN_MAX];
 
 /* ------------------------------------------------------------------ */
 /*  Dialog rate limiting                                              */
@@ -781,6 +802,8 @@ static int dyn_to_persist(const DynEntry *entries, int count,
     {
         const DynEntry *src = &entries[i];
         PersistEntry *dst = &out[i];
+        memcpy(dst->rule_id, src->rule_id, sizeof(src->rule_id));
+        dst->rule_id[sizeof(dst->rule_id) - 1] = '\0';
         memcpy(dst->binary, src->binary, sizeof(src->binary));
         dst->binary[sizeof(dst->binary) - 1] = '\0';
         memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
@@ -800,29 +823,175 @@ static int dyn_to_persist(const DynEntry *entries, int count,
             memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
             dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
         }
+        /* The real creation time travels with the entry: it is not
+         * re-stamped by writes (that moved the ID's own input under the
+         * entry and broke oldest-first ordering). */
+        dst->created_at = src->created_at;
     }
     return n;
 }
 
-/* Copy a DynEntry array to PersistEntry, stamp created_at, write to disk. */
-static void persist_dyn_list(const char *filepath, const DynEntry *entries,
-                             int count, const char *name)
+/* A live entry's rule ID must be exactly RULEID_HEX_LEN (16) lowercase
+ * hex chars -- the format ruleid_make() emits and persist_load() admits.
+ * Anything else is damaged state and must never be persisted. */
+static int dyn_rule_id_valid(const char *id)
 {
+    if (!id || strlen(id) != RULEID_HEX_LEN)
+        return 0;
+    for (int i = 0; i < RULEID_HEX_LEN; i++)
+    {
+        if (!((id[i] >= '0' && id[i] <= '9') ||
+              (id[i] >= 'a' && id[i] <= 'f')))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Validate a caller-supplied lookup ID without consulting a list, so an
+ * invalid argument is -1 even when the list is empty and "not found" is
+ * 0.  ruleid_prefix_match() validates both arguments (8..16 lowercase
+ * hex); against a well-formed constant it returns -1 exactly when 'id'
+ * is malformed, so only the sign is used here (same probe as pin.c).
+ */
+static int dyn_lookup_id_valid(const char *id)
+{
+    static const char probe[RULEID_HEX_LEN + 1] = "0000000000000000";
+
+    return ruleid_prefix_match(probe, id) >= 0;
+}
+
+/*
+ * Generate a rule ID for e from its identity, unique against the other
+ * live entries of the same list (allow and deny are independent ID
+ * namespaces).  count is the number of live entries to consider; e is
+ * skipped when it already lies in list[0..count).  Returns 0 on success,
+ * -1 when generation fails (e->rule_id is left untouched); callers must
+ * then refuse the entry rather than persist an empty ID.
+ */
+static int dyn_assign_rule_id(const DynEntry *list, int count, DynEntry *e)
+{
+    const char *existing[DYN_MAX] = {0}; /* n 0 passes an empty list */
+    RuleIdentity id;
+    int depth = e->chain_depth;
+    int n = 0;
+
+    if (depth < 0)
+        depth = 0;
+    if (depth > PERSIST_CHAIN_MAX)
+        depth = PERSIST_CHAIN_MAX;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (&list[i] == e || list[i].rule_id[0] == '\0')
+            continue;
+        existing[n++] = list[i].rule_id;
+    }
+
+    memset(&id, 0, sizeof(id));
+    id.binary = e->binary;
+    id.binary_sha512 = e->binary_sha512;
+    id.target_path = e->target_path;
+    id.cmdline_sha512 = e->cmdline_sha512;
+    id.chain_depth = depth;
+    for (int i = 0; i < depth; i++)
+    {
+        id.chain_comm[i] = e->chain_comm[i];
+        id.chain_sha512[i] = e->chain_sha512[i];
+    }
+    id.created_at = (long)e->created_at;
+
+    return ruleid_make_unique(&id, existing, n, e->rule_id);
+}
+
+/* Human-readable list name for logs, shared by every mutation. */
+static const char *dyn_list_name(int deny)
+{
+    return deny ? "always-deny" : "always-allow";
+}
+
+/* State file the given side currently writes through. */
+static const char *dyn_state_path(int deny)
+{
+    return deny ? g_dyn_deny_state_file : g_dyn_state_file;
+}
+
+/*
+ * Copy the live list to PersistEntry and write it to the side's state
+ * file.  rule_id and created_at are copied verbatim: created_at is real
+ * creation time, stamped once by dyn_add(), and every live entry must
+ * already have a generated ID.  Returns 0 on success, -1 when the state
+ * file could not be written (the caller keeps or restores its in-memory
+ * list).
+ */
+static int persist_dyn_list(int deny, const DynEntry *entries, int count)
+{
+    const char *name = dyn_list_name(deny);
     PersistEntry *buf = calloc(DYN_MAX, sizeof(PersistEntry));
+    int n;
+
     if (!buf)
     {
         log_msg(LOG_ERR, "out of memory persisting %s", name);
-        return;
+        return -1;
     }
 
-    int n = dyn_to_persist(entries, count, buf, DYN_MAX);
-    time_t now = time(NULL);
-    for (int i = 0; i < n; i++)
-        buf[i].created_at = now;
+    n = dyn_to_persist(entries, count, buf, DYN_MAX);
 
-    if (persist_save(filepath, buf, n) < 0)
-        log_msg(LOG_WARNING, "persist_save failed; %s entry not persisted", name);
+    /* Never write an empty ID: persist_load() drops a present-but-empty
+     * rule_id, so such a file would silently lose the entry on the next
+     * load.  Every creation path assigns an ID; this only catches a
+     * future caller that forgets. */
+    for (int i = 0; i < n; i++)
+    {
+        if (!dyn_rule_id_valid(buf[i].rule_id))
+        {
+            log_msg(LOG_ERR,
+                    "refusing to persist %s entry \"%s\": no usable rule ID",
+                    name, buf[i].binary);
+            free(buf);
+            return -1;
+        }
+    }
+
+    if (persist_save(dyn_state_path(deny), buf, n) < 0)
+    {
+        log_msg(LOG_WARNING, "persist_save failed; %s entries not persisted",
+                name);
+        free(buf);
+        return -1;
+    }
     free(buf);
+    return 0;
+}
+
+/*
+ * Remove the ascending, unique indices in removals from a DynEntry list
+ * in place, preserving survivor order; the vacated tail is zeroed so a
+ * later append cannot resurrect a removed entry.  Indices come from
+ * prune_find() (or one lookup result) and are never mutated here.
+ * Returns the new count.
+ */
+static int dyn_compact(DynEntry *list, int count, const int *removals,
+                       int removal_count)
+{
+    int kept = 0;
+    int r = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (r < removal_count && removals[r] == i)
+        {
+            r++;
+            continue;
+        }
+        if (kept != i)
+            list[kept] = list[i];
+        kept++;
+    }
+    if (kept < count)
+        memset(&list[kept], 0, sizeof(DynEntry) * (count - kept));
+    return kept;
 }
 
 /*
@@ -837,12 +1006,23 @@ static void persist_dyn_list(const char *filepath, const DynEntry *entries,
  * without its matching digest are dropped too: an entry that cannot pin
  * the exact invocation would silently cover every command of that binary,
  * and one that cannot show the invocation is not auditable.
+ *
+ * Each admitted entry keeps its stored rule_id and created_at.  A legacy
+ * entry without an ID (or with a malformed one) gets an ID generated from
+ * its identity, unique against the entries already admitted to this list;
+ * the returned count of regenerated IDs lets the caller persist the
+ * migration immediately.  An entry whose ID cannot be generated is
+ * dropped (fail closed): persist_load() drops present-but-empty IDs, so
+ * an unmigrated entry would silently vanish at the next load anyway.
+ * Returns the number of regenerated IDs (>= 0).
  */
-static void load_dyn_list(DynEntry *list, int *list_count,
-                          const PersistEntry *entries, int count,
-                          const char *name, int require_binary_sha512,
-                          int require_target_path, int require_cmdline)
+static int load_dyn_list(DynEntry *list, int *list_count,
+                         const PersistEntry *entries, int count,
+                         const char *name, int require_binary_sha512,
+                         int require_target_path, int require_cmdline)
 {
+    int migrated = 0;
+
     /* Always replace the in-memory list so a removed state file or a
      * corrupt/unreadable one cannot leave stale grants or denies active
      * in the running daemon. */
@@ -852,7 +1032,7 @@ static void load_dyn_list(DynEntry *list, int *list_count,
     if (!entries || count <= 0)
     {
         log_msg(LOG_DEBUG, "cleared persisted %s entries", name);
-        return;
+        return 0;
     }
     if (count > DYN_MAX)
         count = DYN_MAX;
@@ -866,6 +1046,8 @@ static void load_dyn_list(DynEntry *list, int *list_count,
         snprintf(dst->target_path, sizeof(dst->target_path), "%s", src->target_path);
         snprintf(dst->cmdline, sizeof(dst->cmdline), "%s", src->cmdline);
         snprintf(dst->cmdline_sha512, sizeof(dst->cmdline_sha512), "%s", src->cmdline_sha512);
+        snprintf(dst->rule_id, sizeof(dst->rule_id), "%s", src->rule_id);
+        dst->created_at = src->created_at;
         int depth = src->chain_depth;
         if (depth < 0)
             depth = 0;
@@ -902,10 +1084,32 @@ static void load_dyn_list(DynEntry *list, int *list_count,
                     name, dst->binary);
             continue;
         }
+        /* Legacy migration: assign an ID when none was stored (or a
+         * malformed one somehow reached this list).  Unique against the
+         * entries already admitted, so a list of identical legacy
+         * entries still gets distinct IDs. */
+        if (dst->rule_id[0] == '\0' || !dyn_rule_id_valid(dst->rule_id))
+        {
+            if (dst->rule_id[0] != '\0')
+                log_msg(LOG_WARNING,
+                        "load %s: entry \"%s\" has a malformed rule ID; "
+                        "regenerating it",
+                        name, dst->binary);
+            if (dyn_assign_rule_id(list, n, dst) < 0)
+            {
+                log_msg(LOG_ERR,
+                        "dropping %s entry \"%s\": rule ID could not be "
+                        "generated (fail closed)",
+                        name, dst->binary);
+                continue;
+            }
+            migrated++;
+        }
         n++;
     }
     *list_count = n;
     log_msg(LOG_INFO, "loaded %d persisted %s entries", n, name);
+    return migrated;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1041,12 +1245,50 @@ static int dyn_allow_match(const char *binary, const char *bin_sha512,
  * Append one runtime entry, dropping the oldest when the list is full.
  * Shared by the allow and deny sides; each caller keeps its own admission
  * policy (the allow side refuses entries it cannot pin to a binary).
+ * created_at is stamped once here and the rule ID is generated against
+ * the live entries of the same list.  Returns 0 on success; -1 when no
+ * unique ID could be generated -- nothing is appended (an entry without
+ * an ID must never be persisted: persist_load() would drop it).
  */
-static void dyn_add(DynEntry *list, int *count, const char *binary,
-                    const char *bin_sha512, const ProcChain *chain,
-                    const char *target, const char *cmdline,
-                    const char *cmdline_sha512, const char *name)
+static int dyn_add(DynEntry *list, int *count, const char *binary,
+                   const char *bin_sha512, const ProcChain *chain,
+                   const char *target, const char *cmdline,
+                   const char *cmdline_sha512, const char *name)
 {
+    DynEntry entry;
+    int depth = chain->depth;
+    int rc;
+
+    if (depth < 0)
+        depth = 0;
+    if (depth > PERSIST_CHAIN_MAX)
+        depth = PERSIST_CHAIN_MAX;
+
+    memset(&entry, 0, sizeof(entry));
+    snprintf(entry.binary, sizeof(entry.binary), "%s", binary);
+    snprintf(entry.binary_sha512, sizeof(entry.binary_sha512), "%s",
+             bin_sha512);
+    if (target)
+        snprintf(entry.target_path, sizeof(entry.target_path), "%s", target);
+    snprintf(entry.cmdline, sizeof(entry.cmdline), "%s", cmdline);
+    snprintf(entry.cmdline_sha512, sizeof(entry.cmdline_sha512), "%s",
+             cmdline_sha512);
+    entry.chain_depth = depth;
+    for (int i = 0; i < depth; i++)
+    {
+        snprintf(entry.chain_comm[i], sizeof(entry.chain_comm[i]), "%s",
+                 chain->comm[i]);
+        snprintf(entry.chain_sha512[i], sizeof(entry.chain_sha512[i]), "%s",
+                 chain->sha512[i]);
+    }
+    entry.created_at = time(NULL);
+
+    /* Generate the ID before any eviction: a generation failure must
+     * leave the live list (including its oldest entry) untouched. */
+    rc = dyn_assign_rule_id(list, *count, &entry);
+    if (rc < 0)
+        return -1;
+
     if (*count >= DYN_MAX)
     {
         log_msg(LOG_WARNING, "dynamic %s full (%d); dropping oldest entry",
@@ -1055,21 +1297,8 @@ static void dyn_add(DynEntry *list, int *count, const char *binary,
         *count = DYN_MAX - 1;
     }
 
-    DynEntry *e = &list[(*count)++];
-    memset(e, 0, sizeof(*e));
-    snprintf(e->binary, sizeof(e->binary), "%s", binary);
-    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
-    if (target)
-        snprintf(e->target_path, sizeof(e->target_path), "%s", target);
-    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
-    snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s",
-             cmdline_sha512);
-    e->chain_depth = chain->depth;
-    for (int i = 0; i < chain->depth; i++)
-    {
-        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
-        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
-    }
+    list[(*count)++] = entry;
+    return 0;
 }
 
 /* First 16 hex chars of a digest for log lines; the state file has the
@@ -1112,8 +1341,15 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
         return;
     }
 
-    dyn_add(g_dyn_allow, &g_dyn_allow_count, binary, bin_sha512, chain,
-            target, cmdline, cmdline_sha512, "allowlist");
+    if (dyn_add(g_dyn_allow, &g_dyn_allow_count, binary, bin_sha512, chain,
+                target, cmdline, cmdline_sha512, "allowlist") < 0)
+    {
+        log_msg(LOG_WARNING,
+                "refusing permanent allow for %s: rule ID could not be "
+                "generated; granting one-time access only",
+                binary);
+        return;
+    }
 
     char sha_short[17];
     sha_prefix(bin_sha512, sha_short);
@@ -1121,8 +1357,9 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
             "always-allow added: %s (sha512: %s...) chain-depth=%d -> %s",
             binary, sha_short, chain->depth, target ? target : "(unknown)");
 
-    persist_dyn_list(PERSIST_STATE_FILE, g_dyn_allow, g_dyn_allow_count,
-                     "allowlist");
+    /* A failed write keeps the in-memory entry (the pre-existing
+     * behavior); persist_dyn_list() already logged the failure. */
+    (void)persist_dyn_list(0, g_dyn_allow, g_dyn_allow_count);
 }
 
 /*
@@ -1156,8 +1393,15 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
         return;
     }
 
-    dyn_add(g_dyn_deny, &g_dyn_deny_count, binary, bin_sha512, chain,
-            target, cmdline, cmdline_sha512, "denylist");
+    if (dyn_add(g_dyn_deny, &g_dyn_deny_count, binary, bin_sha512, chain,
+                target, cmdline, cmdline_sha512, "denylist") < 0)
+    {
+        log_msg(LOG_WARNING,
+                "refusing permanent deny for %s: rule ID could not be "
+                "generated; denying this attempt only",
+                binary);
+        return;
+    }
 
     char sha_short[17];
     sha_prefix(bin_sha512, sha_short);
@@ -1165,8 +1409,9 @@ static void dyn_deny_add(const char *binary, const char *bin_sha512,
             "always-deny added: %s (sha512: %s...) chain-depth=%d -> %s",
             binary, sha_short, chain->depth, target ? target : "(unknown)");
 
-    persist_dyn_list(PERSIST_DENY_STATE_FILE, g_dyn_deny, g_dyn_deny_count,
-                     "denylist");
+    /* A failed write keeps the in-memory entry (the pre-existing
+     * behavior); persist_dyn_list() already logged the failure. */
+    (void)persist_dyn_list(1, g_dyn_deny, g_dyn_deny_count);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4361,16 +4606,234 @@ void fanotify_loop(int fd, int wake_fd)
 /*  Public API: dynamic allowlist / denylist persistence              */
 /* ------------------------------------------------------------------ */
 
+void fanotify_set_state_files(const char *allow_path, const char *deny_path)
+{
+    if (!allow_path || allow_path[0] == '\0')
+    {
+        memcpy(g_dyn_state_file, PERSIST_STATE_FILE,
+               sizeof(PERSIST_STATE_FILE));
+    }
+    else if (strlen(allow_path) >= sizeof(g_dyn_state_file))
+    {
+        log_msg(LOG_ERR, "fanotify_set_state_files: allow path too long");
+    }
+    else
+    {
+        memcpy(g_dyn_state_file, allow_path, strlen(allow_path) + 1);
+    }
+
+    if (!deny_path || deny_path[0] == '\0')
+    {
+        memcpy(g_dyn_deny_state_file, PERSIST_DENY_STATE_FILE,
+               sizeof(PERSIST_DENY_STATE_FILE));
+    }
+    else if (strlen(deny_path) >= sizeof(g_dyn_deny_state_file))
+    {
+        log_msg(LOG_ERR, "fanotify_set_state_files: deny path too long");
+    }
+    else
+    {
+        memcpy(g_dyn_deny_state_file, deny_path, strlen(deny_path) + 1);
+    }
+}
+
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 {
-    load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries, count,
-                  "always-allow", 1, 1, 1);
+    int migrated = load_dyn_list(g_dyn_allow, &g_dyn_allow_count, entries,
+                                 count, "always-allow", 1, 1, 1);
+
+    /* Persist the migration immediately so the IDs survive a restart
+     * (the next load would regenerate exactly the same IDs).  A failed
+     * write keeps the in-memory IDs; the entry itself stays usable. */
+    if (migrated > 0)
+    {
+        log_msg(LOG_INFO, "migrated %d always-allow rule ID(s)", migrated);
+        if (persist_dyn_list(0, g_dyn_allow, g_dyn_allow_count) < 0)
+            log_msg(LOG_WARNING,
+                    "migrated always-allow rule IDs were kept in memory but "
+                    "not persisted");
+    }
 }
 
 void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
 {
-    load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries, count,
-                  "always-deny", 0, 1, 1);
+    int migrated = load_dyn_list(g_dyn_deny, &g_dyn_deny_count, entries,
+                                 count, "always-deny", 0, 1, 1);
+
+    if (migrated > 0)
+    {
+        log_msg(LOG_INFO, "migrated %d always-deny rule ID(s)", migrated);
+        if (persist_dyn_list(1, g_dyn_deny, g_dyn_deny_count) < 0)
+            log_msg(LOG_WARNING,
+                    "migrated always-deny rule IDs were kept in memory but "
+                    "not persisted");
+    }
+}
+
+int fanotify_remove_dyn_entry(int deny, const char *id)
+{
+    DynEntry *list = deny ? g_dyn_deny : g_dyn_allow;
+    int *count = deny ? &g_dyn_deny_count : &g_dyn_allow_count;
+    const char *name = dyn_list_name(deny);
+    const char *id_ptrs[DYN_MAX] = {0}; /* n 0 passes an empty list */
+    int idx_map[DYN_MAX];
+    int ambiguous = 0;
+    int n = 0;
+    int match;
+    int idx;
+    int snap_count;
+
+    if (!dyn_lookup_id_valid(id))
+    {
+        log_msg(LOG_WARNING, "remove %s: invalid rule ID argument", name);
+        return -1;
+    }
+
+    /* Resolve through the CLI's matcher: an unambiguous 8..16-character
+     * lower-case hex prefix (full ID allowed).  Entries with an empty ID
+     * do not participate; a malformed non-empty ID means the live list
+     * cannot be trusted, so the removal fails closed. */
+    for (int i = 0; i < *count; i++)
+    {
+        if (list[i].rule_id[0] == '\0')
+            continue;
+        if (!dyn_rule_id_valid(list[i].rule_id))
+        {
+            log_msg(LOG_ERR,
+                    "remove %s: entry \"%s\" has no usable rule ID; refusing",
+                    name, list[i].binary);
+            return -1;
+        }
+        id_ptrs[n] = list[i].rule_id;
+        idx_map[n] = i;
+        n++;
+    }
+
+    match = ruleid_find(id_ptrs, n, id, &ambiguous);
+    if (match < 0)
+    {
+        if (ambiguous)
+        {
+            log_msg(LOG_WARNING,
+                    "remove %s: ID %s matches more than one rule; "
+                    "nothing removed",
+                    name, id);
+            return -2;
+        }
+        return 0; /* well-formed prefix, but no stored ID matches it */
+    }
+    idx = idx_map[match];
+
+    /* Snapshot before mutating so a failed state write restores the
+     * pre-removal list exactly (pin.c's guarantee). */
+    memcpy(g_dyn_snapshot, list, sizeof(g_dyn_snapshot));
+    snap_count = *count;
+
+    *count = dyn_compact(list, *count, &idx, 1);
+
+    if (persist_dyn_list(deny, list, *count) < 0)
+    {
+        memcpy(list, g_dyn_snapshot, sizeof(g_dyn_snapshot));
+        *count = snap_count;
+        return -1;
+    }
+
+    log_msg(LOG_INFO, "removed %s rule %s (%s)", name,
+            g_dyn_snapshot[idx].rule_id, g_dyn_snapshot[idx].binary);
+    return 1;
+}
+
+int fanotify_clear_dyn_list(int deny)
+{
+    DynEntry *list = deny ? g_dyn_deny : g_dyn_allow;
+    int *count = deny ? &g_dyn_deny_count : &g_dyn_allow_count;
+    const char *name = dyn_list_name(deny);
+    int snap_count = *count;
+
+    memcpy(g_dyn_snapshot, list, sizeof(g_dyn_snapshot));
+    memset(list, 0, sizeof(DynEntry) * DYN_MAX);
+    *count = 0;
+
+    if (persist_dyn_list(deny, list, 0) < 0)
+    {
+        memcpy(list, g_dyn_snapshot, sizeof(g_dyn_snapshot));
+        *count = snap_count;
+        return -1;
+    }
+
+    log_msg(LOG_INFO, "cleared %d %s rule(s)", snap_count, name);
+    return snap_count;
+}
+
+int fanotify_prune_dyn_list(int deny, int *removed_out)
+{
+    DynEntry *list = deny ? g_dyn_deny : g_dyn_allow;
+    int *count = deny ? &g_dyn_deny_count : &g_dyn_allow_count;
+    const char *name = dyn_list_name(deny);
+    PersistEntry *rows = NULL;
+    PruneGroup *groups = NULL;
+    int *removals = NULL;
+    int removal_count = 0;
+    int group_count = 0;
+    int n = 0;
+    int snap_count = 0;
+    int rc = -1;
+
+    if (removed_out)
+        *removed_out = 0;
+
+    rows = calloc(DYN_MAX, sizeof(PersistEntry));
+    groups = calloc(DYN_MAX / 2 + 1, sizeof(PruneGroup));
+    removals = calloc(DYN_MAX, sizeof(int));
+    if (!rows || !groups || !removals)
+    {
+        log_msg(LOG_ERR, "out of memory pruning %s", name);
+        goto out;
+    }
+
+    /* prune_find() reports indices into the PersistEntry rows, which
+     * mirror the live array 1:1 (dyn_to_persist copies in order), so the
+     * same ascending removal list compacts the DynEntry list directly. */
+    n = dyn_to_persist(list, *count, rows, DYN_MAX);
+    group_count = prune_find(rows, n, groups, DYN_MAX / 2 + 1, removals,
+                             DYN_MAX, &removal_count);
+    if (group_count < 0)
+    {
+        log_msg(LOG_ERR, "prune %s: duplicate grouping failed", name);
+        goto out;
+    }
+    if (removal_count == 0)
+    {
+        rc = 0;
+        goto out;
+    }
+
+    memcpy(g_dyn_snapshot, list, sizeof(g_dyn_snapshot));
+    snap_count = *count;
+    *count = dyn_compact(list, *count, removals, removal_count);
+
+    if (persist_dyn_list(deny, list, *count) < 0)
+    {
+        memcpy(list, g_dyn_snapshot, sizeof(g_dyn_snapshot));
+        *count = snap_count;
+        goto out;
+    }
+
+    for (int i = 0; i < removal_count; i++)
+        log_msg(LOG_INFO, "pruned %s rule %s (%s)", name,
+                g_dyn_snapshot[removals[i]].rule_id,
+                g_dyn_snapshot[removals[i]].binary);
+    log_msg(LOG_INFO, "prune %s: removed %d duplicate rule(s), %d kept",
+            name, removal_count, *count);
+    if (removed_out)
+        *removed_out = removal_count;
+    rc = 0;
+
+out:
+    free(rows);
+    free(groups);
+    free(removals);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */

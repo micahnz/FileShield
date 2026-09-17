@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <sys/fanotify.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1037,6 +1038,417 @@ static void test_cmdline_scoping(void) {
            "/home/u/.kube/config", "kubectl get secrets") == 0,
            "different command does not match the deny entry");
     fanotify_load_dyn_denylist(NULL, 0);
+}
+
+/*
+ * Part 1c2: stored rule IDs and real created_at on the runtime lists.
+ *
+ * The state files are redirected into a per-run temp directory
+ * (fanotify_set_state_files) before any test runs, so migration writes
+ * and mutation persistence never touch /var/lib/fileshield from an
+ * unprivileged suite -- including the existing fixtures above that load
+ * persisted entries without rule_id.
+ */
+static char g_dyn_dir[256];
+static char g_dyn_allow_file[PATH_MAX + 64];
+static char g_dyn_deny_file[PATH_MAX + 64];
+static int g_dyn_fixture_ready = 0;
+
+static int dyn_fixture_init(void)
+{
+    if (g_dyn_fixture_ready)
+        return 0;
+
+    snprintf(g_dyn_dir, sizeof(g_dyn_dir),
+             "/tmp/fileshield_fanotify_dyn_XXXXXX");
+    if (!mkdtemp(g_dyn_dir))
+        return -1;
+    snprintf(g_dyn_allow_file, sizeof(g_dyn_allow_file),
+             "%s/runtime-allowlist.json", g_dyn_dir);
+    snprintf(g_dyn_deny_file, sizeof(g_dyn_deny_file),
+             "%s/runtime-denylist.json", g_dyn_dir);
+    fanotify_set_state_files(g_dyn_allow_file, g_dyn_deny_file);
+    g_dyn_fixture_ready = 1;
+    return 0;
+}
+
+/* Empty in-memory lists and no state files on disk. */
+static void dyn_fixture_reset(void)
+{
+    if (dyn_fixture_init() < 0)
+        return;
+    unlink(g_dyn_allow_file);
+    unlink(g_dyn_deny_file);
+    fanotify_load_dyn_allowlist(NULL, 0);
+    fanotify_load_dyn_denylist(NULL, 0);
+}
+
+static void dyn_fixture_cleanup(void)
+{
+    if (!g_dyn_fixture_ready)
+        return;
+    unlink(g_dyn_allow_file);
+    unlink(g_dyn_deny_file);
+    rmdir(g_dyn_dir);
+    fanotify_set_state_files(NULL, NULL);
+    g_dyn_fixture_ready = 0;
+}
+
+/*
+ * Fill one PersistEntry the way a real state file would carry it.  id may
+ * be NULL (legacy entry); the command-line digest is derived from the raw
+ * command line so the matcher seams can match the tuple.
+ */
+static void dyn_entry_fill(PersistEntry *e, const char *binary, const char *sha,
+                           const char *target, const char *cmdline,
+                           const char *id, time_t created_at)
+{
+    char fp[129];
+
+    memset(e, 0, sizeof(*e));
+    snprintf(e->binary, sizeof(e->binary), "%s", binary);
+    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", sha);
+    snprintf(e->target_path, sizeof(e->target_path), "%s", target);
+    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
+    if (sha512_string(cmdline, fp) == 0)
+        snprintf(e->cmdline_sha512, sizeof(e->cmdline_sha512), "%s", fp);
+    if (id)
+        snprintf(e->rule_id, sizeof(e->rule_id), "%s", id);
+    e->created_at = created_at;
+}
+
+static int is_hex16(const char *s)
+{
+    size_t i;
+
+    if (!s || strlen(s) != 16)
+        return 0;
+    for (i = 0; i < 16; i++)
+    {
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f')))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * A persisted mutation must carry each survivor's real created_at and
+ * rule_id; the old re-stamping made created_at the write time and would
+ * move the ID's own input under the entry.
+ */
+static void test_dyn_created_at_preserved(void)
+{
+    PersistEntry e[3];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n;
+
+    dyn_fixture_reset();
+
+    dyn_entry_fill(&e[0], "/usr/bin/keep-one", PIN_SHA_A, "/home/u/one",
+                   "keep-one --read", "1111111111111111",
+                   (time_t)1700000000);
+    dyn_entry_fill(&e[1], "/usr/bin/drop-two", PIN_SHA_A, "/home/u/two",
+                   "drop-two --read", "2222222222222222",
+                   (time_t)1700001000);
+    dyn_entry_fill(&e[2], "/usr/bin/keep-three", PIN_SHA_A, "/home/u/three",
+                   "keep-three --read", "3333333333333333",
+                   (time_t)1700002000);
+    fanotify_load_dyn_allowlist(e, 3);
+
+    ASSERT(fanotify_remove_dyn_entry(0, "22222222") == 1,
+           "remove the middle entry to force a persisted write");
+
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "two survivors persisted");
+    ASSERT(strcmp(out[0].rule_id, "1111111111111111") == 0 &&
+               out[0].created_at == (time_t)1700000000,
+           "first survivor kept its rule_id and created_at");
+    ASSERT(strcmp(out[1].rule_id, "3333333333333333") == 0 &&
+               out[1].created_at == (time_t)1700002000,
+           "second survivor kept its rule_id and created_at");
+}
+
+/* Legacy entries get IDs at load and the migration is persisted at once. */
+static void test_dyn_legacy_id_migration(void)
+{
+    PersistEntry e[1];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    char migrated_id[17];
+    int n;
+
+    dyn_fixture_reset();
+
+    dyn_entry_fill(&e[0], "/usr/bin/legacy-tool", PIN_SHA_A,
+                   "/home/u/legacy", "legacy-tool --read", NULL,
+                   (time_t)1700005555);
+    fanotify_load_dyn_allowlist(e, 1);
+
+    ASSERT(test_match_allow("/usr/bin/legacy-tool", PIN_SHA_A,
+                            "/home/u/legacy", "legacy-tool --read") == 1,
+           "migrated allow entry still matches its keys");
+
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "migration persisted the allow state immediately");
+    ASSERT(is_hex16(out[0].rule_id), "migrated ID is 16 lowercase hex");
+    ASSERT(out[0].created_at == (time_t)1700005555,
+           "migration preserved the loaded created_at");
+    memcpy(migrated_id, out[0].rule_id, sizeof(migrated_id));
+
+    ASSERT(fanotify_remove_dyn_entry(0, migrated_id) == 1,
+           "the migrated ID addresses the live entry");
+
+    dyn_entry_fill(&e[0], "/usr/bin/legacy-deny", PIN_SHA_A,
+                   "/home/u/legacy", "legacy-deny --read", NULL,
+                   (time_t)1700006666);
+    fanotify_load_dyn_denylist(e, 1);
+
+    ASSERT(test_match_deny("/usr/bin/legacy-deny", PIN_SHA_A,
+                           "/home/u/legacy", "legacy-deny --read") == 1,
+           "migrated deny entry still matches its keys");
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "migration persisted the deny state immediately");
+    ASSERT(is_hex16(out[0].rule_id), "migrated deny ID is 16 lowercase hex");
+    ASSERT(out[0].created_at == (time_t)1700006666,
+           "deny migration preserved the loaded created_at");
+}
+
+/* Remove-by-ID: prefixes, ambiguity, invalid input, file rewrite. */
+static void test_dyn_remove_by_id(void)
+{
+    PersistEntry e[3];
+    PersistEntry deny[1];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    char deny_id[17];
+    int n;
+
+    dyn_fixture_reset();
+
+    /* Two stored IDs deliberately share the 8-char prefix "deadbeef";
+     * load_dyn_list() trusts an already well-formed stored ID. */
+    dyn_entry_fill(&e[0], "/usr/bin/rm-one", PIN_SHA_A, "/home/u/one",
+                   "rm-one --read", "deadbeefdeadbe01", (time_t)1700010000);
+    dyn_entry_fill(&e[1], "/usr/bin/rm-two", PIN_SHA_A, "/home/u/two",
+                   "rm-two --read", "deadbeefdeadbe02", (time_t)1700010001);
+    dyn_entry_fill(&e[2], "/usr/bin/rm-three", PIN_SHA_A, "/home/u/three",
+                   "rm-three --read", "0123456789abcdef", (time_t)1700010002);
+    fanotify_load_dyn_allowlist(e, 3);
+
+    /* Legacy (no stored ID): the load migrates and writes the deny file,
+     * so the untouched-file assertion below has a real file to check. */
+    dyn_entry_fill(&deny[0], "/usr/bin/deny-keep", PIN_SHA_A,
+                   "/home/u/deny", "deny-keep --read", NULL,
+                   (time_t)1700010003);
+    fanotify_load_dyn_denylist(deny, 1);
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && is_hex16(out[0].rule_id),
+           "deny migration persisted a real deny state file");
+    memcpy(deny_id, out[0].rule_id, sizeof(deny_id));
+
+    ASSERT(fanotify_remove_dyn_entry(0, "deadbeef") == -2,
+           "ambiguous 8-char prefix refuses with -2");
+    ASSERT(test_match_allow("/usr/bin/rm-one", PIN_SHA_A, "/home/u/one",
+                            "rm-one --read") == 1 &&
+               test_match_allow("/usr/bin/rm-two", PIN_SHA_A, "/home/u/two",
+                                "rm-two --read") == 1,
+           "ambiguous removal left both entries in memory");
+
+    ASSERT(fanotify_remove_dyn_entry(0, "01234567") == 1,
+           "unique 8-char prefix removes");
+    ASSERT(test_match_allow("/usr/bin/rm-three", PIN_SHA_A,
+                            "/home/u/three", "rm-three --read") == 0,
+           "removed entry no longer matches");
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "state file rewritten without the removed entry");
+    ASSERT(strcmp(out[0].rule_id, "deadbeefdeadbe01") == 0 &&
+               strcmp(out[1].rule_id, "deadbeefdeadbe02") == 0,
+           "file keeps the two surviving IDs in order");
+
+    ASSERT(fanotify_remove_dyn_entry(0, "deadbeefdeadbe01") == 1,
+           "full 16-char ID removes");
+    ASSERT(fanotify_remove_dyn_entry(0, "deadbeefdeadbe01") == 0,
+           "already removed ID reports 0");
+
+    ASSERT(fanotify_remove_dyn_entry(0, "deadbee") == -1,
+           "7-char prefix is invalid");
+    ASSERT(fanotify_remove_dyn_entry(0, "deadbeeg") == -1,
+           "non-hex prefix is invalid");
+    ASSERT(fanotify_remove_dyn_entry(0, "") == -1, "empty prefix is invalid");
+    ASSERT(fanotify_remove_dyn_entry(0, NULL) == -1, "NULL prefix is invalid");
+
+    ASSERT(test_match_deny("/usr/bin/deny-keep", PIN_SHA_A, "/home/u/deny",
+                           "deny-keep --read") == 1,
+           "remove never touches the other list");
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && strcmp(out[0].rule_id, deny_id) == 0,
+           "deny state file untouched by remove");
+}
+
+/* Clear: memory and file emptied, the other list untouched. */
+static void test_dyn_clear(void)
+{
+    PersistEntry e[2];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    char deny_id[17];
+    int n;
+
+    dyn_fixture_reset();
+
+    dyn_entry_fill(&e[0], "/usr/bin/clear-one", PIN_SHA_A, "/home/u/one",
+                   "clear-one --read", "aaaaaaaaaaaaaaaa",
+                   (time_t)1700020000);
+    dyn_entry_fill(&e[1], "/usr/bin/clear-two", PIN_SHA_B, "/home/u/two",
+                   "clear-two --read", "bbbbbbbbbbbbbbbb",
+                   (time_t)1700020001);
+    fanotify_load_dyn_allowlist(e, 2);
+
+    /* Legacy deny entry: migrated and persisted at load, so the
+     * untouched-list check below reads a real file. */
+    dyn_entry_fill(&e[0], "/usr/bin/clear-deny", PIN_SHA_A, "/home/u/deny",
+                   "clear-deny --read", NULL, (time_t)1700020002);
+    fanotify_load_dyn_denylist(e, 1);
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && is_hex16(out[0].rule_id),
+           "deny migration persisted a real deny state file");
+    memcpy(deny_id, out[0].rule_id, sizeof(deny_id));
+
+    ASSERT(fanotify_clear_dyn_list(0) == 2, "clear reports the removed count");
+    ASSERT(test_match_allow("/usr/bin/clear-one", PIN_SHA_A, "/home/u/one",
+                            "clear-one --read") == 0,
+           "cleared allow entry no longer matches");
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "cleared allow state file holds no entries");
+
+    ASSERT(test_match_deny("/usr/bin/clear-deny", PIN_SHA_A, "/home/u/deny",
+                           "clear-deny --read") == 1,
+           "clear never touches the other list");
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && strcmp(out[0].rule_id, deny_id) == 0,
+           "deny state file still holds its entry");
+
+    ASSERT(fanotify_clear_dyn_list(0) == 0, "clear on an empty list returns 0");
+}
+
+/* Prune: one key, two digest generations -> the newest survives. */
+static void test_dyn_prune(void)
+{
+    PersistEntry e[3];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    char deny_id[17];
+    int removed = -1;
+    int n;
+
+    dyn_fixture_reset();
+
+    /* Same binary/target/cmdline/chain key, different binary_sha512 and
+     * created_at: the binary changed on disk and the older grant is
+     * stale.  e[1] is the newest member (highest index). */
+    dyn_entry_fill(&e[0], "/usr/bin/prune-tool", PIN_SHA_A, "/home/u/prune",
+                   "prune-tool --read", "1111111111111111",
+                   (time_t)1700030000);
+    dyn_entry_fill(&e[1], "/usr/bin/prune-tool", PIN_SHA_B, "/home/u/prune",
+                   "prune-tool --read", "2222222222222222",
+                   (time_t)1700030001);
+    dyn_entry_fill(&e[2], "/usr/bin/other-tool", PIN_SHA_A, "/home/u/other",
+                   "other-tool --read", "3333333333333333",
+                   (time_t)1700030002);
+    fanotify_load_dyn_allowlist(e, 3);
+
+    /* Legacy deny entry: migrated and persisted at load, so the
+     * untouched-list check below reads a real file. */
+    dyn_entry_fill(&e[0], "/usr/bin/prune-deny", PIN_SHA_A, "/home/u/deny",
+                   "prune-deny --read", NULL, (time_t)1700030003);
+    fanotify_load_dyn_denylist(e, 1);
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && is_hex16(out[0].rule_id),
+           "deny migration persisted a real deny state file");
+    memcpy(deny_id, out[0].rule_id, sizeof(deny_id));
+
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == 0 && removed == 1,
+           "prune removes the older duplicate");
+
+    ASSERT(test_match_allow("/usr/bin/prune-tool", PIN_SHA_A, "/home/u/prune",
+                            "prune-tool --read") == 0,
+           "older duplicate no longer matches");
+    ASSERT(test_match_allow("/usr/bin/prune-tool", PIN_SHA_B, "/home/u/prune",
+                            "prune-tool --read") == 1,
+           "newest duplicate still matches");
+    ASSERT(test_match_allow("/usr/bin/other-tool", PIN_SHA_A,
+                            "/home/u/other", "other-tool --read") == 1,
+           "unrelated entry survives");
+
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "prune rewrote the allow state file");
+    ASSERT(strcmp(out[0].rule_id, "2222222222222222") == 0 &&
+               strcmp(out[1].rule_id, "3333333333333333") == 0,
+           "kept the newest duplicate and the unrelated entry");
+
+    removed = -1;
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == 0 && removed == 0,
+           "a second prune finds no duplicates");
+
+    ASSERT(test_match_deny("/usr/bin/prune-deny", PIN_SHA_A, "/home/u/deny",
+                           "prune-deny --read") == 1,
+           "prune never touches the other list");
+    n = persist_load(g_dyn_deny_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1 && strcmp(out[0].rule_id, deny_id) == 0,
+           "deny state file untouched by prune");
+
+    /* NULL removed_out is accepted (the count is only logged). */
+    ASSERT(fanotify_prune_dyn_list(1, NULL) == 0,
+           "prune accepts a NULL removed_out");
+}
+
+/*
+ * A failed state write must leave the in-memory list exactly as it was:
+ * remove, clear and prune all restore their pre-mutation snapshot and
+ * report the failure.
+ */
+static void test_dyn_write_failure_restores(void)
+{
+    PersistEntry e[2];
+    int removed = -1;
+
+    dyn_fixture_reset();
+
+    dyn_entry_fill(&e[0], "/usr/bin/wf-one", PIN_SHA_A, "/home/u/one",
+                   "wf-one --read", "1111111111111111", (time_t)1700040000);
+    fanotify_load_dyn_allowlist(e, 1);
+
+    persist_test_fail_fsync_after(0);
+    ASSERT(fanotify_remove_dyn_entry(0, "11111111") == -1,
+           "failed remove reports the write failure");
+    persist_test_fail_fsync_after(-1);
+    ASSERT(test_match_allow("/usr/bin/wf-one", PIN_SHA_A, "/home/u/one",
+                            "wf-one --read") == 1,
+           "failed remove restored the in-memory entry");
+
+    dyn_entry_fill(&e[0], "/usr/bin/wf-two", PIN_SHA_A, "/home/u/two",
+                   "wf-two --read", "2222222222222222", (time_t)1700040001);
+    fanotify_load_dyn_allowlist(e, 1);
+
+    persist_test_fail_fsync_after(0);
+    ASSERT(fanotify_clear_dyn_list(0) == -1, "failed clear reports -1");
+    persist_test_fail_fsync_after(-1);
+    ASSERT(test_match_allow("/usr/bin/wf-two", PIN_SHA_A, "/home/u/two",
+                            "wf-two --read") == 1,
+           "failed clear restored the in-memory list");
+
+    dyn_entry_fill(&e[0], "/usr/bin/wf-dup", PIN_SHA_A, "/home/u/dup",
+                   "wf-dup --read", "3333333333333333", (time_t)1700040002);
+    dyn_entry_fill(&e[1], "/usr/bin/wf-dup", PIN_SHA_B, "/home/u/dup",
+                   "wf-dup --read", "4444444444444444", (time_t)1700040003);
+    fanotify_load_dyn_allowlist(e, 2);
+
+    persist_test_fail_fsync_after(0);
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == -1 && removed == 0,
+           "failed prune reports -1 and removed 0");
+    persist_test_fail_fsync_after(-1);
+    ASSERT(test_match_allow("/usr/bin/wf-dup", PIN_SHA_A, "/home/u/dup",
+                            "wf-dup --read") == 1 &&
+               test_match_allow("/usr/bin/wf-dup", PIN_SHA_B, "/home/u/dup",
+                                "wf-dup --read") == 1,
+           "failed prune restored both entries");
 }
 
 /*
@@ -2515,6 +2927,15 @@ static void test_dialog_rate_limiter(void) {
 
 int main(void) {
     printf("=== test_fanotify ===\n");
+
+    /* Redirect runtime-list state writes before any test loads a legacy
+     * entry: the load-time migration would otherwise target
+     * /var/lib/fileshield. */
+    if (dyn_fixture_init() < 0) {
+        fprintf(stderr, "FAIL: could not create the dyn state fixture\n");
+        return 1;
+    }
+
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
     test_scope_guard();
@@ -2548,6 +2969,12 @@ int main(void) {
     test_deleted_suffix_stripped();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
+    test_dyn_created_at_preserved();
+    test_dyn_legacy_id_migration();
+    test_dyn_remove_by_id();
+    test_dyn_clear();
+    test_dyn_prune();
+    test_dyn_write_failure_restores();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_respond_failure_retry();
@@ -2556,6 +2983,7 @@ int main(void) {
     test_cmdline_fingerprint_overflow();
     test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
+    dyn_fixture_cleanup();
     pin_fixture_cleanup();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
