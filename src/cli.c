@@ -1,0 +1,1824 @@
+/*
+ * cli.c - fileshield-cli: manage the daemon's runtime allow/deny rules,
+ * [allowlist] hash pins and live session decisions.
+ *
+ * Read paths are deliberately daemon-free: list/describe parse the
+ * root-only JSON state files directly, so they work while the daemon is
+ * stopped.  Every mutation (remove/clear/prune, session commands) goes
+ * through the control socket so the daemon's in-memory lists and the
+ * files change together; the direct-file fallback exists only for a
+ * stopped daemon (ENOENT/ECONNREFUSED), where there is no writer to race.
+ * Session rules live only in daemon memory, so session commands have no
+ * fallback.  See control_client.h for the wire protocol.
+ */
+
+#include <errno.h>
+#include <getopt.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "cli_ui.h"
+#include "control_client.h"
+#include "persist.h"
+#include "pin.h"
+#include "prune.h"
+#include "ruleid.h"
+#include "session.h"
+
+#define CLI_VERSION "2.0.0"
+
+/* The session payload of a worst-case table is a few MB; the CLI can
+ * afford one generous buffer instead of a growable one. */
+#define CLI_RESP_MAX (4 * 1024 * 1024)
+
+static int g_yes;  /* -y/--yes: skip confirmations */
+static int g_wide; /* --wide: no binary/args/target truncation */ 
+static int g_dry;  /* -n/--dry-run: prune lists only */
+static int g_json; /* --json: machine-readable list/describe */
+
+/* Allocated on first socket use so read-only commands never pay for it. */
+static char *g_resp_buf;
+
+/* ------------------------------------------------------------------ */
+/*  small helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+static void print_usage(FILE *f, const char *prog)
+{
+    fprintf(f,
+            "Usage: %s [OPTIONS] <command> [args]\n"
+            "\n"
+            "Commands:\n"
+            "  list [rules|allow|deny|pins]     list entries (default: all)\n"
+            "  describe allow|deny|pin <ID>     full description of one entry\n"
+            "  remove allow|deny|pin <ID>...    remove entries by ID\n"
+            "  clear allow|deny|pins            remove every entry\n"
+            "  prune [allow|deny]               remove stale duplicate rules\n"
+            "  session list [allow|deny]        show live session rules\n"
+            "  session describe [allow|deny] [ID]\n"
+            "  session remove [allow|deny] <ID>...\n"
+            "  session clear [allow|deny]       clear session rules\n"
+            "  reload                           ask the daemon to reload\n"
+            "\n"
+            "Options:\n"
+            "  -y, --yes     assume yes for every confirmation\n"
+            "  -n, --dry-run prune: list what would be removed, change nothing\n"
+            "      --wide    show full binary/args/target and 16-char IDs\n"
+            "      --json    machine-readable output for list/describe\n"
+            "  -h, --help    show this help\n"
+            "  -v, --version show the version\n"
+            "\n"
+            "IDs are the first 8+ hex characters of an entry's rule ID.\n",
+            prog);
+}
+
+static const char *rule_path(int deny)
+{
+    return deny ? PERSIST_DENY_STATE_FILE : PERSIST_STATE_FILE;
+}
+
+static const char *rule_label(int deny)
+{
+    return deny ? "deny" : "allow";
+}
+
+static const char *session_label(int deny)
+{
+    return deny ? "deny" : "allow";
+}
+
+/*
+ * Parse a "allow"/"deny" argument.  Returns 0/1, or -1 when the token is
+ * not a list name.  NULL means "not given"; the caller decides the
+ * default.
+ */
+static int parse_list(const char *arg)
+{
+    if (!arg)
+        return -1;
+    if (strcmp(arg, "allow") == 0)
+        return 0;
+    if (strcmp(arg, "deny") == 0)
+        return 1;
+    return -2;
+}
+
+/* ------------------------------------------------------------------ */
+/*  state-file loading                                                 */
+/* ------------------------------------------------------------------ */
+
+static int load_entries(int deny, PersistEntry **out, int *count_out)
+{
+    const char *path = rule_path(deny);
+    PersistEntry *entries = calloc(PERSIST_MAX_ENTRIES, sizeof(*entries));
+
+    if (!entries)
+    {
+        fprintf(stderr, "error: out of memory reading %s\n", path);
+        return -1;
+    }
+    int count = persist_load(path, entries, PERSIST_MAX_ENTRIES);
+    if (count < 0)
+    {
+        fprintf(stderr, "error: %s is damaged or unreadable (fail closed)\n",
+                path);
+        free(entries);
+        return -1;
+    }
+    *out = entries;
+    *count_out = count;
+    return 0;
+}
+
+static int load_pins(PinRecord **out, int *count_out)
+{
+    PinRecord *rows = calloc(PIN_MAX, sizeof(*rows));
+    int damaged = 0;
+
+    if (!rows)
+    {
+        fprintf(stderr, "error: out of memory reading %s\n", PIN_STATE_FILE);
+        return -1;
+    }
+    int count = pin_load_file(PIN_STATE_FILE, rows, PIN_MAX, &damaged);
+    if (count < 0)
+    {
+        fprintf(stderr, "error: %s is damaged or unreadable (fail closed)\n",
+                PIN_STATE_FILE);
+        free(rows);
+        return -1;
+    }
+    *out = rows;
+    *count_out = count;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ID resolution                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Prefix-resolve 'input' against entries' stored rule IDs.  Returns 1
+ * with *idx_out set, 0 for no match, -2 for an ambiguous prefix, -1 for
+ * an invalid prefix.  Empty stored IDs (legacy, not yet migrated by the
+ * daemon) never match.
+ */
+static int resolve_rule(const PersistEntry *entries, int count,
+                        const char *input, int *idx_out)
+{
+    int found = -1;
+    int matches = 0;
+
+    /* Probe with a known-valid ID so a short/non-hex prefix is reported
+     * as invalid even against an empty list. */
+    if (ruleid_prefix_match("0000000000000000", input) < 0)
+        return -1;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (entries[i].rule_id[0] == '\0')
+            continue;
+        if (ruleid_prefix_match(entries[i].rule_id, input) == 1)
+        {
+            found = i;
+            matches++;
+        }
+    }
+    if (matches == 0)
+        return 0;
+    if (matches > 1)
+        return -2;
+    *idx_out = found;
+    return 1;
+}
+
+static int resolve_pin(const PinRecord *rows, int count, const char *input,
+                       int *idx_out, char full_id[RULEID_HEX_LEN + 1])
+{
+    int found = -1;
+    int matches = 0;
+
+    if (ruleid_prefix_match("0000000000000000", input) < 0)
+        return -1;
+
+    for (int i = 0; i < count; i++)
+    {
+        char id[RULEID_HEX_LEN + 1];
+
+        if (ruleid_pin(rows[i].pattern, id) < 0)
+            continue;
+        if (ruleid_prefix_match(id, input) == 1)
+        {
+            found = i;
+            matches++;
+            memcpy(full_id, id, sizeof(id));
+        }
+    }
+    if (matches == 0)
+        return 0;
+    if (matches > 1)
+        return -2;
+    *idx_out = found;
+    return 1;
+}
+
+/* Resolve into a heap array of full 16-char IDs for later socket use. */
+static int resolve_rule_set(const PersistEntry *entries, int count,
+                            char *const *inputs, int n, int *indices,
+                            char (*full)[RULEID_HEX_LEN + 1])
+{
+    for (int i = 0; i < n; i++)
+    {
+        int rc = resolve_rule(entries, count, inputs[i], &indices[i]);
+
+        if (rc == -1)
+        {
+            fprintf(stderr, "error: invalid rule ID: %s\n", inputs[i]);
+            return -1;
+        }
+        if (rc == 0)
+        {
+            fprintf(stderr, "error: no rule matches %s\n", inputs[i]);
+            return -1;
+        }
+        if (rc == -2)
+        {
+            fprintf(stderr, "error: %s matches more than one rule\n",
+                    inputs[i]);
+            return -1;
+        }
+        memcpy(full[i], entries[indices[i]].rule_id,
+               RULEID_HEX_LEN + 1);
+    }
+    return 0;
+}
+
+static int resolve_pin_set(const PinRecord *rows, int count,
+                           char *const *inputs, int n, int *indices,
+                           char (*full)[RULEID_HEX_LEN + 1])
+{
+    for (int i = 0; i < n; i++)
+    {
+        int rc = resolve_pin(rows, count, inputs[i], &indices[i], full[i]);
+
+        if (rc == -1)
+        {
+            fprintf(stderr, "error: invalid pin ID: %s\n", inputs[i]);
+            return -1;
+        }
+        if (rc == 0)
+        {
+            fprintf(stderr, "error: no pin matches %s\n", inputs[i]);
+            return -1;
+        }
+        if (rc == -2)
+        {
+            fprintf(stderr, "error: %s matches more than one pin\n",
+                    inputs[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  control socket                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Send one request.  Returns 0 with *resp populated on OK, 1 when no
+ * daemon answered (ENOENT/ECONNREFUSED, the only fallback case), -1 on
+ * any other failure (message already printed).
+ */
+static int ctl_call(const char *request, ControlResponse *resp)
+{
+    if (!g_resp_buf)
+    {
+        g_resp_buf = malloc(CLI_RESP_MAX);
+        if (!g_resp_buf)
+        {
+            fprintf(stderr, "error: out of memory\n");
+            return -1;
+        }
+    }
+
+    int rc = control_client_call(CONTROL_SOCKET_PATH, request, g_resp_buf,
+                                 CLI_RESP_MAX, resp);
+    if (rc < 0)
+    {
+        if (errno == ENOENT || errno == ECONNREFUSED)
+            return 1;
+        fprintf(stderr, "error: cannot reach the fileshield daemon at %s: %s\n",
+                CONTROL_SOCKET_PATH, strerror(errno));
+        return -1;
+    }
+    if (!resp->ok)
+    {
+        fprintf(stderr, "error: daemon refused: %s\n",
+                resp->message ? resp->message : "(no message)");
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  list                                                               */
+/* ------------------------------------------------------------------ */
+
+static void build_rule_rows(PersistEntry *allow, int na, PersistEntry *deny,
+                            int nd, CliRuleRow *rows, int *n_out)
+{
+    int n = 0;
+
+    for (int i = 0; i < na; i++)
+    {
+        rows[n].is_deny = 0;
+        rows[n].entry = &allow[i];
+        snprintf(rows[n].id, sizeof(rows[n].id), "%s",
+                 allow[i].rule_id[0] ? allow[i].rule_id : "(none)");
+        n++;
+    }
+    for (int i = 0; i < nd; i++)
+    {
+        rows[n].is_deny = 1;
+        rows[n].entry = &deny[i];
+        snprintf(rows[n].id, sizeof(rows[n].id), "%s",
+                 deny[i].rule_id[0] ? deny[i].rule_id : "(none)");
+        n++;
+    }
+
+    /* Oldest creation first; insertion sort keeps equal timestamps in
+     * list order (allow before deny for a tie, stable by construction). */
+    for (int i = 1; i < n; i++)
+    {
+        CliRuleRow key = rows[i];
+        int j = i - 1;
+
+        while (j >= 0 &&
+               (long long)rows[j].entry->created_at >
+                   (long long)key.entry->created_at)
+        {
+            rows[j + 1] = rows[j];
+            j--;
+        }
+        rows[j + 1] = key;
+    }
+    *n_out = n;
+}
+
+static void build_pin_rows(const PinRecord *pins, int np, CliPinRow *rows,
+                           int *n_out)
+{
+    int n = 0;
+
+    for (int i = 0; i < np; i++)
+    {
+        char id[RULEID_HEX_LEN + 1];
+
+        if (ruleid_pin(pins[i].pattern, id) < 0)
+            snprintf(id, sizeof(id), "%s", "(none)");
+        snprintf(rows[n].id, sizeof(rows[n].id), "%s", id);
+        rows[n].pattern = pins[i].pattern;
+        rows[n].sha512 = pins[i].sha512;
+        rows[n].updated_at = pins[i].updated_at;
+        n++;
+    }
+    for (int i = 1; i < n; i++)
+    {
+        CliPinRow key = rows[i];
+        int j = i - 1;
+
+        while (j >= 0 && rows[j].updated_at > key.updated_at)
+        {
+            rows[j + 1] = rows[j];
+            j--;
+        }
+        rows[j + 1] = key;
+    }
+    *n_out = n;
+}
+
+static int cmd_list(const char *filter)
+{
+    int want_allow = 1, want_deny = 1, want_pins = 1;
+    unsigned sections;
+
+    if (filter)
+    {
+        if (strcmp(filter, "rules") == 0)
+            want_pins = 0;
+        else if (strcmp(filter, "allow") == 0)
+            want_deny = want_pins = 0;
+        else if (strcmp(filter, "deny") == 0)
+            want_allow = want_pins = 0;
+        else if (strcmp(filter, "pins") == 0)
+            want_allow = want_deny = 0;
+        else
+        {
+            fprintf(stderr, "error: unknown list filter: %s "
+                            "(expected rules|allow|deny|pins)\n", filter);
+            return 2;
+        }
+    }
+
+    PersistEntry *allow = NULL, *deny = NULL;
+    PinRecord *pins = NULL;
+    int na = 0, nd = 0, np = 0;
+    int rc = 0;
+
+    if (want_allow && load_entries(0, &allow, &na) < 0)
+        rc = -1;
+    if (rc == 0 && want_deny && load_entries(1, &deny, &nd) < 0)
+        rc = -1;
+    if (rc == 0 && want_pins && load_pins(&pins, &np) < 0)
+        rc = -1;
+    if (rc < 0)
+    {
+        free(allow);
+        free(deny);
+        free(pins);
+        return 1;
+    }
+
+    sections = (want_allow ? CLI_UI_SECTION_ALLOW : 0u) |
+               (want_deny ? CLI_UI_SECTION_DENY : 0u) |
+               (want_pins ? CLI_UI_SECTION_PINS : 0u);
+
+    CliRuleRow *rule_rows = NULL;
+    CliPinRow *pin_rows = NULL;
+    int n_rules = 0, n_pins = 0;
+
+    if (want_allow || want_deny)
+    {
+        rule_rows = calloc((size_t)(na + nd) + 1, sizeof(*rule_rows));
+        if (!rule_rows)
+        {
+            fprintf(stderr, "error: out of memory\n");
+            rc = -1;
+        }
+        else
+            build_rule_rows(allow, na, deny, nd, rule_rows, &n_rules);
+    }
+    if (rc == 0 && want_pins)
+    {
+        pin_rows = calloc((size_t)np + 1, sizeof(*pin_rows));
+        if (!pin_rows)
+        {
+            fprintf(stderr, "error: out of memory\n");
+            rc = -1;
+        }
+        else
+            build_pin_rows(pins, np, pin_rows, &n_pins);
+    }
+
+    if (rc == 0 && g_json)
+    {
+        cli_ui_render_list_json(stdout, sections, rule_rows, n_rules,
+                                pin_rows, n_pins, NULL, 0, time(NULL));
+    }
+    else if (rc == 0)
+    {
+        if (want_allow || want_deny)
+            cli_ui_render_rules(stdout, rule_rows, n_rules,
+                                cli_ui_terminal_width(stdout), g_wide);
+        if (want_pins)
+            cli_ui_render_pins(stdout, pin_rows, n_pins,
+                               cli_ui_terminal_width(stdout), g_wide);
+        cli_ui_render_totals(stdout, na, nd, np, sections);
+    }
+
+    free(rule_rows);
+    free(pin_rows);
+    free(allow);
+    free(deny);
+    free(pins);
+    return rc < 0 ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  describe                                                           */
+/* ------------------------------------------------------------------ */
+
+static int cmd_describe(const char *kind, const char *input)
+{
+    if (strcmp(kind, "pin") == 0)
+    {
+        PinRecord *pins = NULL;
+        int np = 0, idx = -1;
+        int rc;
+
+        if (load_pins(&pins, &np) < 0)
+            return 1;
+        rc = resolve_pin(pins, np, input, &idx, (char[RULEID_HEX_LEN + 1]){0});
+        if (rc == 0)
+            fprintf(stderr, "error: no pin matches %s\n", input);
+        else if (rc == -2)
+            fprintf(stderr, "error: %s matches more than one pin\n", input);
+        else if (rc == -1)
+            fprintf(stderr, "error: invalid pin ID: %s\n", input);
+        if (rc != 1)
+        {
+            free(pins);
+            return 1;
+        }
+
+        CliPinRow row;
+        if (ruleid_pin(pins[idx].pattern, row.id) < 0)
+            snprintf(row.id, sizeof(row.id), "%s", "(none)");
+        row.pattern = pins[idx].pattern;
+        row.sha512 = pins[idx].sha512;
+        row.updated_at = pins[idx].updated_at;
+        if (g_json)
+            cli_ui_render_pin_describe_json(stdout, &row);
+        else
+            cli_ui_render_pin_describe(stdout, &row);
+        free(pins);
+        return 0;
+    }
+
+    int deny = parse_list(kind);
+    if (deny < 0)
+    {
+        fprintf(stderr, "error: unknown describe type: %s "
+                        "(expected allow|deny|pin)\n", kind);
+        return 2;
+    }
+
+    PersistEntry *entries = NULL;
+    int count = 0, idx = -1;
+
+    if (load_entries(deny, &entries, &count) < 0)
+        return 1;
+    int rc = resolve_rule(entries, count, input, &idx);
+    if (rc == 0)
+        fprintf(stderr, "error: no %s rule matches %s\n", rule_label(deny),
+                input);
+    else if (rc == -2)
+        fprintf(stderr, "error: %s matches more than one %s rule\n", input,
+                rule_label(deny));
+    else if (rc == -1)
+        fprintf(stderr, "error: invalid rule ID: %s\n", input);
+    if (rc != 1)
+    {
+        free(entries);
+        return 1;
+    }
+
+    CliRuleRow row;
+    row.is_deny = deny;
+    row.entry = &entries[idx];
+    snprintf(row.id, sizeof(row.id), "%s",
+             entries[idx].rule_id[0] ? entries[idx].rule_id : "(none)");
+    if (g_json)
+        cli_ui_render_rule_describe_json(stdout, &row);
+    else
+        cli_ui_render_rule_describe(stdout, &row);
+    free(entries);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  remove                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Drop duplicates from the resolved sets so a repeated argument cannot
+ * produce a half-applied request. */
+static int dedupe_full_ids(char (*full)[RULEID_HEX_LEN + 1], int *indices,
+                           int n)
+{
+    int w = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+        int seen = 0;
+
+        for (int j = 0; j < w; j++)
+        {
+            if (strcmp(full[j], full[i]) == 0)
+            {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen)
+            continue;
+        if (w != i)
+        {
+            memcpy(full[w], full[i], RULEID_HEX_LEN + 1);
+            indices[w] = indices[i];
+        }
+        w++;
+    }
+    return w;
+}
+
+static int fallback_remove_rules(int deny,
+                                 const char (*full)[RULEID_HEX_LEN + 1], int n)
+{
+    const char *path = rule_path(deny);
+    PersistEntry *entries = NULL;
+    int count = 0, w = 0;
+
+    if (load_entries(deny, &entries, &count) < 0)
+        return -1;
+    for (int i = 0; i < count; i++)
+    {
+        int drop = 0;
+
+        for (int j = 0; j < n; j++)
+        {
+            if (entries[i].rule_id[0] != '\0' &&
+                strcmp(entries[i].rule_id, full[j]) == 0)
+            {
+                drop = 1;
+                break;
+            }
+        }
+        if (!drop)
+        {
+            if (w != i)
+                entries[w] = entries[i];
+            w++;
+        }
+    }
+    int rc = persist_save(path, entries, w);
+    free(entries);
+    if (rc < 0)
+    {
+        fprintf(stderr, "error: failed to write %s\n", path);
+        return -1;
+    }
+    fprintf(stderr, "warning: daemon not running; applied directly to %s "
+                    "(start fileshield to enforce)\n", path);
+    return 0;
+}
+
+static int fallback_remove_pins(const char (*full)[RULEID_HEX_LEN + 1], int n)
+{
+    PinRecord *rows = NULL;
+    int count = 0, w = 0;
+
+    if (load_pins(&rows, &count) < 0)
+        return -1;
+    for (int i = 0; i < count; i++)
+    {
+        char id[RULEID_HEX_LEN + 1];
+        int drop = 0;
+
+        if (ruleid_pin(rows[i].pattern, id) == 0)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                if (strcmp(id, full[j]) == 0)
+                {
+                    drop = 1;
+                    break;
+                }
+            }
+        }
+        if (!drop)
+        {
+            if (w != i)
+                rows[w] = rows[i];
+            w++;
+        }
+    }
+    int rc = pin_write_file(PIN_STATE_FILE, rows, w);
+    free(rows);
+    if (rc < 0)
+    {
+        fprintf(stderr, "error: failed to write %s\n", PIN_STATE_FILE);
+        return -1;
+    }
+    fprintf(stderr, "warning: daemon not running; applied directly to %s "
+                    "(start fileshield to enforce)\n", PIN_STATE_FILE);
+    return 0;
+}
+
+static int remove_rules(int deny, char *const *inputs, int n)
+{
+    PersistEntry *entries = NULL;
+    int count = 0, removed = 0;
+    int *indices = calloc((size_t)n + 1, sizeof(*indices));
+    char (*full)[RULEID_HEX_LEN + 1] =
+        calloc((size_t)n + 1, sizeof(*full));
+
+    if (!indices || !full)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(indices);
+        free(full);
+        return 1;
+    }
+    if (load_entries(deny, &entries, &count) < 0 ||
+        resolve_rule_set(entries, count, inputs, n, indices, full) < 0)
+    {
+        free(entries);
+        free(indices);
+        free(full);
+        return 1;
+    }
+    n = dedupe_full_ids(full, indices, n);
+
+    printf("Will remove %d %s rule(s):\n", n, rule_label(deny));
+    for (int i = 0; i < n; i++)
+        printf("  %.16s: %s -> %s\n", entries[indices[i]].rule_id,
+               entries[indices[i]].binary, entries[indices[i]].target_path);
+
+    if (!cli_confirm("Remove these rules?", g_yes))
+    {
+        printf("aborted; nothing removed\n");
+        free(entries);
+        free(indices);
+        free(full);
+        return 1;
+    }
+
+    int rc = 0;
+    for (int start = 0; start < n && rc == 0; start += CONTROL_MAX_IDS)
+    {
+        int chunk = n - start;
+        char request[CONTROL_REQ_MAX];
+        ControlResponse resp;
+        int pos;
+
+        if (chunk > CONTROL_MAX_IDS)
+            chunk = CONTROL_MAX_IDS;
+        pos = snprintf(request, sizeof(request), "RULE_REMOVE\t%s",
+                       rule_label(deny));
+        for (int i = 0; i < chunk; i++)
+            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
+                            "\t%s", full[start + i]);
+
+        rc = ctl_call(request, &resp);
+        if (rc == 1)
+        {
+            if (fallback_remove_rules(
+                    deny, (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
+                rc = -1;
+            else
+            {
+                removed = n;
+                rc = 0;
+            }
+            break;
+        }
+        if (rc < 0)
+            break;
+        long got = control_response_scalar(&resp);
+        if (got < 0)
+        {
+            fprintf(stderr, "error: malformed daemon response\n");
+            rc = -1;
+            break;
+        }
+        removed += (int)got;
+    }
+
+    if (rc == 0)
+        printf("removed %d rule(s)\n", removed);
+    free(entries);
+    free(indices);
+    free(full);
+    return rc == 0 ? 0 : 1;
+}
+
+static int remove_pins(char *const *inputs, int n)
+{
+    PinRecord *rows = NULL;
+    int count = 0, removed = 0;
+    int *indices = calloc((size_t)n + 1, sizeof(*indices));
+    char (*full)[RULEID_HEX_LEN + 1] =
+        calloc((size_t)n + 1, sizeof(*full));
+
+    if (!indices || !full)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(indices);
+        free(full);
+        return 1;
+    }
+    if (load_pins(&rows, &count) < 0 ||
+        resolve_pin_set(rows, count, inputs, n, indices, full) < 0)
+    {
+        free(rows);
+        free(indices);
+        free(full);
+        return 1;
+    }
+    n = dedupe_full_ids(full, indices, n);
+
+    printf("Will remove %d pin(s):\n", n);
+    for (int i = 0; i < n; i++)
+        printf("  %.16s: %s\n", full[i], rows[indices[i]].pattern);
+
+    if (!cli_confirm("Remove these pins?", g_yes))
+    {
+        printf("aborted; nothing removed\n");
+        free(rows);
+        free(indices);
+        free(full);
+        return 1;
+    }
+
+    int rc = 0;
+    for (int start = 0; start < n && rc == 0; start += CONTROL_MAX_IDS)
+    {
+        int chunk = n - start;
+        char request[CONTROL_REQ_MAX];
+        ControlResponse resp;
+        int pos;
+
+        if (chunk > CONTROL_MAX_IDS)
+            chunk = CONTROL_MAX_IDS;
+        pos = snprintf(request, sizeof(request), "PIN_REMOVE");
+        for (int i = 0; i < chunk; i++)
+            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
+                            "\t%s", full[start + i]);
+
+        rc = ctl_call(request, &resp);
+        if (rc == 1)
+        {
+            if (fallback_remove_pins(
+                    (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
+                rc = -1;
+            else
+            {
+                removed = n;
+                rc = 0;
+            }
+            break;
+        }
+        if (rc < 0)
+            break;
+        long got = control_response_scalar(&resp);
+        if (got < 0)
+        {
+            fprintf(stderr, "error: malformed daemon response\n");
+            rc = -1;
+            break;
+        }
+        removed += (int)got;
+    }
+
+    if (rc == 0)
+        printf("removed %d pin(s)\n", removed);
+    free(rows);
+    free(indices);
+    free(full);
+    return rc == 0 ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  clear                                                              */
+/* ------------------------------------------------------------------ */
+
+static int clear_rules(int deny)
+{
+    PersistEntry *entries = NULL;
+    int count = 0;
+
+    if (load_entries(deny, &entries, &count) < 0)
+        return 1;
+    if (count == 0)
+    {
+        printf("no %s rules to clear\n", rule_label(deny));
+        free(entries);
+        return 0;
+    }
+    printf("This clears all %d %s rule(s).\n", count, rule_label(deny));
+    if (!cli_confirm("Clear the list?", g_yes))
+    {
+        printf("aborted; nothing cleared\n");
+        free(entries);
+        return 1;
+    }
+
+    int rc = ctl_call(deny ? "RULE_CLEAR\tdeny" : "RULE_CLEAR\tallow",
+                      &(ControlResponse){0});
+    if (rc == 1)
+    {
+        if (persist_save(rule_path(deny), entries, 0) < 0)
+        {
+            fprintf(stderr, "error: failed to write %s\n", rule_path(deny));
+            free(entries);
+            return 1;
+        }
+        fprintf(stderr, "warning: daemon not running; applied directly to %s "
+                        "(start fileshield to enforce)\n", rule_path(deny));
+        rc = 0;
+        count = 0;
+    }
+    free(entries);
+    if (rc < 0)
+        return 1;
+    printf("cleared the %s list\n", rule_label(deny));
+    return 0;
+}
+
+static int clear_pins(void)
+{
+    PinRecord *rows = NULL;
+    int count = 0;
+
+    if (load_pins(&rows, &count) < 0)
+        return 1;
+    if (count == 0)
+    {
+        printf("no pins to clear\n");
+        free(rows);
+        return 0;
+    }
+    printf("This clears all %d pin(s); allowlisted binaries will be hashed "
+           "again on first use.\n", count);
+    if (!cli_confirm("Clear every pin?", g_yes))
+    {
+        printf("aborted; nothing cleared\n");
+        free(rows);
+        return 1;
+    }
+
+    int rc = ctl_call("PIN_CLEAR", &(ControlResponse){0});
+    if (rc == 1)
+    {
+        if (pin_write_file(PIN_STATE_FILE, rows, 0) < 0)
+        {
+            fprintf(stderr, "error: failed to write %s\n", PIN_STATE_FILE);
+            free(rows);
+            return 1;
+        }
+        fprintf(stderr, "warning: daemon not running; applied directly to %s "
+                        "(start fileshield to enforce)\n", PIN_STATE_FILE);
+        rc = 0;
+    }
+    free(rows);
+    if (rc < 0)
+        return 1;
+    printf("cleared every pin\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  prune                                                              */
+/* ------------------------------------------------------------------ */
+
+/* One printable cell: sanitized, tail-truncated unless --wide. */
+static void print_cell(const char *s, int width)
+{
+    char buf[PATH_MAX + PERSIST_CMDLINE_MAX + 64];
+    size_t max = g_wide ? sizeof(buf) : (size_t)(width + 1);
+
+    if (max > sizeof(buf))
+        max = sizeof(buf);
+    if (g_wide)
+        cli_ui_sanitize(s, buf, sizeof(buf));
+    else
+        cli_ui_truncate_tail(s, width, buf, max);
+    fputs(buf, stdout);
+}
+
+static void print_prune_groups(int deny, const PersistEntry *entries,
+                               const PruneGroup *groups, int ngroups)
+{
+    printf("%s: %d duplicate group(s)\n", rule_label(deny), ngroups);
+    for (int g = 0; g < ngroups; g++)
+    {
+        const PersistEntry *keep = &entries[groups[g].keep_index];
+        char arg[PERSIST_CMDLINE_MAX];
+        char chain[4 * 256];
+
+        cli_ui_arg_column(keep->cmdline, arg, sizeof(arg));
+        cli_ui_chain_column(keep->chain_comm, keep->chain_depth, chain,
+                            sizeof(chain));
+        printf("  ");
+        print_cell(keep->binary, 48);
+        printf(" ");
+        print_cell(arg, 32);
+        printf(" -> ");
+        print_cell(keep->target_path, 48);
+        if (strcmp(chain, "(none)") != 0)
+        {
+            printf("  (");
+            print_cell(chain, 40);
+            printf(")");
+        }
+        printf("  [%d duplicate(s)]\n", groups[g].remove_count);
+    }
+}
+
+static int prune_list(int deny)
+{
+    PersistEntry *entries = NULL;
+    int count = 0, ngroups = 0, nremovals = 0;
+    PruneGroup *groups;
+    int *removals;
+    int rc = 0;
+
+    if (load_entries(deny, &entries, &count) < 0)
+        return -1;
+    if (count == 0)
+    {
+        free(entries);
+        return 0;
+    }
+    groups = calloc((size_t)count + 1, sizeof(*groups));
+    removals = calloc((size_t)count + 1, sizeof(*removals));
+    if (!groups || !removals)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(entries);
+        free(groups);
+        free(removals);
+        return -1;
+    }
+
+    ngroups = prune_find(entries, count, groups, count, removals, count,
+                         &nremovals);
+    if (ngroups < 0)
+    {
+        fprintf(stderr, "error: could not analyze %s\n", rule_path(deny));
+        rc = -1;
+    }
+    else if (ngroups > 0)
+    {
+        print_prune_groups(deny, entries, groups, ngroups);
+    }
+
+    free(groups);
+    free(removals);
+    free(entries);
+    return rc;
+}
+
+static int prune_apply_local(int deny)
+{
+    PersistEntry *entries = NULL;
+    int count = 0, ngroups, nremovals = 0, new_count = 0;
+    PruneGroup *groups;
+    int *removals;
+    int rc = 0;
+
+    if (load_entries(deny, &entries, &count) < 0)
+        return -1;
+    groups = calloc((size_t)count + 1, sizeof(*groups));
+    removals = calloc((size_t)count + 1, sizeof(*removals));
+    if (!groups || !removals)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(entries);
+        free(groups);
+        free(removals);
+        return -1;
+    }
+    ngroups = prune_find(entries, count, groups, count, removals, count,
+                         &nremovals);
+    if (ngroups > 0 &&
+        prune_apply(entries, count, removals, nremovals, &new_count) >= 0)
+    {
+        if (persist_save(rule_path(deny), entries, new_count) < 0)
+        {
+            fprintf(stderr, "error: failed to write %s\n", rule_path(deny));
+            rc = -1;
+        }
+        else
+        {
+            fprintf(stderr, "warning: daemon not running; applied directly "
+                            "to %s (start fileshield to enforce)\n",
+                    rule_path(deny));
+            rc = nremovals;
+        }
+    }
+    else if (ngroups < 0)
+    {
+        fprintf(stderr, "error: could not analyze %s\n", rule_path(deny));
+        rc = -1;
+    }
+    free(groups);
+    free(removals);
+    free(entries);
+    return rc;
+}
+
+static int cmd_prune(const char *which)
+{
+    int want_allow = 1, want_deny = 1;
+
+    if (which)
+    {
+        if (strcmp(which, "allow") == 0)
+            want_deny = 0;
+        else if (strcmp(which, "deny") == 0)
+            want_allow = 0;
+        else
+        {
+            fprintf(stderr, "error: unknown prune filter: %s "
+                            "(expected allow|deny)\n", which);
+            return 2;
+        }
+    }
+
+    /* The pre-confirmation report is the dry run: always computed from
+     * the files, then discarded unless the user confirms. */
+    if (want_allow && prune_list(0) < 0)
+        return 1;
+    if (want_deny && prune_list(1) < 0)
+        return 1;
+
+    if (g_dry)
+    {
+        printf("dry run: nothing removed\n");
+        return 0;
+    }
+    if (!cli_confirm("Prune these duplicates?", g_yes))
+    {
+        printf("aborted; nothing removed\n");
+        return 1;
+    }
+
+    const char *what = want_allow && want_deny ? "both"
+                       : want_allow             ? "allow"
+                                                : "deny";
+    char request[64];
+    ControlResponse resp;
+    int rc;
+
+    snprintf(request, sizeof(request), "PRUNE\t%s", what);
+    rc = ctl_call(request, &resp);
+    if (rc == 1)
+    {
+        int total = 0;
+
+        if (want_allow)
+        {
+            int r = prune_apply_local(0);
+            if (r < 0)
+                return 1;
+            total += r;
+        }
+        if (want_deny)
+        {
+            int r = prune_apply_local(1);
+            if (r < 0)
+                return 1;
+            total += r;
+        }
+        printf("pruned %d duplicate(s)\n", total);
+        return 0;
+    }
+    if (rc < 0)
+        return 1;
+    long got = control_response_scalar(&resp);
+    if (got < 0)
+    {
+        fprintf(stderr, "error: malformed daemon response\n");
+        return 1;
+    }
+    printf("pruned %ld duplicate(s)\n", got);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  session                                                            */
+/* ------------------------------------------------------------------ */
+
+typedef struct
+{
+    CliSessionRow row;
+    char binary[PATH_MAX];
+    char target[PATH_MAX];
+} SessionStore;
+
+/* Split line on TABs in place; returns the field count (capped). */
+static int split_tabs(char *line, char **fields, int max)
+{
+    int n = 0;
+
+    while (n < max)
+    {
+        fields[n++] = line;
+        char *tab = strchr(line, '\t');
+        if (!tab)
+            break;
+        *tab = '\0';
+        line = tab + 1;
+    }
+    return n;
+}
+
+static int parse_long_field(const char *s, long *out)
+{
+    char *end;
+    long v;
+
+    if (!s || *s == '\0')
+        return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || *end != '\0')
+        return -1;
+    *out = v;
+    return 0;
+}
+
+/*
+ * Fetch one list and append parsed records.  Returns 0 on success, -1 on
+ * any failure (message printed; no listener prints the daemon-down
+ * message because session state has no file fallback).
+ */
+static int session_fetch(int deny, SessionStore *store, int max, int *count)
+{
+    char request[64];
+    ControlResponse resp;
+
+    snprintf(request, sizeof(request), "SESSION_LIST\t%s",
+             session_label(deny));
+    int rc = ctl_call(request, &resp);
+    if (rc == 1)
+    {
+        fprintf(stderr, "error: the fileshield daemon is not running; session "
+                        "rules live only in daemon memory\n");
+        return -1;
+    }
+    if (rc < 0)
+        return -1;
+
+    for (int i = 0; i < resp.count; i++)
+    {
+        char *fields[6];
+        long sid, start, ttl;
+        SessionStore *s;
+
+        if (*count >= max)
+        {
+            fprintf(stderr, "error: too many session records\n");
+            return -1;
+        }
+        if (split_tabs(resp.lines[i], fields, 6) != 6)
+        {
+            fprintf(stderr, "error: malformed session record\n");
+            return -1;
+        }
+        s = &store[*count];
+        memset(s, 0, sizeof(*s));
+        if (control_decode_field(fields[0], s->row.id,
+                                 sizeof(s->row.id)) < 0 ||
+            parse_long_field(fields[1], &sid) < 0 ||
+            parse_long_field(fields[2], &start) < 0 ||
+            control_decode_field(fields[3], s->binary,
+                                 sizeof(s->binary)) < 0 ||
+            control_decode_field(fields[4], s->target,
+                                 sizeof(s->target)) < 0 ||
+            parse_long_field(fields[5], &ttl) < 0)
+        {
+            fprintf(stderr, "error: malformed session record\n");
+            return -1;
+        }
+        s->row.is_deny = deny;
+        s->row.sid = (pid_t)sid;
+        s->row.binary = s->binary;
+        s->row.target = s->target;
+        s->row.ttl_remaining = ttl;
+        (*count)++;
+    }
+    return 0;
+}
+
+/* Soonest expiry first; session-lifetime records last. */
+static int session_before(const CliSessionRow *a, const CliSessionRow *b)
+{
+    int a_life = a->ttl_remaining < 0;
+    int b_life = b->ttl_remaining < 0;
+
+    if (a_life != b_life)
+        return a_life ? 0 : 1;
+    if (a_life)
+        return 0;
+    return a->ttl_remaining < b->ttl_remaining;
+}
+
+static void session_sort(SessionStore *store, int count)
+{
+    for (int i = 1; i < count; i++)
+    {
+        SessionStore key = store[i];
+        int j = i - 1;
+
+        while (j >= 0 && !session_before(&store[j].row, &key.row))
+        {
+            store[j + 1] = store[j];
+            j--;
+        }
+        store[j + 1] = key;
+    }
+}
+
+static int session_by_id(const SessionStore *store, int count,
+                         const char *input, int *idx_out)
+{
+    int found = -1;
+    int matches = 0;
+
+    if (ruleid_prefix_match("0000000000000000", input) < 0)
+        return -1;
+    for (int i = 0; i < count; i++)
+    {
+        if (store[i].row.id[0] == '\0')
+            continue;
+        if (ruleid_prefix_match(store[i].row.id, input) == 1)
+        {
+            found = i;
+            matches++;
+        }
+    }
+    if (matches == 0)
+        return 0;
+    if (matches > 1)
+        return -2;
+    *idx_out = found;
+    return 1;
+}
+
+static void format_expiry(long ttl, char *out, size_t outsz)
+{
+    char human[32];
+
+    if (ttl < 0)
+    {
+        snprintf(out, outsz, "until session ends");
+        return;
+    }
+    if (ttl >= 3600)
+        snprintf(human, sizeof(human), "%ldh %ldm", ttl / 3600,
+                 (ttl % 3600) / 60);
+    else if (ttl >= 60)
+        snprintf(human, sizeof(human), "%ldm %lds", ttl / 60, ttl % 60);
+    else
+        snprintf(human, sizeof(human), "%lds", ttl);
+
+    time_t when = time(NULL) + ttl;
+    struct tm tm;
+    char abs_time[32];
+
+    localtime_r(&when, &tm);
+    strftime(abs_time, sizeof(abs_time), "%Y-%m-%d %H:%M:%S", &tm);
+    snprintf(out, outsz, "%s (in %s)", abs_time, human);
+}
+
+static void session_describe_one(const CliSessionRow *row, int first)
+{
+    char expiry[96];
+
+    if (!first)
+        putchar('\n');
+    format_expiry(row->ttl_remaining, expiry, sizeof(expiry));
+    printf("ID:         %s\n", row->id);
+    printf("Type:       %s\n", row->is_deny ? "DENY" : "ALLOW");
+    printf("Session:    SID %d\n", (int)row->sid);
+    printf("Binary:     %s\n", row->binary);
+    printf("Target:     %s\n", row->target);
+    printf("Expires:    %s\n", expiry);
+}
+
+static int session_list_cmd(const char *list, const char *id, int describe)
+{
+    int want_allow = 1, want_deny = 1;
+
+    if (list)
+    {
+        int parsed = parse_list(list);
+
+        if (parsed < 0)
+        {
+            fprintf(stderr, "error: unknown session list: %s "
+                            "(expected allow|deny)\n", list);
+            return 2;
+        }
+        want_allow = parsed == 0;
+        want_deny = parsed == 1;
+    }
+
+    SessionStore *store = calloc(CONTROL_PAYLOAD_MAX, sizeof(*store));
+    int count = 0;
+
+    if (!store)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+    if ((want_allow &&
+         session_fetch(0, store, CONTROL_PAYLOAD_MAX, &count) < 0) ||
+        (want_deny &&
+         session_fetch(1, store, CONTROL_PAYLOAD_MAX, &count) < 0))
+    {
+        free(store);
+        return 1;
+    }
+    session_sort(store, count);
+
+    if (describe && id)
+    {
+        int idx = -1;
+        int rc = session_by_id(store, count, id, &idx);
+
+        if (rc == 0)
+            fprintf(stderr, "error: no session rule matches %s\n", id);
+        else if (rc == -2)
+            fprintf(stderr, "error: %s matches more than one session rule\n",
+                    id);
+        else if (rc == -1)
+            fprintf(stderr, "error: invalid rule ID: %s\n", id);
+        if (rc != 1)
+        {
+            free(store);
+            return 1;
+        }
+        if (g_json)
+            cli_ui_render_list_json(stdout, CLI_UI_SECTION_SESSIONS, NULL, 0,
+                                    NULL, 0, &store[idx].row, 1, time(NULL));
+        else
+            session_describe_one(&store[idx].row, 1);
+        free(store);
+        return 0;
+    }
+
+    if (describe && !g_json)
+    {
+        /* `session describe` without an ID describes every record. */
+        for (int i = 0; i < count; i++)
+            session_describe_one(&store[i].row, i == 0);
+        if (count == 0)
+            printf("no session rules\n");
+        free(store);
+        return 0;
+    }
+
+    /* `session list`, or `session describe --json`: both take the row
+     * view (the JSON renderer emits the same records either way). */
+    CliSessionRow *rows = calloc((size_t)count + 1, sizeof(*rows));
+
+    if (!rows)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(store);
+        return 1;
+    }
+    for (int i = 0; i < count; i++)
+        rows[i] = store[i].row;
+    if (g_json)
+        cli_ui_render_list_json(stdout, CLI_UI_SECTION_SESSIONS, NULL, 0, NULL,
+                                0, rows, count, time(NULL));
+    else
+        cli_ui_render_sessions(stdout, rows, count,
+                               cli_ui_terminal_width(stdout), g_wide,
+                               time(NULL));
+    free(rows);
+    free(store);
+    return 0;
+}
+
+static int session_remove_cmd(const char *list, char **ids, int n)
+{
+    int want_allow = 1, want_deny = 1;
+
+    if (list)
+    {
+        int parsed = parse_list(list);
+
+        if (parsed < 0)
+        {
+            fprintf(stderr, "error: unknown session list: %s\n", list);
+            return 2;
+        }
+        want_allow = parsed == 0;
+        want_deny = parsed == 1;
+    }
+
+    SessionStore *store = calloc(CONTROL_PAYLOAD_MAX, sizeof(*store));
+    int count = 0, removed = 0;
+
+    if (!store)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+    if ((want_allow &&
+         session_fetch(0, store, CONTROL_PAYLOAD_MAX, &count) < 0) ||
+        (want_deny &&
+         session_fetch(1, store, CONTROL_PAYLOAD_MAX, &count) < 0))
+    {
+        free(store);
+        return 1;
+    }
+
+    /* Resolve every ID before asking, then act on the snapshot. */
+    int *indices = calloc((size_t)n + 1, sizeof(*indices));
+    if (!indices)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        free(store);
+        return 1;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        int rc = session_by_id(store, count, ids[i], &indices[i]);
+
+        if (rc == 0)
+            fprintf(stderr, "error: no session rule matches %s\n", ids[i]);
+        else if (rc == -2)
+            fprintf(stderr, "error: %s matches more than one session rule\n",
+                    ids[i]);
+        else if (rc == -1)
+            fprintf(stderr, "error: invalid rule ID: %s\n", ids[i]);
+        if (rc != 1)
+        {
+            free(store);
+            free(indices);
+            return 1;
+        }
+    }
+
+    printf("Will remove %d session rule(s):\n", n);
+    for (int i = 0; i < n; i++)
+        printf("  %.16s: %s -> %s\n", store[indices[i]].row.id,
+               store[indices[i]].row.binary, store[indices[i]].row.target);
+
+    if (!cli_confirm("Remove these session rules?", g_yes))
+    {
+        printf("aborted; nothing removed\n");
+        free(store);
+        free(indices);
+        return 1;
+    }
+
+    for (int i = 0; i < n; i++)
+    {
+        char request[128];
+        ControlResponse resp;
+
+        snprintf(request, sizeof(request), "SESSION_REMOVE\t%s\t%s",
+                 store[indices[i]].row.is_deny ? "deny" : "allow",
+                 store[indices[i]].row.id);
+        if (ctl_call(request, &resp) < 0)
+        {
+            free(store);
+            free(indices);
+            return 1;
+        }
+        removed++;
+    }
+    printf("removed %d session rule(s)\n", removed);
+    free(store);
+    free(indices);
+    return 0;
+}
+
+static int session_clear_cmd(const char *list)
+{
+    int both = list == NULL;
+    int deny = 0;
+
+    if (list)
+    {
+        int parsed = parse_list(list);
+
+        if (parsed < 0)
+        {
+            fprintf(stderr, "error: unknown session list: %s\n", list);
+            return 2;
+        }
+        deny = parsed;
+    }
+    if (!cli_confirm(both ? "Clear every session rule?"
+                          : "Clear the session rules for this list?", g_yes))
+    {
+        printf("aborted; nothing cleared\n");
+        return 1;
+    }
+
+    char request[64];
+    ControlResponse resp;
+
+    snprintf(request, sizeof(request), "SESSION_CLEAR\t%s",
+             both ? "both" : session_label(deny));
+    if (ctl_call(request, &resp) < 0)
+        return 1;
+    printf("cleared the session rules\n");
+    return 0;
+}
+
+static int session_cmd(char **args, int nargs)
+{
+    if (nargs < 1)
+    {
+        fprintf(stderr, "error: session requires a subcommand "
+                        "(list|describe|remove|clear)\n");
+        return 2;
+    }
+    const char *sub = args[0];
+    const char *list = NULL;
+    int pos = 1;
+
+    /* The optional list argument comes first; anything else is IDs. */
+    if (pos < nargs && (strcmp(args[pos], "allow") == 0 ||
+                        strcmp(args[pos], "deny") == 0))
+        list = args[pos++];
+
+    if (strcmp(sub, "list") == 0)
+    {
+        if (pos != nargs)
+        {
+            fprintf(stderr, "error: session list takes at most one list\n");
+            return 2;
+        }
+        return session_list_cmd(list, NULL, 0);
+    }
+    if (strcmp(sub, "describe") == 0)
+    {
+        const char *id = NULL;
+
+        if (pos < nargs)
+            id = args[pos++];
+        if (pos != nargs || (id && !list && nargs > 2))
+        {
+            fprintf(stderr, "error: session describe [allow|deny] [ID]\n");
+            return 2;
+        }
+        return session_list_cmd(list, id, 1);
+    }
+    if (strcmp(sub, "remove") == 0)
+    {
+        if (pos >= nargs)
+        {
+            fprintf(stderr, "error: session remove needs at least one ID\n");
+            return 2;
+        }
+        return session_remove_cmd(list, &args[pos], nargs - pos);
+    }
+    if (strcmp(sub, "clear") == 0)
+    {
+        if (pos != nargs)
+        {
+            fprintf(stderr, "error: session clear takes at most one list\n");
+            return 2;
+        }
+        return session_clear_cmd(list);
+    }
+    fprintf(stderr, "error: unknown session subcommand: %s "
+                    "(expected list|describe|remove|clear)\n", sub);
+    return 2;
+}
+
+/* ------------------------------------------------------------------ */
+/*  reload                                                             */
+/* ------------------------------------------------------------------ */
+
+static int cmd_reload(void)
+{
+    ControlResponse resp;
+
+    int rc = ctl_call("RELOAD", &resp);
+
+    if (rc == 1)
+    {
+        fprintf(stderr, "error: the fileshield daemon is not running\n");
+        return 1;
+    }
+    if (rc < 0)
+        return 1;
+    printf("reload requested\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+    static struct option long_opts[] = {
+        {"yes", no_argument, 0, 'y'},
+        {"dry-run", no_argument, 0, 'n'},
+        {"wide", no_argument, &g_wide, 1},
+        {"json", no_argument, &g_json, 1},
+        {"help", no_argument, 0, 'h'},
+        {"version", no_argument, 0, 'v'},
+        {0, 0, 0, 0}};
+    int opt;
+
+    while ((opt = getopt_long(argc, argv, "ynhv", long_opts, NULL)) != -1)
+    {
+        switch (opt)
+        {
+        case 'y':
+            g_yes = 1;
+            break;
+        case 'n':
+            g_dry = 1;
+            break;
+        case 'h':
+            print_usage(stdout, argv[0]);
+            return 0;
+        case 'v':
+            printf("fileshield-cli %s\n", CLI_VERSION);
+            return 0;
+        case 0:
+            break; /* long option stored its flag */
+        default:
+            print_usage(stderr, argv[0]);
+            return 2;
+        }
+    }
+
+    if (optind >= argc)
+    {
+        print_usage(stderr, argv[0]);
+        return 2;
+    }
+
+    const char *cmd = argv[optind++];
+    int rest = argc - optind;
+
+    if (strcmp(cmd, "list") == 0)
+    {
+        if (rest > 1)
+        {
+            fprintf(stderr, "error: list takes at most one filter\n");
+            return 2;
+        }
+        return cmd_list(rest == 1 ? argv[optind] : NULL);
+    }
+    if (strcmp(cmd, "describe") == 0)
+    {
+        if (rest != 2)
+        {
+            fprintf(stderr, "error: describe needs a type and an ID\n");
+            return 2;
+        }
+        return cmd_describe(argv[optind], argv[optind + 1]);
+    }
+    if (strcmp(cmd, "remove") == 0)
+    {
+        if (rest < 2)
+        {
+            fprintf(stderr, "error: remove needs a type and at least one ID\n");
+            return 2;
+        }
+        if (strcmp(argv[optind], "pin") == 0)
+            return remove_pins(&argv[optind + 1], rest - 1);
+        int deny = parse_list(argv[optind]);
+        if (deny < 0)
+        {
+            fprintf(stderr, "error: unknown remove type: %s "
+                            "(expected allow|deny|pin)\n", argv[optind]);
+            return 2;
+        }
+        return remove_rules(deny, &argv[optind + 1], rest - 1);
+    }
+    if (strcmp(cmd, "clear") == 0)
+    {
+        if (rest != 1)
+        {
+            fprintf(stderr, "error: clear needs exactly one type "
+                            "(allow|deny|pins)\n");
+            return 2;
+        }
+        if (strcmp(argv[optind], "pins") == 0)
+            return clear_pins();
+        int deny = parse_list(argv[optind]);
+        if (deny < 0)
+        {
+            fprintf(stderr, "error: unknown clear type: %s "
+                            "(expected allow|deny|pins)\n", argv[optind]);
+            return 2;
+        }
+        return clear_rules(deny);
+    }
+    if (strcmp(cmd, "prune") == 0)
+    {
+        if (rest > 1)
+        {
+            fprintf(stderr, "error: prune takes at most one filter\n");
+            return 2;
+        }
+        return cmd_prune(rest == 1 ? argv[optind] : NULL);
+    }
+    if (strcmp(cmd, "session") == 0)
+        return session_cmd(&argv[optind], rest);
+    if (strcmp(cmd, "reload") == 0)
+    {
+        if (rest != 0)
+        {
+            fprintf(stderr, "error: reload takes no arguments\n");
+            return 2;
+        }
+        return cmd_reload();
+    }
+
+    fprintf(stderr, "error: unknown command: %s\n", cmd);
+    print_usage(stderr, argv[0]);
+    return 2;
+}

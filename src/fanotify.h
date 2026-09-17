@@ -24,16 +24,25 @@ int fanotify_add_mark(int fd, const char *path);
 int fanotify_add_protected(int fd, const ProtectedPath *pp);
 
 /*
- * Main event loop.  Blocks in poll() on {group fd, wake pipe} until an
- * event arrives, a signal handler writes to the wake pipe (read end;
- * pass -1 when there is none), or g_running/g_need_reload/g_fatal are
- * set.  The group fd must be non-blocking (FAN_NONBLOCK at init): the
- * wake pipe closes the window in which a signal arriving just before a
- * blocking read() would suspend shutdown/reload on an idle filesystem,
- * which would let a supervisor SIGKILL auto-allow outstanding
- * permission events on close(fan_fd).
+ * Main event loop.  Blocks in poll() on {group fd, wake pipe, control
+ * listener} until an event arrives, a signal handler writes to the wake
+ * pipe (read end; pass -1 when there is none), a CLI client connects on
+ * the control listener (control_setup()'s non-blocking fd; pass -1 when
+ * there is none), or g_running/g_need_reload/g_fatal are set.  The group
+ * fd must be non-blocking (FAN_NONBLOCK at init): the wake pipe closes
+ * the window in which a signal arriving just before a blocking read()
+ * would suspend shutdown/reload on an idle filesystem, which would let a
+ * supervisor SIGKILL auto-allow outstanding permission events on
+ * close(fan_fd).
+ *
+ * A readable control fd is served through control_handle(), which makes
+ * a bounded number of non-blocking accepts and never waits on a client.
+ * A control fd that reports POLLERR/POLLHUP/POLLNVAL is logged and
+ * dropped from the poll set (the loop's local copy is cleared to -1)
+ * instead of stopping the daemon: a CLI transport failure must not take
+ * protection down, and main.c owns the fd's lifetime.
  */
-void fanotify_loop(int fd, int wake_fd);
+void fanotify_loop(int fd, int wake_fd, int control_fd);
 
 /* Non-zero when at least one file/directory or filesystem/mount mark is active. */
 int fanotify_any_mark_active(void);

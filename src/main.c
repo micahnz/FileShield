@@ -15,6 +15,7 @@
 #include "fanotify.h"
 #include "notify.h"
 #include "reload.h"
+#include "control.h"
 
 #define DEFAULT_CONFIG "/etc/fileshield.conf"
 
@@ -328,12 +329,27 @@ int main(int argc, char *argv[])
                 "direct mark)",
                 mark_skipped);
 
+    /* The CLI can only reach a running daemon through this socket, so a
+     * setup failure is fatal: a daemon without a listener would push CLI
+     * mutations onto the direct-file fallback and reintroduce the
+     * lost-update race the socket exists to close.  Setup only creates
+     * /run/fileshield.sock -- it opens no marked path -- and runs after
+     * persisted state and pins were loaded and the marks were installed. */
+    int control_fd = control_setup();
+    if (control_fd < 0)
+    {
+        log_msg(LOG_ERR,
+                "control socket setup failed; refusing to start without a "
+                "CLI that can reach this daemon");
+        return startup_fail(fan_fd, cfg);
+    }
+
     log_msg(LOG_INFO, "Fileshield started, watching %d paths (%d exclusions)",
             cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
 
     while (g_running)
     {
-        fanotify_loop(fan_fd, g_sigwake[0]);
+        fanotify_loop(fan_fd, g_sigwake[0], control_fd);
         if (g_fatal)
             break;
         if (g_need_reload && reload_protection(fan_fd, config_path, &cfg) < 0)
@@ -341,6 +357,14 @@ int main(int argc, char *argv[])
     }
 
     log_msg(LOG_INFO, "Fileshield shutting down");
+
+    /* Stop listening before the fail-closed fanotify drain: no request
+     * is served past this point.  control_teardown() closes the fd and
+     * unlinks the socket exactly once, on every post-setup exit path
+     * (shutdown, g_fatal, failed reload); the process exits below, so
+     * no later signal path can reuse the closed descriptor. */
+    if (control_fd >= 0)
+        control_teardown(control_fd);
     /* Fail closed: the kernel allows outstanding permission events when
      * the group fd is closed, so deny the userspace-deferred queue and
      * everything still queued in the kernel before close(fan_fd). */

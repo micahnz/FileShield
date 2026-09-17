@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "../src/control.h"
+#include "../src/control_client.h"
 #include "../src/fanotify.h"
 #include "../src/persist.h"
 #include "../src/pin.h"

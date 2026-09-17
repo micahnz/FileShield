@@ -25,6 +25,7 @@
 #include "pin.h"
 #include "ruleid.h"
 #include "prune.h"
+#include "control.h"
 
 #define BUF_SIZE 4096
 
@@ -4409,18 +4410,27 @@ void fanotify_drain_and_deny(int fan_fd)
 }
 
 /*
- * Main event loop.  Blocks in poll() on {group fd, wake pipe}; wake_fd is
- * the read end of a non-blocking pipe that the signal handlers write a
- * byte to (pass -1 when there is no wake pipe).  The wake pipe makes
- * signal delivery observable even when a signal arrives between the
- * outer flag check and poll(): otherwise an idle marked filesystem could
- * suspend shutdown/reload until the next open, and a supervisor SIGKILL
- * would let the kernel auto-ALLOW every outstanding permission event on
+ * Main event loop.  Blocks in poll() on {group fd, wake pipe, control
+ * listener}; wake_fd is the read end of a non-blocking pipe that the
+ * signal handlers write a byte to (pass -1 when there is no wake pipe)
+ * and control_fd is control_setup()'s non-blocking listening socket
+ * (pass -1 when there is none).  The wake pipe makes signal delivery
+ * observable even when a signal arrives between the outer flag check and
+ * poll(): otherwise an idle marked filesystem could suspend
+ * shutdown/reload until the next open, and a supervisor SIGKILL would
+ * let the kernel auto-ALLOW every outstanding permission event on
  * close(fan_fd).  The group fd is permanently non-blocking (FAN_NONBLOCK
  * at init), so a read only happens after poll() reports readable; EAGAIN
  * is a spurious wake, not an error.
+ *
+ * A readable control fd is served through control_handle() -- a bounded,
+ * non-blocking batch per wake, so a client can never block the loop.  A
+ * control fd that reports POLLERR/POLLHUP/POLLNVAL is logged and dropped
+ * from the poll set (the local copy is set to -1) instead of failing the
+ * daemon: protection must outlive a CLI transport failure, and main.c
+ * owns the fd's lifetime and teardown.
  */
-void fanotify_loop(int fd, int wake_fd)
+void fanotify_loop(int fd, int wake_fd, int control_fd)
 {
     char buf[BUF_SIZE]
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
@@ -4442,15 +4452,30 @@ void fanotify_loop(int fd, int wake_fd)
                 break;
         }
 
-        struct pollfd pfds[2];
+        /* {group fd, wake pipe, control listener}: up to three slot
+         * entries, each optional except the group fd.  Named indices
+         * keep the wake drain and the control drop working whatever the
+         * optional set looks like this iteration. */
+        struct pollfd pfds[3];
         nfds_t nfds = 0;
+        int wake_idx = -1;
+        int control_idx = -1;
         pfds[nfds].fd = fd;
         pfds[nfds].events = POLLIN;
         pfds[nfds].revents = 0;
         nfds++;
         if (wake_fd >= 0)
         {
+            wake_idx = (int)nfds;
             pfds[nfds].fd = wake_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (control_fd >= 0)
+        {
+            control_idx = (int)nfds;
+            pfds[nfds].fd = control_fd;
             pfds[nfds].events = POLLIN;
             pfds[nfds].revents = 0;
             nfds++;
@@ -4477,11 +4502,38 @@ void fanotify_loop(int fd, int wake_fd)
             continue;
 
         /* Drain the wake pipe so a backlog of signal bytes cannot spin. */
-        if (wake_fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)))
+        if (wake_idx >= 0 &&
+            (pfds[wake_idx].revents & (POLLIN | POLLHUP | POLLERR)))
         {
             char wake[64];
             while (read(wake_fd, wake, sizeof(wake)) > 0)
                 ;
+        }
+
+        /*
+         * Serve at most one bounded batch of control clients per wake.
+         * control_handle() is non-blocking by contract (bounded accepts,
+         * one bounded read per connection), so no retry or wait belongs
+         * here and a client can never hold the loop.  A broken listener
+         * is dropped from this loop's poll set (the local copy is set to
+         * -1) rather than closing it or failing the daemon: a CLI
+         * transport failure must not stop protection, and main.c owns
+         * the fd's lifetime.
+         */
+        if (control_idx >= 0)
+        {
+            if (pfds[control_idx].revents & (POLLERR | POLLHUP | POLLNVAL))
+            {
+                log_msg(LOG_WARNING,
+                        "control socket poll error (revents=0x%x); no longer "
+                        "polling it",
+                        (unsigned)pfds[control_idx].revents);
+                control_fd = -1;
+            }
+            else if (pfds[control_idx].revents & POLLIN)
+            {
+                control_handle(control_fd);
+            }
         }
 
         if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
@@ -4494,7 +4546,7 @@ void fanotify_loop(int fd, int wake_fd)
             break;
         }
         if (!(pfds[0].revents & POLLIN))
-            continue; /* woke for the signal only */
+            continue; /* woke for the signal or the control client only */
 
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0)
