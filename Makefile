@@ -30,12 +30,12 @@ SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/session.c $(SRCDIR)/notify.c \
            $(SRCDIR)/fanotify.c $(SRCDIR)/inode.c $(SRCDIR)/sha512.c \
            $(SRCDIR)/persist.c $(SRCDIR)/pin.c $(SRCDIR)/reload.c \
-           $(SRCDIR)/ruleid.c $(SRCDIR)/prune.c
+           $(SRCDIR)/ruleid.c $(SRCDIR)/prune.c $(SRCDIR)/control.c
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS    := $(OBJS:.o=.d)
 
 TESTS   := test_cache test_config test_reload test_utils test_persist test_pin test_session test_sha512 test_inode test_fanotify \
-           test_ruleid test_prune test_cli_ui
+           test_ruleid test_prune test_cli_ui test_control
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
 all: $(OBJDIR)/$(TARGET)
@@ -93,6 +93,18 @@ $(OBJDIR)/test_prune: $(OBJDIR)/prune.o $(TSTDIR)/test_prune.c
 $(OBJDIR)/test_cli_ui: $(OBJDIR)/cli_ui.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o $(TSTDIR)/test_cli_ui.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_cli_ui.c $(OBJDIR)/cli_ui.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
+
+$(OBJDIR)/test_control: $(TSTDIR)/test_control.c $(OBJDIR)/control.o $(OBJDIR)/fanotify.o \
+                        $(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
+                        $(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
+                        $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o \
+                        $(OBJDIR)/prune.o $(OBJDIR)/utils.o
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_control.c $(OBJDIR)/control.o \
+		$(OBJDIR)/fanotify.o $(OBJDIR)/notify.o $(OBJDIR)/config.o \
+		$(OBJDIR)/cache.o $(OBJDIR)/session.o $(OBJDIR)/sha512.o \
+		$(OBJDIR)/persist.o $(OBJDIR)/inode.o $(OBJDIR)/pin.o \
+		$(OBJDIR)/ruleid.o $(OBJDIR)/prune.o $(OBJDIR)/utils.o -o $@
 
 # Links the full event pipeline: fanotify.o needs notify/config/cache/
 # session/sha512/persist/utils, and the test supplies the daemon's signal
