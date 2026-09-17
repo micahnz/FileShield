@@ -98,10 +98,13 @@ static void test_glob_match(void) {
     assert_glob("/**/b", "/b", 1, "leading globstar zero segments");
     assert_glob("/a/**/**/b", "/a/x/y/b", 1, "repeated globstar");
 
-    /* Multiple distinct globstars: the matcher is documented as a
-     * single-backtrack greedy algorithm, so these cases pin the current
-     * behavior (a false negative is the safe direction for protection,
-     * the wrong direction for allowlist targets). */
+    /* Multiple distinct globstars: the matcher carries a single
+     * backtrack slot, and these direct-call cases pin that raw-matcher
+     * behavior.  Config loading REJECTS patterns with more than one
+     * "**" segment (rule_pattern_set): a false negative is fail-open
+     * for a protected entry (files silently not protected) and a miss
+     * for a deny rule, so the approximation is never reachable from a
+     * loaded config. */
     assert_glob("/a/**/b/**/c", "/a/b/c", 1, "two globstars zero filler");
     assert_glob("/a/**/b/**/c", "/a/x/b/y/c", 1, "two globstars with filler");
     assert_glob("/a/**/b/**/c", "/a/x/y/b/c", 1, "first globstar eats more");

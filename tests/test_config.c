@@ -932,8 +932,10 @@ static void test_glob_rejection(void)
              "*.json\n"                     /* no static base */
              "/tmp/glob_rej_%d/*//x.json\n" /* empty segment in suffix */
              "/tmp/glob_rej_%d/*.json/\n"   /* trailing slash */
-             "/tmp/glob_rej_%d/../*.json\n", /* unresolvable '..' base */
-             (int)getpid(), (int)getpid(), (int)getpid(), (int)getpid());
+             "/tmp/glob_rej_%d/../*.json\n" /* unresolvable '..' base */
+             "/tmp/glob_rej_%d/**/a/**/x.json\n", /* two '**' segments */
+             (int)getpid(), (int)getpid(), (int)getpid(), (int)getpid(),
+             (int)getpid());
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config for glob rejection");
@@ -1311,10 +1313,13 @@ static void test_rule_glob_rejection(void)
              "/usr/bin/exact2 = *.json\n"                         /* target no base */
              "/usr/bin/exact3 = /tmp/fileshield_rglob_%d/../*.json\n" /* target '..' */
              "/usr/bin/exact4 = /tmp/fileshield_rglob_%d/*//x\n"  /* target empty segment */
+             "/tmp/fileshield_rglob_%d/**/a/**/bin = /tmp/x\n"    /* binary: two '**' */
+             "/usr/bin/exact5 = /tmp/fileshield_rglob_%d/**/a/**/y\n" /* target: two '**' */
              "/usr/bin/survivor = /tmp/fileshield_rglob_target\n", /* valid */
              ok_bin,
              (int)getpid(), (int)getpid(), (int)getpid(),
-             (int)getpid(), (int)getpid());
+             (int)getpid(), (int)getpid(), (int)getpid(),
+             (int)getpid());
 
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config for glob rule rejection");

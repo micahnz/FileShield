@@ -218,6 +218,36 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
         return -1;
     }
 
+    /* The matcher carries one globstar backtrack slot, so a pattern with
+     * two "**" segments can silently under-match: for a protected entry
+     * that means silently NOT protecting files the pattern appears to
+     * cover (fail open), and for a deny rule it means missing paths it
+     * appears to block.  Reject the second "**" at load time instead of
+     * accepting semantics the matcher cannot honor (nothing in the
+     * shipped config uses more than one); split the pattern or use a
+     * single "**". */
+    {
+        int globstars = 0;
+        for (const char *p = raw;;)
+        {
+            const char *end = strchr(p, '/');
+            size_t seglen = end ? (size_t)(end - p) : strlen(p);
+            if (seglen == 2 && p[0] == '*' && p[1] == '*')
+                globstars++;
+            if (!end)
+                break;
+            p = end + 1;
+        }
+        if (globstars > 1)
+        {
+            log_msg(LOG_ERR,
+                    "config_load: at most one '**' segment per pattern "
+                    "(a second would under-match silently): %s",
+                    raw);
+            return -1;
+        }
+    }
+
     int blen = glob_base_len(raw);
     if (blen <= 0)
     {
