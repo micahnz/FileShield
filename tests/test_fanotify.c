@@ -1159,6 +1159,185 @@ static void test_kdialog_status_mapping(void) {
 }
 
 /*
+ * The kdialog --menu decision seam: a grant exists only as an explicit
+ * tag the user selected.  Every other string — including empty, NULL,
+ * near-misses and tokens an error path or forged stream might produce —
+ * must deny.  The dialog runtime (run_kdialog_menu) is a thin reader:
+ * anything but exit-0 yields no token to this mapper.
+ */
+static void test_menu_choice_mapping(void) {
+    ASSERT(notify_test_menu_choice("once") == NOTIFY_ALLOW_ONCE,
+           "once tag allows once");
+    ASSERT(notify_test_menu_choice("session") == NOTIFY_ALLOW_SESSION,
+           "session tag allows for the session");
+    ASSERT(notify_test_menu_choice("always") == NOTIFY_ALLOW_ALWAYS,
+           "always tag allows permanently");
+    ASSERT(notify_test_menu_choice("deny") == NOTIFY_DENY,
+           "deny tag denies");
+    ASSERT(notify_test_menu_choice("deny-session") == NOTIFY_DENY_SESSION,
+           "deny-session tag denies for the session");
+    ASSERT(notify_test_menu_choice("deny-always") == NOTIFY_DENY_ALWAYS,
+           "deny-always tag denies permanently");
+
+    /* Fail-closed for anything that is not an exact known tag. */
+    ASSERT(notify_test_menu_choice("") == NOTIFY_DENY, "empty token denies");
+    ASSERT(notify_test_menu_choice(NULL) == NOTIFY_DENY, "NULL token denies");
+    ASSERT(notify_test_menu_choice("Once") == NOTIFY_DENY,
+           "wrong case is not a known tag: denies");
+    ASSERT(notify_test_menu_choice("always ") == NOTIFY_DENY,
+           "trailing space is not a known tag: denies");
+    ASSERT(notify_test_menu_choice("nope") == NOTIFY_DENY,
+           "unknown token denies");
+}
+
+/*
+ * Menu end-to-end: drive the real notify_ask -> run_kdialog_menu fork
+ * with a scripted kdialog stand-in (notify_test_set_kdialog_path), so
+ * the child's argv shape, the stdout pipe drain and the token->decision
+ * mapping are proven together — without needing a desktop click.
+ * The script asserts the KF6 --menu shape (kdialog --title Fileshield
+ * --menu BODY + 6 tag/label pairs = 16 args after argv[0]) and then
+ * behaves per FAKE_KDIALOG_MODE.
+ */
+static void test_menu_end_to_end(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before menu child fork");
+
+    char script[PATH_MAX];
+    snprintf(script, sizeof(script), "/tmp/fileshield_fakekdialog_%d.sh",
+             (int)getpid());
+    FILE *f = fopen(script, "w");
+    ASSERT(f != NULL, "create fake kdialog script");
+    if (!f)
+        return;
+    /* timeout execs the script with argv[0] = script path, so:
+     * $1=--title $2=Fileshield $3=--menu $4=BODY $5=first TAG $6=first
+     * label ... $16=last label => 16 positional args.  Asserting the
+     * TAG sits at $5 is what pins the real kdialog contract: the earlier
+     * bug (an extra argv element shifting the pairs) still matched a
+     * naive count check but broke the tag/item alignment. */
+    fputs("#!/bin/sh\n"
+          "[ \"$#\" -eq 16 ] || exit 0\n"
+          "[ \"$1\" = \"--title\" ] || exit 0\n"
+          "[ \"$3\" = \"--menu\" ] || exit 0\n"
+          "[ \"$5\" = \"once\" ] || exit 0\n"
+          "case \"$FAKE_KDIALOG_MODE\" in\n"
+          "  pick) echo once; exit 0 ;;\n"
+          "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
+          "  empty-ok) exit 0 ;;\n"
+          "  dump) printf '%s' \"$4\" > /tmp/fileshield_body_dump; "
+          "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
+          "\"${14}\" \"${16}\" > /tmp/fileshield_labels_dump; "
+          "echo once; exit 0 ;;\n"
+          "esac\n"
+          "exit 1\n",
+          f);
+    fclose(f);
+    chmod(script, 0755);
+
+    NotifyRequest req;
+    memset(&req, 0, sizeof(req));
+    req.comm = "fake";
+    req.pid = getpid();
+    req.ppid = getppid();
+    req.comm_parent = "sh";
+    req.exe = "/bin/fake";
+    req.cmdline = "fake --arg";
+    req.path = "/tmp/fake-secret";
+    req.user_uid = getuid();
+    req.user_ttl = 60;
+    req.session_ttl = 0;
+    req.hash_unavailable = 0;
+    req.hash_failure = NULL;
+
+    notify_test_set_kdialog_path(script);
+
+    /* Explicit selection: exit 0 + the tag on stdout -> grant. */
+    ASSERT(setenv("FAKE_KDIALOG_MODE", "pick", 1) == 0, "set pick mode");
+    ASSERT(notify_ask(&req) == NOTIFY_ALLOW_ONCE,
+           "menu pick: tag on stdout grants once");
+
+    /* A label (not a tag) on stdout is not a grant channel: deny. */
+    ASSERT(setenv("FAKE_KDIALOG_MODE", "garbage", 1) == 0, "set garbage mode");
+    ASSERT(notify_ask(&req) == NOTIFY_DENY,
+           "menu: non-tag stdout fails the exact match and denies");
+
+    /* Exit 0 but no token at all: deny (only exit-0 is not enough). */
+    ASSERT(setenv("FAKE_KDIALOG_MODE", "empty-ok", 1) == 0, "set empty-ok mode");
+    ASSERT(notify_ask(&req) == NOTIFY_DENY,
+           "menu: zero exit without a token still denies");
+
+    /* Cancel semantics: nonzero exit -> no selection -> deny. */
+    ASSERT(unsetenv("FAKE_KDIALOG_MODE") == 0, "clear mode");
+    ASSERT(notify_ask(&req) == NOTIFY_DENY,
+           "menu: cancel (exit 1, no stdout) denies");
+
+    /*
+     * Dump mode: pin the design contract of the text a real kdialog
+     * would render, plus the row labels — verified as text, no GUI.
+     * The dumps stay in /tmp for manual inspection (overwritten on
+     * every run).
+     */
+    ASSERT(setenv("FAKE_KDIALOG_MODE", "dump", 1) == 0, "set dump mode");
+    ASSERT(notify_ask(&req) == NOTIFY_ALLOW_ONCE, "dump run still grants");
+
+    char dump[4096];
+    size_t dlen = 0;
+    FILE *df = fopen("/tmp/fileshield_body_dump", "r");
+    if (df) {
+        dlen = fread(dump, 1, sizeof(dump) - 1, df);
+        fclose(df);
+    }
+    dump[dlen] = '\0';
+    ASSERT(dlen > 0, "rendered body dump written");
+    ASSERT(strstr(dump, "Binary:   /bin/fake") != NULL,
+           "binary line present");
+    ASSERT(strstr(dump, "Command:  fake --arg\n"
+                        "Path:     /tmp/fake-secret") != NULL,
+           "Path follows Command immediately (no blank line)");
+    {
+        const char *pbin = strstr(dump, "Binary:");
+        const char *pcmd = strstr(dump, "Command:");
+        const char *ppth = strstr(dump, "Path:");
+        ASSERT(pbin != NULL && pcmd != NULL && ppth != NULL &&
+                   pbin < pcmd && pcmd < ppth,
+               "field order: Binary, Command, Path");
+    }
+    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Once: this file and process")
+               != NULL,
+           "Allow Once description present");
+    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Session: this binary and file")
+               != NULL,
+           "Allow Session description present");
+    ASSERT(strstr(dump, "\xe2\x80\xa2 Allow Always: saved permanently for "
+                        "this command and file") != NULL,
+           "Allow Always description is the concise one");
+    ASSERT(strstr(dump, "call chain") == NULL,
+           "old wordy Allow Always description is gone");
+
+    char labels[512];
+    size_t llen = 0;
+    FILE *lf = fopen("/tmp/fileshield_labels_dump", "r");
+    if (lf) {
+        llen = fread(labels, 1, sizeof(labels) - 1, lf);
+        fclose(lf);
+    }
+    labels[llen] = '\0';
+    ASSERT(strcmp(labels,
+                  "Allow Once - this file and process, cached 60 seconds|"
+                  "Allow Session - this binary and file until the session ends|"
+                  "Allow Always - saved permanently for this command and file|"
+                  "Deny Once - block this access only|"
+                  "Deny Session - block this binary and file until the session ends|"
+                  "Deny Always - block permanently for this command and file")
+               == 0,
+           "rows carry the concise inline descriptions, hyphen separated");
+
+    notify_test_set_kdialog_path(NULL);
+    unlink(script);
+}
+
+
+/*
  * Part 1: fill the deferred queue to capacity, verify a full queue
  * refuses further events, then verify the fail-closed flush denies and
  * closes every deferred event.
@@ -2207,6 +2386,8 @@ int main(void) {
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_kdialog_status_mapping();
+    test_menu_choice_mapping();
+    test_menu_end_to_end();
     test_verdict_stage_order();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();

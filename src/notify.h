@@ -134,4 +134,20 @@ void notify_test_sanitize_ellipsized(const char *in, char *out, size_t outsz);
  */
 int notify_test_kdialog_choice(int status);
 
+/*
+ * Test seam: map a kdialog --menu selection token (the tag echoed on
+ * stdout for an explicit pick) to a NOTIFY_* decision.  Every unknown,
+ * empty or NULL token denies (fail closed): a grant exists only as a
+ * row the user actually selected, never as a side effect of an error.
+ */
+int notify_test_menu_choice(const char *token);
+
+/*
+ * Test seam: override the kdialog binary spawned by the --menu prompt
+ * (NULL restores /usr/bin/kdialog). Lets an integration test drive the
+ * full fork/pipe/drain/token flow with a scripted stand-in, proving the
+ * argv shape and that only a stdout tag grants.
+ */
+void notify_test_set_kdialog_path(const char *path);
+
 #endif

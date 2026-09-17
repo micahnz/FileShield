@@ -642,8 +642,12 @@ static int run_kdialog(const DisplaySession *session,
          * SIG_IGN would leak into kdialog/timeout as ignored SIGPIPE. */
         signal(SIGPIPE, SIG_DFL);
 
+        /* No argv[0] slot for kdialog here either: timeout sets the
+         * child's argv[0] to the command path itself, so the previous
+         * "kdialog" string landed as a stray positional (KMessageBox
+         * showed it as the details text). */
         execl("/usr/bin/timeout", "timeout", "30",
-              "/usr/bin/kdialog", "kdialog",
+              "/usr/bin/kdialog",
               "--title", "Fileshield",
               "--yesnocancel", text,
               "--yes-label", yes_label,
@@ -731,6 +735,249 @@ static int run_kdialog(const DisplaySession *session,
     return kdialog_status_to_choice(status);
 }
 
+/*
+ * One choice row of a kdialog --menu prompt: the tag is what kdialog
+ * echoes to stdout when the user picks the row; the label is the
+ * descriptive text the user reads.
+ */
+typedef struct
+{
+    const char *tag;
+    const char *label;
+} DialogMenuItem;
+
+#define DIALOG_MENU_MAX_ITEMS 8
+#define DIALOG_TOKEN_MAX 64
+
+/* The menu child execs this kdialog. Test seam below swaps it for a
+ * scripted stand-in so the fork/pipe/dup2/drain mechanics and the
+ * argv shape can be proven without a desktop click; the yesnocancel
+ * hash prompt always execs the production path. */
+static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
+
+/* Test seam (notify.h): override the menu kdialog binary (NULL = reset). */
+void notify_test_set_kdialog_path(const char *path)
+{
+    if (!path)
+        snprintf(g_kdialog_path, sizeof(g_kdialog_path), "/usr/bin/kdialog");
+    else
+        snprintf(g_kdialog_path, sizeof(g_kdialog_path), "%s", path);
+}
+
+/*
+ * Map the selected menu tag to a NOTIFY_* decision.  Exact matches only;
+ * NULL, empty, unknown and oversized tokens all deny (fail closed), so a
+ * token stream produced by anything other than a real selection cannot
+ * grant access.
+ */
+static int menu_token_to_decision(const char *token)
+{
+    if (!token)
+        return NOTIFY_DENY;
+    if (strcmp(token, "once") == 0)
+        return NOTIFY_ALLOW_ONCE;
+    if (strcmp(token, "session") == 0)
+        return NOTIFY_ALLOW_SESSION;
+    if (strcmp(token, "always") == 0)
+        return NOTIFY_ALLOW_ALWAYS;
+    if (strcmp(token, "deny") == 0)
+        return NOTIFY_DENY;
+    if (strcmp(token, "deny-session") == 0)
+        return NOTIFY_DENY_SESSION;
+    if (strcmp(token, "deny-always") == 0)
+        return NOTIFY_DENY_ALWAYS;
+    return NOTIFY_DENY;
+}
+
+/* Test seam (notify.h): the menu-token decision mapping. */
+int notify_test_menu_choice(const char *token)
+{
+    return menu_token_to_decision(token);
+}
+
+/*
+ * run_kdialog_menu: show a kdialog --menu picker and return the TAG of
+ * the user's selection in token (NUL-terminated; empty when none).
+ *
+ * Why a menu on stdout instead of --yesnocancel on the exit code: KF6
+ * kdialog prints the chosen row's tag and exits 0 ONLY for an explicit
+ * selection; cancel, window close, argument errors, runtime failures,
+ * timeouts and aborts all leave stdout empty (verified against the KDE
+ * source: Widgets::listBox prints result = args[tag] only on Accepted).
+ * The decision therefore rides on a positive channel no error path can
+ * produce — deny is the literal default, and the old trade-off where
+ * kdialog's No (exit 1, shared with runtime errors) could persist an
+ * "Allow Always" nobody clicked is withdrawn.
+ *
+ * Requires the KF6 kdialog argv shape (--menu TEXT tag item [tag item]
+ * ..., no numeric geometry args); an older kdialog misparses the pairs
+ * and emits no valid token — every failure path denies.
+ *
+ * Returns 1 when the child exited normally with code 0 (a tag should be
+ * in token; menu_token_to_decision still vets it), 0 for any other
+ * normal exit (cancel/error), -1 for timeout, shutdown or spawn failure.
+ */
+static int run_kdialog_menu(const DisplaySession *session,
+                            const DialogEnvSetting *env, int env_count,
+                            const char *text,
+                            const DialogMenuItem *items, int nitems,
+                            char *token, size_t tokensz)
+{
+    int pipefd[2];
+
+    token[0] = '\0';
+    if (nitems <= 0 || nitems > DIALOG_MENU_MAX_ITEMS)
+        return -1;
+    if (pipe2(pipefd, O_CLOEXEC | O_NONBLOCK) < 0)
+    {
+        log_msg(LOG_ERR, "pipe2 failed for kdialog menu: %m");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        log_msg(LOG_ERR, "fork failed for kdialog menu: %m");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        /* Same child posture as run_kdialog: own process group, session
+         * user, display and theme env, fd sweep.  Redirect stdout to the
+         * pipe BEFORE close_fds_from(3) (fd 2 survives the sweep; the
+         * pipe ends beyond fd 3 do not need to). */
+        setpgid(0, 0);
+        drop_to_session_user(session);
+        apply_display_env(session);
+        apply_dialog_env(env, env_count);
+        if (pipefd[1] != STDOUT_FILENO)
+            dup2(pipefd[1], STDOUT_FILENO);
+        close_fds_from(3);
+        signal(SIGPIPE, SIG_DFL);
+
+        /* timeout execs the child with argv[0] = the command string, so
+         * there is NO extra argv[0] slot here: everything after the path
+         * would land in kdialog as a positional argument, shifting the
+         * --menu tag/item pairs by one (a selected row would then echo a
+         * wrong token and deny — the exact bug an earlier build shipped
+         * with).  The KF6 --menu shape is: --menu TEXT tag item [...]. */
+        char *argv[7 + 2 * DIALOG_MENU_MAX_ITEMS + 1];
+        int n = 0;
+        argv[n++] = "/usr/bin/timeout";
+        argv[n++] = "30";
+        argv[n++] = g_kdialog_path;
+        argv[n++] = "--title";
+        argv[n++] = "Fileshield";
+        argv[n++] = "--menu";
+        argv[n++] = (char *)text;
+        for (int i = 0; i < nitems; i++)
+        {
+            argv[n++] = (char *)items[i].tag;
+            argv[n++] = (char *)items[i].label;
+        }
+        argv[n] = NULL;
+
+        execv(argv[0], argv);
+        _exit(127);
+    }
+
+    log_msg(LOG_DEBUG, "[dialog] forked kdialog menu child pid=%d", (int)pid);
+    close(pipefd[1]);
+
+    int child_exited = 0;
+    int status = 0;
+    long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
+
+    while (!child_exited && now_ms() < deadline)
+    {
+        if (!g_running || g_fatal)
+        {
+            log_msg(LOG_WARNING,
+                    "[dialog] shutdown while a menu dialog is open; "
+                    "denying it");
+            break;
+        }
+
+        struct pollfd pfd;
+        int nfds = 0;
+
+        if (g_fan_fd >= 0)
+        {
+            pfd.fd = g_fan_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            nfds = 1;
+        }
+
+        int ret = poll(nfds ? &pfd : NULL, (nfds_t)nfds, 200);
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        if (nfds && (pfd.revents & POLLIN))
+            fanotify_pump(g_fan_fd, pid);
+
+        pid_t wr = waitpid(pid, &status, WNOHANG);
+        if (wr == pid)
+        {
+            child_exited = 1;
+        }
+        else if (wr < 0 && errno != EINTR)
+        {
+            log_msg(LOG_ERR, "waitpid failed for menu dialog: %m");
+            kill_and_reap(pid, &status, &child_exited);
+            close(pipefd[0]);
+            return -1;
+        }
+    }
+
+    if (!child_exited)
+    {
+        log_msg(LOG_WARNING,
+                "[dialog] kdialog menu timeout or shutdown, killing pid=%d",
+                (int)pid);
+        kill_and_reap(pid, &status, &child_exited);
+    }
+
+    log_msg(LOG_DEBUG, "[dialog] kdialog menu exited status=0x%x ec=%d",
+            status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* The child flushed its stdout before exiting (kdialog prints the tag
+     * then leaves, and the write is far below the pipe capacity), so one
+     * non-blocking drain after the reap captures the token.  Anything
+     * unexpected — no data, oversized, no newline — leaves an empty or
+     * unmatched token, which menu_token_to_decision denies. */
+    size_t len = 0;
+    int overflow = 0;
+    for (;;)
+    {
+        char c;
+        ssize_t r = read(pipefd[0], &c, 1);
+        if (r != 1)
+            break;
+        if (c == '\n')
+            break;
+        if (len + 1 < tokensz)
+            token[len++] = c;
+        else
+            overflow = 1;
+    }
+    token[overflow ? 0 : len] = '\0';
+    close(pipefd[0]);
+
+    if (!child_exited)
+        return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        return 1;
+    return 0;
+}
+
 const char *notify_decision_name(int decision)
 {
     switch (decision)
@@ -767,97 +1014,13 @@ typedef struct
 } PromptText;
 
 /*
- * Stage 2 after "Allow": pick the grant scope.  Returns a NOTIFY_* code.
- *
- * Button mapping (as specified): Yes = Allow Session, No = Allow Always,
- * Cancel = deny this attempt.  kdialog returns 1 both for a deliberate No
- * and for some runtime errors, so a dialog that fails with exit 1 can
- * create a permanent rule; timeouts (124), exec failures (127) and
- * Cancel/window close (2) all deny, and the trade-off is documented in
- * the README.  "Allow Session" matches the POSIX session + this binary
- * (+ its SHA-512) + this exact file, so the body spells that out rather
- * than implying the file is unlocked for everyone.
+ * One menu prompt replaces the old two-stage button flow.  Every outcome
+ * is an explicit row choice reported by kdialog on stdout; Cancel, window
+ * close, timeouts, exec failures and every runtime error leave no token
+ * and deny (see run_kdialog_menu).  The first row is the mildest grant:
+ * focus lands there, so Enter confirms only the least-permissive allow,
+ * and a persistent rule takes selecting "always" deliberately.
  */
-static int ask_grant_scope(const DisplaySession *session,
-                           const DialogEnvSetting *env, int env_count,
-                           const PromptText *t, pid_t pid, int session_ttl)
-{
-    char body[3072];
-    char session_bullet[160];
-
-    if (session_ttl > 0)
-        snprintf(session_bullet, sizeof(session_bullet),
-                 "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this binary and file "
-                 "for up to %d seconds", session_ttl);
-    else
-        snprintf(session_bullet, sizeof(session_bullet),
-                 "\xe2\x80\xa2 Allow Session \xe2\x80\x94 this binary and file "
-                 "until this session ends");
-
-    snprintf(body, sizeof(body),
-             "Allow access to:\n"
-             "%s\n\n"
-             "Requested by: %s (PID %d)\n"
-             "Binary:   %s\n"
-             "Command:  %s\n\n"
-             "%s\n"
-             "\xe2\x80\xa2 Allow Always \xe2\x80\x94 this file, this command and "
-             "its call chain, permanently\n"
-             "\xe2\x80\xa2 Deny         \xe2\x80\x94 deny this time%s",
-             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet,
-             t->note);
-
-    int r = run_kdialog(session, env, env_count, body,
-                            "Allow Session", "Allow Always", "Deny");
-    if (r == 0)
-        return NOTIFY_ALLOW_SESSION;
-    if (r == 1)
-        return NOTIFY_ALLOW_ALWAYS;
-    return NOTIFY_DENY; /* Cancel, window close or failure */
-}
-
-/*
- * Stage 2 after an explicit "Deny": pick the deny scope.  Returns a
- * NOTIFY_* code; Yes = Deny Session, No = Deny Always, Cancel = deny
- * once.  Denial is always the safe direction, so any failure denies.
- */
-static int ask_deny_scope(const DisplaySession *session,
-                          const DialogEnvSetting *env, int env_count,
-                          const PromptText *t, pid_t pid, int session_ttl)
-{
-    char body[2048];
-    char session_bullet[160];
-
-    if (session_ttl > 0)
-        snprintf(session_bullet, sizeof(session_bullet),
-                 "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this binary and file "
-                 "for up to %d seconds", session_ttl);
-    else
-        snprintf(session_bullet, sizeof(session_bullet),
-                 "\xe2\x80\xa2 Deny Session \xe2\x80\x94 this binary and file "
-                 "until this session ends");
-
-    snprintf(body, sizeof(body),
-             "Deny access to:\n"
-             "%s\n\n"
-             "Requested by: %s (PID %d)\n"
-             "Binary:   %s\n"
-             "Command:  %s\n\n"
-             "%s\n"
-             "\xe2\x80\xa2 Deny Always \xe2\x80\x94 this file, this command and "
-             "its call chain, permanently\n"
-             "\xe2\x80\xa2 Deny Once   \xe2\x80\x94 block this attempt",
-             t->path, t->comm, (int)pid, t->exe, t->cmd, session_bullet);
-
-    int r = run_kdialog(session, env, env_count, body,
-                            "Deny Session", "Deny Always", "Deny Once");
-    if (r == 0)
-        return NOTIFY_DENY_SESSION;
-    if (r == 1)
-        return NOTIFY_DENY_ALWAYS;
-    return NOTIFY_DENY;
-}
-
 int notify_ask(const NotifyRequest *req)
 {
     /* Return values: NOTIFY_ALLOW_ONCE, NOTIFY_DENY,
@@ -868,7 +1031,14 @@ int notify_ask(const NotifyRequest *req)
 
     PromptText t;
     char msg[3072];
-    char once_bullet[160];
+    char once_desc[96];
+    char session_desc[96];
+    char label_once[128];
+    char label_session[128];
+    char label_always[128];
+    char label_deny[128];
+    char label_deny_session[128];
+    char label_deny_always[128];
 
     /* Attacker-controlled strings (file names, comm, cmdline) are
      * sanitized so control characters cannot forge dialog content. */
@@ -896,31 +1066,43 @@ int notify_ask(const NotifyRequest *req)
                      ? req->hash_failure
                      : "hashing failed");
 
-    /* "Allow once" is keyed by PID + binary + file for user_ttl. */
+    /* Concise per-scope descriptions, shared by the menu rows, the body
+     * bullets and the plain fallback so the three can never drift. */
     if (req->user_ttl > 0)
-        snprintf(once_bullet, sizeof(once_bullet),
-                 "\xe2\x80\xa2 Allow Once \xe2\x80\x94 this file for %d seconds "
-                 "(this process)", req->user_ttl);
+        snprintf(once_desc, sizeof(once_desc),
+                 "this file and process, cached %d seconds", req->user_ttl);
     else
-        snprintf(once_bullet, sizeof(once_bullet),
-                 "\xe2\x80\xa2 Allow Once \xe2\x80\x94 this file (this process)");
+        snprintf(once_desc, sizeof(once_desc), "this access only");
 
-    /* Stage 1: everything known about the requester and the access, plus
-     * what each button does.  No grant is bound to a non-Yes outcome:
-     * "Allow..." only opens the scope dialog, and a failed dialog denies. */
+    if (req->session_ttl > 0)
+        snprintf(session_desc, sizeof(session_desc),
+                 "this binary and file, up to %d seconds", req->session_ttl);
+    else
+        snprintf(session_desc, sizeof(session_desc),
+                 "this binary and file until the session ends");
+
+    static const char always_desc[] =
+        "saved permanently for this command and file";
+    static const char deny_once_desc[] = "block this access only";
+    static const char deny_session_desc[] =
+        "block this binary and file until the session ends";
+    static const char deny_always_desc[] =
+        "block permanently for this command and file";
+
     snprintf(msg, sizeof(msg),
              "Process %s (PID %d, parent: %s (PID %d)) wants to read:\n"
-             "%s\n\n"
              "Binary:   %s\n"
-             "Command:  %s\n\n"
-             "%s\n"
-             "\xe2\x80\xa2 Allow      \xe2\x80\x94 choose session or permanent "
-             "access\n"
-             "\xe2\x80\xa2 Deny       \xe2\x80\x94 choose this time, session or "
-             "permanent%s",
+             "Command:  %s\n"
+             "Path:     %s\n\n"
+             "\xe2\x80\xa2 Allow Once: %s\n"
+             "\xe2\x80\xa2 Allow Session: %s\n"
+             "\xe2\x80\xa2 Allow Always: %s\n"
+             "\xe2\x80\xa2 The Deny rows block with the same scopes.\n"
+             "Cancelling or closing this dialog, or any failure, denies "
+             "this attempt only.%s",
              t.comm, (int)req->pid, t.pcomm, (int)req->ppid,
-             t.path, t.exe, t.cmd, once_bullet, t.note);
-
+             t.exe, t.cmd, t.path, once_desc, session_desc, always_desc,
+             t.note);
     /* Auto-detect the active graphical session if env vars are not set.
      * The daemon itself is never modified: the session is applied by the
      * dialog child, per prompt. */
@@ -949,20 +1131,47 @@ int notify_ask(const NotifyRequest *req)
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    int r = run_kdialog(&session, dialog_env, dialog_env_count, msg,
-                            "Allow Once", "Allow\xe2\x80\xa6",
-                            "Deny\xe2\x80\xa6");
-    if (r == 0)
-        return NOTIFY_ALLOW_ONCE;
-    if (r == 1)
-        return ask_grant_scope(&session, dialog_env, dialog_env_count, &t,
-                               req->pid, req->session_ttl);
-    if (r == 2)
-        return ask_deny_scope(&session, dialog_env, dialog_env_count, &t,
-                              req->pid, req->session_ttl);
+    /* Menu rows repeat each scope's concise description inline (hyphen
+     * separated), built from the same fragments as the body bullets so
+     * the two can never drift. */
+    snprintf(label_once, sizeof(label_once), "Allow Once - %s", once_desc);
+    snprintf(label_session, sizeof(label_session), "Allow Session - %s",
+             session_desc);
+    snprintf(label_always, sizeof(label_always), "Allow Always - %s",
+             always_desc);
+    snprintf(label_deny, sizeof(label_deny), "Deny Once - %s",
+             deny_once_desc);
+    snprintf(label_deny_session, sizeof(label_deny_session),
+             "Deny Session - %s", deny_session_desc);
+    snprintf(label_deny_always, sizeof(label_deny_always),
+             "Deny Always - %s", deny_always_desc);
 
-    log_msg(LOG_WARNING, "[dialog] no valid kdialog choice; denying once");
-    return NOTIFY_DENY;
+    const DialogMenuItem items[] = {
+        { "once",          label_once },
+        { "session",       label_session },
+        { "always",        label_always },
+        { "deny",          label_deny },
+        { "deny-session",  label_deny_session },
+        { "deny-always",   label_deny_always },
+    };
+
+    char token[DIALOG_TOKEN_MAX];
+    int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, msg,
+                             items, (int)(sizeof(items) / sizeof(items[0])),
+                             token, sizeof(token));
+    if (r != 1)
+    {
+        log_msg(LOG_WARNING,
+                "[dialog] menu returned no selection (r=%d); denying "
+                "(fail closed)", r);
+        return NOTIFY_DENY;
+    }
+
+    int decision = menu_token_to_decision(token);
+    log_msg(LOG_INFO, "[dialog] menu choice '%s' -> %s",
+            token[0] != '\0' ? token : "(unknown)",
+            notify_decision_name(decision));
+    return decision;
 }
 
 /*

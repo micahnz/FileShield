@@ -21,7 +21,7 @@ Fileshield/
 │   ├── config.c / config.h      # parse fileshield.conf
 │   ├── cache.c / cache.h        # target-scoped, PID-keyed allow cache with TTL
 │   ├── session.c / session.h    # in-memory session-scoped allow/deny decisions
-│   ├── notify.c / notify.h      # kdialog-only two-stage popups
+│   ├── notify.c / notify.h      # kdialog-only menu popups (stdout tokens)
 │   ├── persist.c / persist.h    # runtime allow/deny JSON state files
 │   ├── pin.c / pin.h            # [allowlist] SHA-512 pins (TOFU, 256-entry table, change state)
 │   ├── reload.c / reload.h      # SIGHUP reload: mark install, state/pin loading, reject/rollback
@@ -99,16 +99,22 @@ Headers are the source of truth for signatures; this table is the map.
 #define NOTIFY_DENY_SESSION 5   /* deny until the shell session ends   */
 ```
 
-Both stages are `kdialog --yesnocancel` prompts whose bodies repeat the
-binary, command and file. Stage 1: Yes = allow once, No = grant scope,
-Cancel = deny scope. Stage 2 (grants): Yes = allow session, No = allow
-always, Cancel = deny. Stage 2 (denies): Yes = deny session, No = deny
-always, Cancel = deny once. kdialog's No button shares its exit code (1)
-with some runtime errors, so a dialog that fails with exit 1 on the grant
-stage can create a permanent rule -- a documented, accepted trade-off;
-timeouts, exec failures and Cancel/window close always deny. Scope text
-states the real match keys: session = this binary + this exact file for
-the session; always = file, command and call chain.
+The access prompt is a single `kdialog --menu` whose rows offer all six
+scopes (once/session/always + the three denies), "Allow once" first; its
+body carries the access details and the real match keys.  The decision is
+the chosen row's **tag read from the dialog's stdout with a zero exit
+code** -- the only grant channel that exists.  Cancel, window close, the
+timeout, exec failures and kdialog's runtime errors (including the exit-1
+class it shares with the old No button) produce no stdout and therefore
+**deny**, so no error path can persist a rule: this replaces the
+two-stage button flow and withdraws its accepted exit-1 trade-off.  The
+hash-change prompt stays `kdialog --yesnocancel`: only Yes (exit 0)
+approves; every other outcome denies and keeps the old pin.  The menu
+requires KF6 kdialog argv shape (`--menu TEXT tag item [tag item] ...`);
+an older kdialog misparses it and denies (fail closed).  Each scope
+(the six rows and the body bullets) pairs its name inline with a concise
+description: session = this binary and file until the session ends;
+always = saved permanently for this command and file.
 
 The dialog child forwards a whitelist of the user's session appearance
 variables (desktop identity, Qt theme/scale, locale, cursor) read from
