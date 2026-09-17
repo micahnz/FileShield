@@ -27,7 +27,6 @@
 #include "pin.h"
 #include "prune.h"
 #include "ruleid.h"
-#include "session.h"
 
 #define CLI_VERSION "2.0.0"
 
