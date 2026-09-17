@@ -122,6 +122,15 @@ void notify_test_reset_rate(void);
 int notify_test_env_key_allowed(const char *key);
 
 /*
+ * Test seam: merge a synthetic NUL-separated environ blob exactly like
+ * the dialog code merges /proc/<pid>/environ.  Returns the number of
+ * collected entries; when out/outsz are non-NULL, copies the value
+ * collected for key ("" when the key was not collected).
+ */
+int notify_test_merge_env(const char *blob, size_t len, const char *key,
+                          char *out, size_t outsz);
+
+/*
  * Test seam: sanitize one dialog-body value exactly like the prompt
  * builder (control characters become '?', an over-long value gets its
  * tail replaced by "...").  Writes at most outsz-1 bytes plus the NUL.

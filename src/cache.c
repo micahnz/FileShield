@@ -217,3 +217,10 @@ void cache_clear(void)
     cache_high = 0; /* empty table: restart the scan bound at zero */
 }
 
+/* Test seam (cache.h): table capacity, so the full-table drop behavior
+ * is testable without hardcoding the internal size. */
+int cache_test_capacity(void)
+{
+    return CACHE_MAX_ENTRIES;
+}
+

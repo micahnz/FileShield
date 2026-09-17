@@ -340,6 +340,99 @@ static void test_log_scrub(void) {
     ASSERT(strcmp(raw, "a???z") == 0, "control bytes scrubbed");
 }
 
+/*
+ * proc_stat_session's parser: the comm field may contain ')' and spaces,
+ * so fields are addressed from the LAST ')' onward.  Synthetic lines pin
+ * the field offsets (a wrong field 22 means stale allow-cache hits), the
+ * anomaly rejections, and the live read stays cross-checked against the
+ * real /proc entry.
+ */
+static void test_parse_proc_stat(void) {
+    unsigned long long sid = 0, start = 0;
+
+    static const char weird[] =
+        "1234 (a)b c) S 1 2 4242 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 "
+        "7777777\n";
+    ASSERT(utils_test_parse_proc_stat(weird, strlen(weird), &sid, &start) == 0,
+           "comm with ) and spaces parses");
+    ASSERT(sid == 4242, "field 6 is the session id");
+    ASSERT(start == 7777777ULL, "field 22 is the start time");
+
+    /* Trailing digit without newline is complete; a non-digit tail means
+     * the line was cut short and must be rejected. */
+    static const char no_newline[] =
+        "9 (x) S 1 2 7 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 42";
+    ASSERT(utils_test_parse_proc_stat(no_newline, strlen(no_newline), &sid,
+                                      &start) == 0,
+           "digit-terminated line accepted");
+    static const char cut_tail[] =
+        "9 (x) S 1 2 7 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 42x";
+    ASSERT(utils_test_parse_proc_stat(cut_tail, strlen(cut_tail), &sid,
+                                      &start) == -1,
+           "non-digit line end is rejected as truncated");
+
+    static const char no_close[] =
+        "9 x S 1 2 7 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 42\n";
+    ASSERT(utils_test_parse_proc_stat(no_close, strlen(no_close), &sid,
+                                      &start) == -1,
+           "missing comm terminator is rejected");
+    static const char short_fields[] = "9 (x) S 1 2 7 4 5\n";
+    ASSERT(utils_test_parse_proc_stat(short_fields, strlen(short_fields),
+                                      &sid, &start) == -1,
+           "short field list is rejected");
+    static const char nonnum[] =
+        "9 (x) S abc 2 7 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 42\n";
+    ASSERT(utils_test_parse_proc_stat(nonnum, strlen(nonnum), &sid, &start)
+               == -1,
+           "non-numeric field is rejected");
+
+    /* Live cross-check: the function still reads real processes. */
+    ASSERT(proc_stat_session(getpid(), &sid, &start) == 0,
+           "live stat read succeeds");
+    ASSERT(sid == (unsigned long long)getsid(0), "live session id matches");
+    ASSERT(start != 0, "live start time present");
+}
+
+/*
+ * read_cmdline: "argv\0argv\0" renders as space-separated text, with the
+ * trailing NUL (and any space it produced) trimmed.
+ */
+static void test_read_cmdline_multi_argv(void) {
+    const char *src = NULL;
+    if (access("/bin/sleep", X_OK) == 0)
+        src = "/bin/sleep";
+    else if (access("/usr/bin/sleep", X_OK) == 0)
+        src = "/usr/bin/sleep";
+    if (!src) {
+        fprintf(stderr, "SKIP: sleep binary unavailable; cmdline test skipped\n");
+        return;
+    }
+
+    pid_t child = fork();
+    ASSERT(child >= 0, "fork cmdline child");
+    if (child < 0)
+        return;
+
+    if (child == 0) {
+        execl(src, "sleep", "60", (char *)NULL);
+        _exit(127);
+    }
+
+    char buf[256];
+    int ok = 0;
+    for (int i = 0; i < 200 && !ok; i++) {
+        if (read_cmdline(child, buf, sizeof(buf)) > 0 &&
+            strcmp(buf, "sleep 60") == 0)
+            ok = 1;
+        else
+            usleep(10000);
+    }
+    ASSERT(ok, "nul-separated argv renders as 'sleep 60' (no trailing space)");
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+}
+
 int main(void) {
     printf("=== test_utils ===\n");
     test_path_under();
@@ -351,6 +444,8 @@ int main(void) {
     test_proc_helpers();
     test_expand_home();
     test_log_scrub();
+    test_parse_proc_stat();
+    test_read_cmdline_multi_argv();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

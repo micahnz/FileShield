@@ -2237,6 +2237,50 @@ static void test_dialog_env_whitelist(void) {
 }
 
 /*
+ * merge_proc_environ: whitelist filtering, malformed entries, duplicate
+ * keys, embedded '=' and oversized values (truncated at the cap), all
+ * without needing a live process's environment.
+ */
+static void test_merge_proc_environ(void) {
+    char val[512];
+
+    static const char blob[] =
+        "XDG_CURRENT_DESKTOP=KDE\0"
+        "LD_PRELOAD=/evil.so\0"
+        "NOEQUALS\0"
+        "KDE_FULL_SESSION=true\0"
+        "LANG=a=b\0";
+    int n = notify_test_merge_env(blob, sizeof(blob) - 1,
+                                  "XDG_CURRENT_DESKTOP", val, sizeof(val));
+    ASSERT(n == 3, "only whitelisted, well-formed entries are collected");
+    ASSERT(strcmp(val, "KDE") == 0, "value copied for the requested key");
+    n = notify_test_merge_env(blob, sizeof(blob) - 1, "LD_PRELOAD", val,
+                              sizeof(val));
+    ASSERT(n == 3 && strcmp(val, "") == 0,
+           "non-whitelisted key is not collected");
+    n = notify_test_merge_env(blob, sizeof(blob) - 1, "LANG", val,
+                              sizeof(val));
+    ASSERT(n == 3 && strcmp(val, "a=b") == 0,
+           "value may contain '=' (split at the first one)");
+
+    /* Duplicate keys: first occurrence wins. */
+    static const char dup[] = "LANG=first\0LANG=second\0";
+    n = notify_test_merge_env(dup, sizeof(dup) - 1, "LANG", val, sizeof(val));
+    ASSERT(n == 1, "duplicate key collected once");
+    ASSERT(strcmp(val, "first") == 0, "first occurrence wins");
+
+    /* Oversized value truncates at DIALOG_ENV_VALUE_MAX-1 (255). */
+    char big[600];
+    char blob2[1024];
+    memset(big, 'v', 512);
+    big[512] = '\0';
+    int bl = snprintf(blob2, sizeof(blob2), "LANG=%s", big);
+    n = notify_test_merge_env(blob2, (size_t)bl, "LANG", val, sizeof(val));
+    ASSERT(n == 1, "oversized value is still collected");
+    ASSERT(strlen(val) == 255, "value truncated to the env value cap");
+}
+
+/*
  * Run the verdict-stage seam in a child: an unsafe grant records the
  * per-process "first hit" gate for whatever pid asks, and the test binary
  * must not spend its own gate (test_unsafe_hit_once_per_process relies on
@@ -2476,6 +2520,7 @@ int main(void) {
     test_scope_guard();
     test_recent_decision_cache();
     test_dialog_env_whitelist();
+    test_merge_proc_environ();
     test_kdialog_status_mapping();
     test_menu_choice_mapping();
     test_menu_end_to_end();

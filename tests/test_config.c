@@ -1073,6 +1073,124 @@ static void test_relative_protected_rejected(void)
 }
 
 /*
+ * Line handling and hard caps: CRLF endings parse cleanly (the trim
+ * strips '\r'), a line longer than the parser buffer is skipped whole
+ * (drained to its newline) with the rest of the config still loading,
+ * and the MAX_RULES cap is exact -- loading at the cap, refusing at one
+ * over (never silently truncating).
+ */
+static void test_crlf_longline_and_rule_cap(void)
+{
+    Config cfg;
+
+    /* A [settings] line missing '=' is ignored (loudly, via the log):
+     * the typo must not look like it took effect. */
+    {
+        const char *conf =
+            "[protected_paths]\n"
+            "/tmp/fileshield_settings_typo\n"
+            "[settings]\n"
+            "user_ttl 900\n";
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write settings-typo config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0,
+               "settings typo does not fail the config");
+        ASSERT(cfg.user_ttl_seconds == 0,
+               "settings line without '=' is ignored, not half-applied");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* CRLF line endings. */
+    {
+        const char *crlf =
+            "[protected_paths]\r\n"
+            "/tmp/fileshield_crlf_ok\r\n"
+            "[settings]\r\n"
+            "user_ttl = 60\r\n";
+        char *path = write_temp(crlf);
+        ASSERT(path != NULL, "write CRLF config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0, "CRLF config loads");
+        ASSERT(cfg.protected_count == 1, "CRLF protected entry parsed");
+        ASSERT(strcmp(cfg.protected[0].path, "/tmp/fileshield_crlf_ok") == 0,
+               "CRLF stripped from the entry");
+        ASSERT(cfg.user_ttl_seconds == 60, "CRLF settings value parsed");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /* A line longer than the parser buffer (PATH_MAX * 2) is skipped
+     * whole and the following entry still loads. */
+    {
+        char *conf = malloc(PATH_MAX * 2 + 512);
+        ASSERT(conf != NULL, "alloc long-line config");
+        if (!conf)
+            return;
+        char *p = conf;
+        p += sprintf(p, "[protected_paths]\n");
+        p += sprintf(p, "/tmp/");
+        memset(p, 'a', PATH_MAX * 2);
+        p += PATH_MAX * 2;
+        *p++ = '\n';
+        p += sprintf(p, "/tmp/fileshield_long_ok\n");
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write long-line config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0,
+               "config with an over-long line still loads");
+        ASSERT(cfg.protected_count == 1,
+               "over-long line skipped, following entry kept");
+        ASSERT(strcmp(cfg.protected[0].path, "/tmp/fileshield_long_ok") == 0,
+               "valid entry after the over-long line survives");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+        free(conf);
+    }
+
+    /* MAX_RULES is exact: at the cap loads, one over refuses. */
+    {
+        char conf[8192];
+        char *p = conf;
+        p += sprintf(p, "[allowlist]\n");
+        for (int i = 0; i < MAX_RULES; i++)
+            p += sprintf(p, "/usr/bin/cap%03d\n", i);
+        *p = '\0';
+
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write at-cap config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == 0, "MAX_RULES rules load");
+        ASSERT(cfg.allowlist_count == MAX_RULES,
+               "rule count at the cap is exact");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+
+        p = conf;
+        p += sprintf(p, "[allowlist]\n");
+        for (int i = 0; i <= MAX_RULES; i++)
+            p += sprintf(p, "/usr/bin/cap%03d\n", i);
+        *p = '\0';
+
+        path = write_temp(conf);
+        ASSERT(path != NULL, "write over-cap config");
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == -1,
+               "one rule past MAX_RULES refuses the config");
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+}
+
+/*
  * M4 regression: '#' is a comment only at line start.  Mid-line it is a
  * legal path byte — accepting "pattern  # note" verbatim silently
  * un-protected the files the entry appeared to guard (and the README
@@ -1710,6 +1828,7 @@ int main(void)
     test_unknown_setting();
     test_debug_staging();
     test_relative_protected_rejected();
+    test_crlf_longline_and_rule_cap();
     test_inline_hash_rejected();
     test_settings_user_ttl();
     test_settings_session_ttl();

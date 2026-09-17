@@ -393,34 +393,18 @@ int glob_match_path(const char *pattern, const char *path)
 /*  /proc/<pid>/stat field extraction                                  */
 /* ------------------------------------------------------------------ */
 
-int proc_stat_session(pid_t pid, unsigned long long *sid_out,
-                      unsigned long long *start_out)
+/*
+ * Parse one /proc/<pid>/stat line (NUL-terminated; n = bytes read).
+ * Returns 0 on success, -1 on any structural anomaly.  Split from
+ * proc_stat_session so synthetic lines can be tested directly (the comm
+ * field may contain ')' and spaces, and the numeric fields must be
+ * addressed from the LAST ')' onward).
+ */
+static int parse_proc_stat(const char *buf, size_t n,
+                           unsigned long long *sid_out,
+                           unsigned long long *start_out)
 {
-    char path[64];
-    char buf[1024];
-
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    /*
-     * open()/read() instead of fopen()/fread(): this sits on the hot
-     * path (PID-reuse check on every cache hit).  FILE stream setup and
-     * teardown is measurable here — 7.16 us with stdio vs 5.70 us with
-     * raw descriptors in tests/bench_hotpath.c.
-     */
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    ssize_t n;
-    do
-    {
-        n = read(fd, buf, sizeof(buf) - 1);
-    } while (n < 0 && errno == EINTR);
-    close(fd);
-    if (n <= 0)
-        return -1;
-    buf[n] = '\0';
-    /* A full buffer means the line did not fit and was truncated;
-     * reject it before it can parse garbage start times. */
-    if (n >= (ssize_t)sizeof(buf) - 1)
+    if (n == 0)
         return -1;
     /* The line always ends with the numeric field 52, so reject
      * anything that does not end in a digit (or the newline). */
@@ -431,9 +415,9 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
      * The comm field (field 2) may contain spaces and parentheses, so the
      * fixed numeric fields cannot be addressed by splitting on whitespace
      * from the left.  Everything after the LAST ')' is stable: the next
-     * token is the single state character (field 3), then fields 4..52.
+     * token is the single state character (field 3), then fields 4..22.
      */
-    char *q = strrchr(buf, ')');
+    const char *q = strrchr(buf, ')');
     if (!q || q[1] == '\0')
         return -1;
     q++;
@@ -466,6 +450,48 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
     if (start_out)
         *start_out = start;
     return 0;
+}
+
+/* Test seam (utils.h): parse a synthetic stat line exactly like
+ * proc_stat_session does (n = bytes before the terminator). */
+int utils_test_parse_proc_stat(const char *line, size_t n,
+                               unsigned long long *sid_out,
+                               unsigned long long *start_out)
+{
+    return parse_proc_stat(line, n, sid_out, start_out);
+}
+
+int proc_stat_session(pid_t pid, unsigned long long *sid_out,
+                      unsigned long long *start_out)
+{
+    char path[64];
+    char buf[1024];
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    /*
+     * open()/read() instead of fopen()/fread(): this sits on the hot
+     * path (PID-reuse check on every cache hit).  FILE stream setup and
+     * teardown is measurable here — 7.16 us with stdio vs 5.70 us with
+     * raw descriptors in tests/bench_hotpath.c.
+     */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n;
+    do
+    {
+        n = read(fd, buf, sizeof(buf) - 1);
+    } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    /* A full buffer means the line did not fit and was truncated;
+     * reject it before it can parse garbage start times. */
+    if (n >= (ssize_t)sizeof(buf) - 1)
+        return -1;
+
+    return parse_proc_stat(buf, (size_t)n, sid_out, start_out);
 }
 
 /* ------------------------------------------------------------------ */

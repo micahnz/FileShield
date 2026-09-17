@@ -161,6 +161,30 @@ static int merge_proc_environ(const char *buf, size_t len,
     return count;
 }
 
+/*
+ * Test seam (notify.h): run merge_proc_environ over a synthetic
+ * NUL-separated blob (like /proc/<pid>/environ).  Returns the number of
+ * collected entries and, when out/outsz are non-NULL, copies the value
+ * collected for key ("" when the key was not collected).
+ */
+int notify_test_merge_env(const char *blob, size_t len, const char *key,
+                          char *out, size_t outsz)
+{
+    DialogEnvSetting merged[DIALOG_ENV_MAX];
+    int count;
+
+    memset(merged, 0, sizeof(merged));
+    count = merge_proc_environ(blob, len, merged, 0, DIALOG_ENV_MAX);
+    if (out && outsz > 0)
+    {
+        out[0] = '\0';
+        for (int i = 0; i < count; i++)
+            if (strcmp(merged[i].key, key) == 0)
+                snprintf(out, outsz, "%s", merged[i].value);
+    }
+    return count;
+}
+
 static int read_proc_environ(pid_t pid, char *buf, size_t bufsz)
 {
     char path[64];

@@ -96,6 +96,16 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
                       unsigned long long *start_out);
 
 /*
+ * Test seam: parse a synthetic /proc/<pid>/stat line exactly like
+ * proc_stat_session does (n = bytes before the terminator).  Exercises
+ * the comm-with-')'-and-spaces path and the field offsets without a
+ * live process.
+ */
+int utils_test_parse_proc_stat(const char *line, size_t n,
+                               unsigned long long *sid_out,
+                               unsigned long long *start_out);
+
+/*
  * close_fds_from: close every file descriptor >= 'first' in the calling
  * process.  Used by fork()ed children before exec() so no daemon file
  * descriptors (fanotify group fd, event fds, pipes) leak into helpers.
