@@ -930,10 +930,20 @@ static void load_dyn_list(DynEntry *list, int *list_count,
  */
 typedef const ProcChain *(*ChainProviderFn)(void *ctx);
 
+/*
+ * Command-line fingerprint provider, mirroring the chain provider: the
+ * matchers request the digest only after every cheaper key (binary,
+ * target, digest, call chain) has matched, so an event that cannot hit
+ * a runtime entry never pays for the /proc read or the hash.  Providers
+ * memoize per event.
+ */
+typedef const char *(*CmdlineProviderFn)(void *ctx);
+
 static int dyn_match(const DynEntry *list, int count,
                      const char *binary, const char *bin_sha512,
                      ChainProviderFn chain_fn, void *chain_ctx,
-                     const char *target, const char *cmdline_fp,
+                     const char *target,
+                     CmdlineProviderFn cmdline_fn, void *cmdline_ctx,
                      int require_binary_sha)
 {
     if (!target || target[0] == '\0')
@@ -999,10 +1009,14 @@ static int dyn_match(const DynEntry *list, int count,
         if (!ok)
             continue;
 
-        /* An entry without a command fingerprint can never match, and an
+        /* Command line is the last key: fingerprint it only now, so an
+         * event whose earlier keys match nothing never pays for the
+         * /proc read or the hash (the provider memoizes per event).
+         * An entry without a stored fingerprint can never match, and an
          * unavailable current fingerprint is re-prompted (fail closed). */
         if (e->cmdline_sha512[0] == '\0')
             continue;
+        const char *cmdline_fp = cmdline_fn(cmdline_ctx);
         if (!cmdline_fp || cmdline_fp[0] == '\0')
             continue;
         if (strcmp(e->cmdline_sha512, cmdline_fp) != 0)
@@ -1015,10 +1029,12 @@ static int dyn_match(const DynEntry *list, int count,
 /* "Always Allow" lookup: grants are strict (see dyn_match). */
 static int dyn_allow_match(const char *binary, const char *bin_sha512,
                            ChainProviderFn chain_fn, void *chain_ctx,
-                           const char *target, const char *cmdline_fp)
+                           const char *target,
+                           CmdlineProviderFn cmdline_fn, void *cmdline_ctx)
 {
     return dyn_match(g_dyn_allow, g_dyn_allow_count, binary, bin_sha512,
-                     chain_fn, chain_ctx, target, cmdline_fp, 1);
+                     chain_fn, chain_ctx, target, cmdline_fn, cmdline_ctx,
+                     1);
 }
 
 /*
@@ -1116,10 +1132,12 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
  */
 static int dyn_deny_match(const char *binary, const char *bin_sha512,
                           ChainProviderFn chain_fn, void *chain_ctx,
-                          const char *target, const char *cmdline_fp)
+                          const char *target,
+                          CmdlineProviderFn cmdline_fn, void *cmdline_ctx)
 {
     return dyn_match(g_dyn_deny, g_dyn_deny_count, binary, bin_sha512,
-                     chain_fn, chain_ctx, target, cmdline_fp, 0);
+                     chain_fn, chain_ctx, target, cmdline_fn, cmdline_ctx,
+                     0);
 }
 
 static void dyn_deny_add(const char *binary, const char *bin_sha512,
@@ -2538,6 +2556,13 @@ static const char *event_cmdline_fp(EventCtx *c)
     return c->cmdline_sha512;
 }
 
+/* Provider wrapper: lets dyn_match request the fingerprint lazily (the
+ * computation itself memoizes on the event context). */
+static const char *event_cmdline_provider(void *ctx)
+{
+    return event_cmdline_fp((EventCtx *)ctx);
+}
+
 /*
  * Deliver one decision through fanotify_respond() and note when the
  * response was queued for retry, so process_open_perm() leaves the event
@@ -2815,7 +2840,7 @@ static int event_runtime_denied(EventCtx *c)
 
     if (g_dyn_deny_count > 0 &&
         dyn_deny_match(c->binary, c->bin_sha512, event_chain_provider, c,
-                       c->target, event_cmdline_fp(c)))
+                       c->target, event_cmdline_provider, c))
     {
         log_msg(LOG_INFO, "dynamic denylist hit: %s (pid %d) -> %s",
                 c->binary, (int)c->ev->pid, c->target);
@@ -3022,7 +3047,7 @@ static int try_runtime_allow(EventCtx *c)
 {
     if (g_dyn_allow_count <= 0 ||
         !dyn_allow_match(c->binary, c->bin_sha512, event_chain_provider, c,
-                         c->target, event_cmdline_fp(c)))
+                         c->target, event_cmdline_provider, c))
         return 0;
 
     int user_ttl = g_config ? g_config->user_ttl_seconds : DEFAULT_USER_TTL_S;
@@ -4358,13 +4383,20 @@ static const ProcChain *test_chain_provider(void *ctx)
     return (const ProcChain *)ctx;
 }
 
+/* Fixed-fingerprint provider for the matcher seams: the synthetic test
+ * request carries its precomputed fingerprint as the context. */
+static const char *test_fp_provider(void *ctx)
+{
+    return (const char *)ctx;
+}
+
 int fanotify_test_dyn_allow_match(const char *binary, const char *bin_sha512,
                                   const char *target, const char *cmdline_fp)
 {
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
     return dyn_allow_match(binary, bin_sha512, test_chain_provider, &chain,
-                           target, cmdline_fp);
+                           target, test_fp_provider, (void *)cmdline_fp);
 }
 
 int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
@@ -4373,7 +4405,7 @@ int fanotify_test_dyn_deny_match(const char *binary, const char *bin_sha512,
     ProcChain chain;
     memset(&chain, 0, sizeof(chain));
     return dyn_deny_match(binary, bin_sha512, test_chain_provider, &chain,
-                          target, cmdline_fp);
+                          target, test_fp_provider, (void *)cmdline_fp);
 }
 
 int fanotify_test_cmdline_fingerprint(pid_t pid, char hex_out[129])
