@@ -42,6 +42,15 @@ static void make_test_path(char *out, size_t sz, const char *name)
 #define SHA_VIM "bbbb2222222222222222222222222222222222222222222222222222222222"
 #define SHA_SSH "cccc3333333333333333333333333333333333333333333333333333333333"
 
+/* Valid stored rule IDs (16 lowercase hex chars); distinct values prove
+ * the field is carried per entry rather than defaulted at save time. */
+#define RULE_ID_A "0123456789abcdef"
+#define RULE_ID_B "fedcba9876543210"
+#define RULE_ID_C "1111111111111111"
+#define RULE_ID_D "2222222222222222"
+#define RULE_ID_E "3333333333333333"
+#define RULE_ID_F "4444444444444444"
+
 static int test_persist_roundtrip(void)
 {
     char path[PATH_MAX];
@@ -71,6 +80,7 @@ static int test_persist_roundtrip(void)
              "2222222222222222222222222222222222222222222222222222222222222222"
              "2222222222222222222222222222222222222222222222222222222222222222");
     in[0].created_at = (time_t)1700000000;
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
 
     /* Entry 1: chain depth 1 */
     snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/ssh");
@@ -84,6 +94,7 @@ static int test_persist_roundtrip(void)
              "3333333333333333333333333333333333333333333333333333333333333333"
              "3333333333333333333333333333333333333333333333333333333333333333");
     in[1].created_at = (time_t)1700001000;
+    snprintf(in[1].rule_id, sizeof(in[1].rule_id), RULE_ID_B);
 
     ASSERT(persist_save(path, in, 2) == 0, "persist_save returned 0");
 
@@ -105,8 +116,10 @@ static int test_persist_roundtrip(void)
     ASSERT(strcmp(out[0].chain_sha512[1], in[0].chain_sha512[1]) == 0,
            "entry0 chain_sha512[1]");
     ASSERT(out[0].created_at == (time_t)1700000000, "entry0 created_at");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0, "entry0 rule_id");
 
     ASSERT(strcmp(out[1].binary, "/usr/bin/ssh") == 0, "entry1 binary");
+    ASSERT(strcmp(out[1].rule_id, RULE_ID_B) == 0, "entry1 rule_id");
     ASSERT(strcmp(out[1].target_path, "/etc/ssl/private/key.pem") == 0, "entry1 target_path");
     ASSERT(out[1].chain_depth == 1, "entry1 chain_depth");
     ASSERT(strcmp(out[1].chain_comm[0], "bash") == 0, "entry1 chain_comm[0]");
@@ -131,6 +144,7 @@ static int test_persist_max_chain_depth(void)
     memset(in, 0, sizeof(in));
 
     snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/kubectl");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
     snprintf(in[0].target_path, sizeof(in[0].target_path), "/var/run/secrets/tls.crt");
     in[0].chain_depth = PERSIST_CHAIN_MAX;
     for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
@@ -146,6 +160,7 @@ static int test_persist_max_chain_depth(void)
     int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
     ASSERT(n == 1, "persist_load max chain returns 1");
     ASSERT(out[0].chain_depth == PERSIST_CHAIN_MAX, "chain_depth == PERSIST_CHAIN_MAX");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0, "max chain rule_id");
     ASSERT(strcmp(out[0].target_path, "/var/run/secrets/tls.crt") == 0, "max chain target_path");
 
     for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
@@ -222,10 +237,14 @@ static int test_persist_chain_depths(void)
 
     PersistEntry in[PERSIST_CHAIN_MAX];
     memset(in, 0, sizeof(in));
+    static const char *const ids[PERSIST_CHAIN_MAX] = {
+        RULE_ID_A, RULE_ID_B, RULE_ID_C
+    };
 
     for (int i = 0; i < PERSIST_CHAIN_MAX; i++)
     {
         snprintf(in[i].binary, sizeof(in[i].binary), "/usr/bin/chain%d", i);
+        snprintf(in[i].rule_id, sizeof(in[i].rule_id), "%s", ids[i]);
         snprintf(in[i].target_path, sizeof(in[i].target_path), "/etc/target%d.conf", i);
         in[i].chain_depth = i + 1;
         for (int j = 0; j <= i; j++)
@@ -243,6 +262,8 @@ static int test_persist_chain_depths(void)
         char msg[64];
         snprintf(msg, sizeof(msg), "entry %d chain_depth", i);
         ASSERT(out[i].chain_depth == i + 1, msg);
+        snprintf(msg, sizeof(msg), "entry %d rule_id", i);
+        ASSERT(strcmp(out[i].rule_id, in[i].rule_id) == 0, msg);
         char expected_target[64];
         snprintf(expected_target, sizeof(expected_target), "/etc/target%d.conf", i);
         snprintf(msg, sizeof(msg), "entry %d target_path", i);
@@ -282,6 +303,7 @@ static int test_persist_json_escaping(void)
      * by `sh -c "..."` invocations. */
     snprintf(in[0].cmdline, sizeof(in[0].cmdline),
              "sh -c \"echo \\\"hi\\\" > /tmp/x\"");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
     in[0].chain_depth = 1;
     snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "normalproc");
 
@@ -296,6 +318,8 @@ static int test_persist_json_escaping(void)
            "cmdline quotes and backslash roundtrip");
     ASSERT(strcmp(out[0].chain_comm[0], "normalproc") == 0,
            "chain_comm normal name roundtrip");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0,
+           "rule_id roundtrips alongside escaped fields");
 
     unlink(path);
     TEST_PASS("JSON special character escaping");
@@ -490,9 +514,13 @@ static int test_persist_over_cap(void)
 
     PersistEntry in[4];
     memset(in, 0, sizeof(in));
+    static const char *const ids[4] = {
+        RULE_ID_C, RULE_ID_D, RULE_ID_E, RULE_ID_F
+    };
     for (int i = 0; i < 4; i++)
     {
         snprintf(in[i].binary, sizeof(in[i].binary), "/usr/bin/bin%d", i);
+        snprintf(in[i].rule_id, sizeof(in[i].rule_id), "%s", ids[i]);
         snprintf(in[i].binary_sha512, sizeof(in[i].binary_sha512),
                  "sha%d", i);
     }
@@ -505,6 +533,10 @@ static int test_persist_over_cap(void)
     ASSERT(n == 2, "load with cap 2 returns exactly 2 entries");
     ASSERT(strcmp(out[0].binary, "/usr/bin/bin0") == 0, "first entry kept");
     ASSERT(strcmp(out[1].binary, "/usr/bin/bin1") == 0, "second entry kept");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_C) == 0,
+           "first entry rule_id kept");
+    ASSERT(strcmp(out[1].rule_id, RULE_ID_D) == 0,
+           "second entry rule_id kept");
 
     free(out);
     unlink(path);
@@ -883,6 +915,7 @@ static int test_persist_save_fixed_bytes(void)
         "{\n"
         "  \"entries\": [\n"
         "    {\n"
+        "      \"rule_id\": \"0123456789abcdef\",\n"
         "      \"binary\": \"/usr/bin/fixed\",\n"
         "      \"binary_sha512\": \"abc123\",\n"
         "      \"target_path\": \"/etc/fixed.conf\",\n"
@@ -905,6 +938,7 @@ static int test_persist_save_fixed_bytes(void)
 
     memset(in, 0, sizeof(in));
     snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/fixed");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
     snprintf(in[0].binary_sha512, sizeof(in[0].binary_sha512), "abc123");
     snprintf(in[0].target_path, sizeof(in[0].target_path), "/etc/fixed.conf");
     snprintf(in[0].cmdline, sizeof(in[0].cmdline), "fixed --run");
@@ -921,7 +955,7 @@ static int test_persist_save_fixed_bytes(void)
            "fixed entry serializes byte-for-byte unchanged");
 
     unlink(path);
-    TEST_PASS("persist_save serialization unchanged");
+    TEST_PASS("persist_save serialization fixed (rule_id included)");
     return 0;
 }
 
@@ -939,6 +973,7 @@ static int test_persist_escape_overflow_fails(void)
     unlink(path);
 
     memset(in, 0, sizeof(in));
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
     /* Worst case: a full-length field of control bytes, each escaping to
      * six characters (\uXXXX).  JSON_ESCAPED_MAX is sized for exactly
      * this, so the save must now succeed and the field must survive a
@@ -953,12 +988,264 @@ static int test_persist_escape_overflow_fails(void)
     ASSERT(n == 1, "the escaped full-length field round-trips");
     ASSERT(strcmp(out[0].target_path, in[0].target_path) == 0,
            "escaped field round-trips byte-exact");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0,
+           "rule_id survives the escaped field");
 
     /* A NULL entry array fails the save without leaving files behind. */
     ASSERT(persist_save(path, NULL, 1) == -1,
            "NULL entry array fails the save");
 
     TEST_PASS("persist_save handles the worst-case escaped field");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: stored rule_id round-trips byte-identically                  */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_rule_id_roundtrip(void)
+{
+    char path[PATH_MAX];
+    PersistEntry in[2];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+
+    make_test_path(path, sizeof(path), "rule_id_roundtrip.json");
+    unlink(path);
+
+    memset(in, 0, sizeof(in));
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/id0");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
+    snprintf(in[0].target_path, sizeof(in[0].target_path), "/etc/id0.conf");
+    in[0].created_at = (time_t)1700003000;
+
+    snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/id1");
+    snprintf(in[1].rule_id, sizeof(in[1].rule_id), RULE_ID_B);
+
+    ASSERT(persist_save(path, in, 2) == 0, "save entries with rule_ids");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "both rule_id entries load");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0, "entry0 rule_id preserved");
+    ASSERT(strcmp(out[1].rule_id, RULE_ID_B) == 0, "entry1 rule_id preserved");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/id0") == 0, "entry0 binary intact");
+    ASSERT(strcmp(out[1].binary, "/usr/bin/id1") == 0, "entry1 binary intact");
+    ASSERT(out[0].created_at == (time_t)1700003000, "entry0 created_at intact");
+
+    unlink(path);
+    TEST_PASS("rule_id roundtrip");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_save writes one "rule_id" line per entry             */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_save_writes_rule_id(void)
+{
+    char path[PATH_MAX];
+    char content[4096];
+    PersistEntry in[2];
+
+    make_test_path(path, sizeof(path), "rule_id_lines.json");
+    unlink(path);
+
+    memset(in, 0, sizeof(in));
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/idline0");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
+    snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/idline1");
+    snprintf(in[1].rule_id, sizeof(in[1].rule_id), RULE_ID_B);
+
+    ASSERT(persist_save(path, in, 2) == 0, "save two entries with IDs");
+    ASSERT(read_file_text(path, content, sizeof(content)) > 0,
+           "read written state file");
+
+    /* The exact key/value pair must appear once per entry. */
+    int occurrences = 0;
+    for (const char *p = content; (p = strstr(p, "\"rule_id\"")) != NULL; p++)
+        occurrences++;
+    ASSERT(occurrences == 2, "one rule_id line per entry");
+    ASSERT(strstr(content, "\"rule_id\": \"" RULE_ID_A "\"") != NULL,
+           "entry0 rule_id value written");
+    ASSERT(strstr(content, "\"rule_id\": \"" RULE_ID_B "\"") != NULL,
+           "entry1 rule_id value written");
+
+    unlink(path);
+    TEST_PASS("save writes a rule_id line per entry");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: a legacy line without rule_id loads with an empty ID         */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_legacy_without_rule_id(void)
+{
+    char path[PATH_MAX];
+    PersistEntry *out;
+    const char *legacy =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/legacy\",\n"
+        "      \"target_path\": \"/etc/legacy.conf\",\n"
+        "      \"chain_depth\": 1,\n"
+        "      \"created_at\": 5\n"
+        "    }\n  ]\n}\n";
+
+    make_test_path(path, sizeof(path), "legacy_no_id.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, legacy) == 0, "write legacy state file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc legacy output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "legacy entry is counted");
+    ASSERT(out[0].rule_id[0] == '\0', "legacy entry has an empty rule_id");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/legacy") == 0, "legacy binary loads");
+    ASSERT(strcmp(out[0].target_path, "/etc/legacy.conf") == 0,
+           "legacy target_path loads");
+    ASSERT(out[0].chain_depth == 1, "legacy chain_depth loads");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("legacy state without rule_id loads");
+    return 0;
+}
+
+/*
+ * Append one raw JSON entry carrying a rule_id value (use "" for an
+ * explicit empty string) to a bounded buffer.  A trailing comma is fine:
+ * the line parser ends the object at '}'.  Returns 0 on success.
+ */
+static int append_raw_rule_entry(char *buf, size_t cap, size_t *off,
+                                 const char *rule_id, const char *binary)
+{
+    int n = snprintf(buf + *off, cap - *off,
+                     "    {\n"
+                     "      \"rule_id\": \"%s\",\n"
+                     "      \"binary\": \"%s\",\n"
+                     "      \"chain_depth\": 0,\n"
+                     "      \"created_at\": 1\n"
+                     "    },\n",
+                     rule_id, binary);
+    if (n < 0 || (size_t)n >= cap - *off)
+        return -1;
+    *off += (size_t)n;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: malformed rule_ids drop only their own entry                 */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_invalid_rule_id_rejected(void)
+{
+    char path[PATH_MAX];
+    char content[8192];
+    char binary[64];
+    size_t off;
+    int f;
+    static const char *bad[] = {
+        "0123456789ABCDEF",  /* uppercase      */
+        "0123456789abcde",   /* 15 chars       */
+        "0123456789abcdef0", /* 17 chars       */
+        "0123456789abcdeg",  /* non-hex char   */
+        ""                   /* explicit empty */
+    };
+    PersistEntry *out;
+
+    make_test_path(path, sizeof(path), "bad_ids.json");
+    unlink(path);
+
+    f = snprintf(content, sizeof(content), "{\n  \"entries\": [\n");
+    ASSERT(f > 0 && (size_t)f < sizeof(content), "bounded header");
+    off = (size_t)f;
+
+    ASSERT(append_raw_rule_entry(content, sizeof(content), &off, RULE_ID_A,
+                                 "/usr/bin/good0") == 0, "append first good");
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        snprintf(binary, sizeof(binary), "/usr/bin/bad%zu", i);
+        ASSERT(append_raw_rule_entry(content, sizeof(content), &off, bad[i],
+                                     binary) == 0, "append bad entry");
+    }
+
+    /* An undecodable rule_id (unterminated string) is still a present key:
+     * extraction fails, but the entry must not slip through as legacy. */
+    f = snprintf(content + off, sizeof(content) - off,
+                 "    {\n"
+                 "      \"rule_id\": \"abc,\n"
+                 "      \"binary\": \"/usr/bin/badtrunc\",\n"
+                 "      \"created_at\": 1\n"
+                 "    },\n");
+    ASSERT(f > 0 && (size_t)f < sizeof(content) - off, "append undecodable");
+    off += (size_t)f;
+
+    ASSERT(append_raw_rule_entry(content, sizeof(content), &off, RULE_ID_B,
+                                 "/usr/bin/good1") == 0, "append second good");
+
+    f = snprintf(content + off, sizeof(content) - off, "  ]\n}\n");
+    ASSERT(f > 0 && (size_t)f < sizeof(content) - off, "bounded footer");
+
+    ASSERT(write_raw_file(path, content) == 0, "write mixed state file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc mixed output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "only the valid siblings are admitted");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0, "first valid ID kept");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/good0") == 0,
+           "first valid binary kept");
+    ASSERT(strcmp(out[1].rule_id, RULE_ID_B) == 0, "second valid ID kept");
+    ASSERT(strcmp(out[1].binary, "/usr/bin/good1") == 0,
+           "second valid binary kept");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("malformed rule_ids drop only their own entry");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: a file with only invalid rule_ids loads as 0 entries         */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_all_rule_ids_invalid(void)
+{
+    char path[PATH_MAX];
+    char content[4096];
+    char binary[64];
+    size_t off;
+    int f;
+    static const char *bad[] = { "0123456789ABCDEF", "nope" };
+    PersistEntry *out;
+
+    make_test_path(path, sizeof(path), "all_bad_ids.json");
+    unlink(path);
+
+    f = snprintf(content, sizeof(content), "{\n  \"entries\": [\n");
+    ASSERT(f > 0 && (size_t)f < sizeof(content), "bounded header");
+    off = (size_t)f;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        snprintf(binary, sizeof(binary), "/usr/bin/onlybad%zu", i);
+        ASSERT(append_raw_rule_entry(content, sizeof(content), &off, bad[i],
+                                     binary) == 0, "append invalid entry");
+    }
+    f = snprintf(content + off, sizeof(content) - off, "  ]\n}\n");
+    ASSERT(f > 0 && (size_t)f < sizeof(content) - off, "bounded footer");
+
+    ASSERT(write_raw_file(path, content) == 0, "write all-invalid state file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc all-invalid output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "only invalid IDs: 0 entries loaded, not -1");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("all-invalid rule_id file is not a load failure");
     return 0;
 }
 
@@ -1003,6 +1290,11 @@ int main(void)
     failed |= test_persist_json_helpers();
     failed |= test_persist_save_fixed_bytes();
     failed |= test_persist_escape_overflow_fails();
+    failed |= test_persist_rule_id_roundtrip();
+    failed |= test_persist_save_writes_rule_id();
+    failed |= test_persist_legacy_without_rule_id();
+    failed |= test_persist_invalid_rule_id_rejected();
+    failed |= test_persist_all_rule_ids_invalid();
 
     rmdir(g_test_dir);
 
