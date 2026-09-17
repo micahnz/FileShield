@@ -1669,8 +1669,16 @@ static void spawn_notify_send(const DisplaySession *session,
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
             ;
     }
-    /* A 127 exit means exec failed (notify-send may have been removed
-     * since the cached check): re-check it on the next hit. */
+    /*
+     * The intermediate exits 0 as soon as it has forked the helper, so
+     * the only 127 observable here is its own fork() failure — a
+     * transient condition, NOT "notify-send is gone": the helper's exec
+     * failure happens in the reparented grandchild and is deliberately
+     * unobservable (fire-and-forget).  A genuinely missing helper is
+     * caught by notify_send_available()'s access() probe on the next
+     * hit.  Reset the cached availability so that next hit re-probes
+     * before spending another fork pair.
+     */
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
         g_notify_send_ok = 0;
 }
