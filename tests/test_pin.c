@@ -467,6 +467,25 @@ static int test_malformed_files(void)
             return 1;
     }
 
+    /*
+     * A line longer than any pin_store() can emit (JSON_LINE_MAX =
+     * PATH_MAX * 6 + 256) must refuse the whole file: parsing a split
+     * line as valid structure would be a silent-corruption path (same
+     * convention as persist_load).
+     */
+    {
+        char big[PATH_MAX * 6 + 512];
+
+        memset(big, 'x', sizeof(big) - 1);
+        big[0] = '{';
+        big[sizeof(big) - 2] = '}';
+        big[sizeof(big) - 1] = '\0'; /* no newline: one over-long line */
+        ASSERT(write_raw_file(path, big) == 0, "write over-long-line file");
+        ASSERT(pin_load(path) == -1,
+               "over-long line marks the file damaged");
+        ASSERT(pin_damaged() == 1, "over-long line sets damaged");
+    }
+
     /* The empty one-line array is still a valid, clean empty table. */
     ASSERT(write_raw_file(path, "{\n  \"pins\": []\n}\n") == 0,
            "write empty one-line pins array");

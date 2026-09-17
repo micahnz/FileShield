@@ -231,6 +231,19 @@ int pin_load(const char *filepath)
 
     while (ok && fgets(line, sizeof(line), fp))
     {
+        if (!strchr(line, '\n') && !feof(fp))
+        {
+            /* A line longer than any pin_store() can emit: the file was
+             * not written by the daemon or is corrupt.  Fail instead of
+             * parsing a split line as valid structure (the same
+             * convention persist_load() enforces). */
+            log_msg(LOG_ERR,
+                    "pin_load: %s has a line longer than %d bytes; "
+                    "ignoring the pin file",
+                    path, PIN_LINE_MAX - 1);
+            ok = 0;
+            break;
+        }
         char *p = line;
         char *pins_key;
 
