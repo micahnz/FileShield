@@ -1,6 +1,9 @@
 #ifndef FILESHIELD_PIN_H
 #define FILESHIELD_PIN_H
 
+#include <limits.h> /* PATH_MAX */
+#include <time.h>   /* time_t   */
+
 /*
  * Hash pinning for [allowlist] rules.
  *
@@ -41,6 +44,13 @@
  * store order, oldest first).  Writes go through persist_write_text():
  * atomic O_EXCL temp + rename, 0600 file inside a root-only directory.
  *
+ * pin_load_file()/pin_write_file() are the same parser and serializer
+ * without daemon state: fileshield-cli uses them to read and write the
+ * pin file directly when the daemon is stopped, and the daemon's
+ * pin_load()/pin_store() are built on them.  A pin row's ID is not
+ * stored: it is the first RULEID_HEX_LEN (16) hex characters of
+ * SHA-512 over the row's pattern, computed on demand (ruleid.h).
+ *
  * This module is not thread-safe; the daemon is single-threaded.
  */
 
@@ -60,16 +70,64 @@
 #define PIN_CHECK_DAMAGED 3   /* cannot check: damaged table or bad args  */
 
 /*
+ * One serialized pin row: the shape stored in allowlist-hashes.json and
+ * the unit of the pure file API.  The live daemon table adds a
+ * store-order tie-break that is never persisted, so it is not part of
+ * the public shape.
+ */
+typedef struct
+{
+    char pattern[PATH_MAX];
+    char sha512[129];
+    time_t updated_at;
+} PinRecord;
+
+/*
+ * Pure file API: load 'filepath' into out[0..max-1] with the strict
+ * fail-closed parse described above, without touching daemon state (the
+ * damage verdict is reported through damaged_out, not pin_damaged()).
+ *
+ * Requires a non-empty filepath, out != NULL and max >= 1; anything
+ * else returns -1 with *damaged_out = 1.
+ *
+ * Returns the number of rows loaded (>= 0) on success, with
+ * *damaged_out = 0.  A missing file is the normal empty table (0 rows,
+ * not damaged).  Any other open error, and every structural or value
+ * anomaly, returns -1 with *damaged_out = 1.  A file holding more rows
+ * than max is damage: rows are never silently dropped, so callers
+ * managing the daemon's file pass max = PIN_MAX.  On an open or parse
+ * failure (and for a missing file) out[0..max-1] is zeroed, never left
+ * partially filled, so a partial table can never be mistaken for a
+ * loaded one; argument errors return before out is touched.  damaged_out
+ * may be NULL when the caller does not need the flag.
+ */
+int pin_load_file(const char *filepath, PinRecord *out, int max,
+                  int *damaged_out);
+
+/*
+ * Serialize rows[0..count-1] and write them atomically to filepath via
+ * persist_write_text().  Requires a non-empty filepath, count in
+ * 0..PIN_MAX (a larger table would make the daemon load the file as
+ * damaged), rows != NULL unless count == 0, and every row valid: an
+ * absolute pattern shorter than PATH_MAX, a 128-hex-character digest and
+ * a non-negative updated_at.  Arguments are validated before any row is
+ * touched.  Returns 0 on success, -1 on any invalid argument or write
+ * failure.  rows may be NULL when count == 0.
+ */
+int pin_write_file(const char *filepath, const PinRecord *rows, int count);
+
+/*
  * Load the pin table from 'filepath', always replacing the whole table
  * on success (startup and every SIGHUP reload).  Pass NULL or "" to use
  * the current state file path: the PIN_STATE_FILE default or the
- * pin_set_state_file() override.
+ * pin_set_state_file() override.  Thin wrapper over pin_load_file()
+ * staged into the module table: a failure sets pin_damaged() == 1 and
+ * keeps the previously loaded table untrusted (never a silent reset to
+ * an empty table).
  *
  * Returns 0 when the file was loaded or does not exist (ENOENT yields an
  * empty table with pin_damaged() == 0 - normal first use).  Returns -1
- * and sets pin_damaged() == 1 with a LOG_ERR for any other open error
- * and for every structural or value anomaly, keeping the previously
- * loaded table untrusted (never a silent reset to an empty table).
+ * for any other open error and for every structural or value anomaly.
  */
 int pin_load(const char *filepath);
 
@@ -108,6 +166,30 @@ int pin_check(const char *pattern, const char *sha512, char old_out[129]);
  * next successful store or a restart rewrites the state.
  */
 int pin_store(const char *pattern, const char *sha512);
+
+/*
+ * Remove the pin whose pattern-derived ID (ruleid_pin(): the first 16
+ * hex characters of SHA-512 over the pattern) starts with 'id'.  'id'
+ * must be an unambiguous 8..16-character lower-case hex prefix; the full
+ * 16-character ID is accepted.  Returns 1 when a pin was removed and the
+ * file rewritten, 0 when no pin matches, -2 when the prefix matches more
+ * than one pin (nothing is removed), and -1 for invalid arguments, a
+ * damaged table, or a failed serialize/write.
+ *
+ * On a write failure the pre-removal table is restored in memory (same
+ * guarantee as pin_store()) so memory and disk stay consistent.  A
+ * damaged file is never overwritten; repair it and reload first.
+ */
+int pin_remove_by_id(const char *id);
+
+/*
+ * Empty the daemon table and persist the empty table atomically.
+ * Returns 0 on success; -1 when the table is damaged (repair the file
+ * and reload first - pin_clear never overwrites a damaged file) or when
+ * the write fails.  On a write failure the pre-clear table is restored
+ * in memory.  Clearing an already-empty table still writes the file.
+ */
+int pin_clear(void);
 
 /*
  * Override the state file path used by pin_store() (and by pin_load()

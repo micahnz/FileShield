@@ -29,7 +29,8 @@ RESTART ?= 0
 SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/session.c $(SRCDIR)/notify.c \
            $(SRCDIR)/fanotify.c $(SRCDIR)/inode.c $(SRCDIR)/sha512.c \
-           $(SRCDIR)/persist.c $(SRCDIR)/pin.c $(SRCDIR)/reload.c
+           $(SRCDIR)/persist.c $(SRCDIR)/pin.c $(SRCDIR)/reload.c \
+           $(SRCDIR)/ruleid.c
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS    := $(OBJS:.o=.d)
 
@@ -61,9 +62,9 @@ $(OBJDIR)/test_utils: $(OBJDIR)/utils.o $(TSTDIR)/test_utils.c
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_utils.c $(OBJDIR)/utils.o -o $@
 
-$(OBJDIR)/test_session: $(OBJDIR)/session.o $(OBJDIR)/utils.o $(TSTDIR)/test_session.c
+$(OBJDIR)/test_session: $(OBJDIR)/session.o $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o $(TSTDIR)/test_session.c
 	@mkdir -p $(OBJDIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_session.c $(OBJDIR)/session.o $(OBJDIR)/utils.o -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_session.c $(OBJDIR)/session.o $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/test_sha512: $(OBJDIR)/sha512.o $(OBJDIR)/utils.o $(TSTDIR)/test_sha512.c
 	@mkdir -p $(OBJDIR)
@@ -73,9 +74,9 @@ $(OBJDIR)/test_persist: $(OBJDIR)/persist.o $(OBJDIR)/utils.o $(TSTDIR)/test_per
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_persist.c $(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
 
-$(OBJDIR)/test_pin: $(OBJDIR)/pin.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o $(TSTDIR)/test_pin.c
+$(OBJDIR)/test_pin: $(OBJDIR)/pin.o $(OBJDIR)/persist.o $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o $(TSTDIR)/test_pin.c
 	@mkdir -p $(OBJDIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_pin.c $(OBJDIR)/pin.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_pin.c $(OBJDIR)/pin.o $(OBJDIR)/persist.o $(OBJDIR)/ruleid.o $(OBJDIR)/sha512.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/test_inode: $(OBJDIR)/inode.o $(OBJDIR)/utils.o $(TSTDIR)/test_inode.c
 	@mkdir -p $(OBJDIR)
@@ -99,12 +100,12 @@ $(OBJDIR)/test_cli_ui: $(OBJDIR)/cli_ui.o $(OBJDIR)/persist.o $(OBJDIR)/utils.o 
 $(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
                          $(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/session.o \
                          $(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
-                         $(OBJDIR)/pin.o $(OBJDIR)/utils.o
+                         $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR)/notify.o \
 		$(OBJDIR)/config.o $(OBJDIR)/cache.o $(OBJDIR)/session.o \
 		$(OBJDIR)/sha512.o $(OBJDIR)/persist.o $(OBJDIR)/inode.o \
-		$(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
 
 # Links the reload decision path with fan_fd = -1: every kernel mark fails,
 # so parse failure, reject plus rollback, and rollback failure are exercised
@@ -112,12 +113,12 @@ $(OBJDIR)/test_fanotify: $(TSTDIR)/test_fanotify.c $(OBJDIR)/fanotify.o $(OBJDIR
 $(OBJDIR)/test_reload: $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
                        $(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
                        $(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-                       $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o
+                       $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/test_reload.c $(OBJDIR)/reload.o $(OBJDIR)/fanotify.o \
 		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
 		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
 
 test: all $(TSTBINS)
 	@failed=0; skips=0; \
@@ -144,12 +145,12 @@ $(OBJDIR)/bench_hotpath: $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
                          $(OBJDIR)/notify.o $(OBJDIR)/config.o \
                          $(OBJDIR)/cache.o $(OBJDIR)/session.o \
                          $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-                         $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o
+                         $(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o
 	@mkdir -p $(OBJDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(TSTDIR)/bench_hotpath.c $(OBJDIR)/fanotify.o \
 		$(OBJDIR)/notify.o $(OBJDIR)/config.o $(OBJDIR)/cache.o \
 		$(OBJDIR)/session.o $(OBJDIR)/sha512.o $(OBJDIR)/persist.o \
-		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/utils.o -o $@
+		$(OBJDIR)/inode.o $(OBJDIR)/pin.o $(OBJDIR)/ruleid.o $(OBJDIR)/utils.o -o $@
 
 bench: all $(OBJDIR)/bench_hotpath
 	./$(OBJDIR)/bench_hotpath

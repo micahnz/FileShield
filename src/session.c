@@ -1,4 +1,5 @@
 #include "session.h"
+#include "ruleid.h"
 #include "utils.h"
 
 #include <limits.h>
@@ -18,6 +19,10 @@
 typedef struct
 {
     int used;
+    /* Stored rule ID: generated at add, preserved across a refresh, and
+     * unique within this list.  Empty when generation failed; such an
+     * entry is never removable by ID (fail closed). */
+    char rule_id[RULEID_HEX_LEN + 1];
     pid_t sid;
     unsigned long long leader_start;
     char binary[PATH_MAX];
@@ -30,6 +35,14 @@ static SessionEntry g_allow[SESSION_MAX];
 static SessionEntry g_deny[SESSION_MAX];
 static int g_allow_count = 0;
 static int g_deny_count = 0;
+
+/*
+ * A syntactically valid stored ID used only to validate a lookup prefix
+ * through ruleid_prefix_match(): with an empty list there is no stored ID
+ * to match against, yet a short or malformed prefix must still be an
+ * argument error, never "not found".
+ */
+static const char g_probe_id[RULEID_HEX_LEN + 1] = "0000000000000000";
 
 /*
  * Resolve the POSIX session id and the session leader's start time for
@@ -158,6 +171,100 @@ int session_deny_match(pid_t sid, const char *binary, const char *bin_sha512,
     return list_match(g_deny, g_deny_count, sid, binary, bin_sha512, target);
 }
 
+/*
+ * Remove one entry and close the hole.  Table order is preserved: it is
+ * the CLI's display order and the overflow eviction order.
+ */
+static void list_remove_at(SessionEntry *list, int *count, int idx)
+{
+    if (idx < 0 || idx >= *count)
+        return;
+
+    (*count)--;
+    if (idx < *count)
+        memmove(&list[idx], &list[idx + 1],
+                sizeof(SessionEntry) * (size_t)(*count - idx));
+    memset(&list[*count], 0, sizeof(SessionEntry));
+}
+
+static void list_clear(SessionEntry *list, int *count)
+{
+    memset(list, 0, sizeof(SessionEntry) * SESSION_MAX);
+    *count = 0;
+}
+
+/*
+ * Drop expired and dead-leader entries and compact the holes.  The
+ * snapshot sweeps first: the CLI must not display an entry the matcher
+ * would already treat as gone, and the compaction keeps the table dense
+ * for later reads.
+ */
+static void list_sweep(SessionEntry *list, int *count)
+{
+    time_t now = mono_seconds();
+    int w = 0;
+
+    for (int i = 0; i < *count; i++)
+    {
+        SessionEntry *e = &list[i];
+
+        if (!e->used || entry_expired(e, now) ||
+            !leader_alive(e->sid, e->leader_start))
+        {
+            e->used = 0;
+            continue;
+        }
+        if (w != i)
+        {
+            list[w] = list[i];
+            list[i].used = 0;
+        }
+        w++;
+    }
+    *count = w;
+}
+
+/*
+ * Fill e->rule_id from the entry's identity, unique against the other
+ * live entries of the same list (allow and deny are separate ID
+ * namespaces).  A session decision has no recorded command line or call
+ * chain, so those identity fields are empty/zero; created_at is the
+ * generation time in wall-clock seconds.  A failure -- which should not
+ * happen -- leaves the ID empty and logs: an entry without an ID is
+ * invisible to ID-based management (fail closed) and still matches by
+ * key.
+ */
+static void generate_rule_id(SessionEntry *list, int count, SessionEntry *e)
+{
+    const char *existing[SESSION_MAX] = {0}; /* n 0 passes an empty list */
+    RuleIdentity id;
+    int n = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (&list[i] == e || !list[i].used || list[i].rule_id[0] == '\0')
+            continue;
+        existing[n++] = list[i].rule_id;
+    }
+
+    memset(&id, 0, sizeof(id));
+    id.binary = e->binary;
+    id.binary_sha512 = e->binary_sha512;
+    id.target_path = e->target;
+    id.cmdline_sha512 = "";
+    id.chain_depth = 0;
+    id.created_at = (long)time(NULL);
+
+    if (ruleid_make_unique(&id, existing, n, e->rule_id) < 0)
+    {
+        e->rule_id[0] = '\0'; /* the generator leaves out untouched on failure */
+        log_msg(LOG_WARNING,
+                "session rule ID generation failed for %s -> %s; "
+                "the entry cannot be managed by ID",
+                e->binary, e->target);
+    }
+}
+
 static void list_add(SessionEntry *list, int *count, pid_t sid,
                      unsigned long long leader_start, const char *binary,
                      const char *bin_sha512, const char *target, int ttl_seconds)
@@ -172,6 +279,9 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
 
     /* Refresh an identical entry instead of appending a duplicate. */
     SessionEntry *e = NULL;
+    int refresh = 0;
+    char kept_id[RULEID_HEX_LEN + 1];
+    memset(kept_id, 0, sizeof(kept_id));
     for (int i = 0; i < *count; i++)
     {
         SessionEntry *c = &list[i];
@@ -179,6 +289,8 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
             strcmp(c->binary, binary) == 0 && strcmp(c->target, target) == 0)
         {
             e = c;
+            refresh = 1;
+            memcpy(kept_id, c->rule_id, sizeof(kept_id));
             break;
         }
     }
@@ -254,6 +366,15 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
     snprintf(e->target, sizeof(e->target), "%s", target);
     if (ttl_seconds > 0)
         e->expiry = mono_seconds() + ttl_seconds;
+
+    /* A refresh keeps the ID the CLI already holds: the decision key did
+     * not change, while re-hashing with a new created_at would mint a new
+     * ID on every repeat grant.  An empty ID (generation failed earlier)
+     * is the one case that gets a fresh attempt. */
+    if (refresh && kept_id[0] != '\0')
+        memcpy(e->rule_id, kept_id, sizeof(kept_id));
+    else
+        generate_rule_id(list, *count, e);
 }
 
 void session_allow_add(pid_t sid, unsigned long long leader_start,
@@ -274,10 +395,111 @@ void session_deny_add(pid_t sid, unsigned long long leader_start,
 
 void session_clear(void)
 {
-    memset(g_allow, 0, sizeof(g_allow));
-    memset(g_deny, 0, sizeof(g_deny));
-    g_allow_count = 0;
-    g_deny_count = 0;
+    list_clear(g_allow, &g_allow_count);
+    list_clear(g_deny, &g_deny_count);
+}
+
+void session_clear_list(int deny)
+{
+    if (deny == 0)
+        list_clear(g_allow, &g_allow_count);
+    else if (deny == 1)
+        list_clear(g_deny, &g_deny_count);
+    /* Any other selector clears nothing (fail closed). */
+}
+
+int session_snapshot(int deny, SessionRecord *out, int max, int *total_out)
+{
+    SessionEntry *list;
+    int *count;
+    int live;
+    int n;
+    time_t now;
+
+    if (!out || !total_out || max <= 0 || (deny != 0 && deny != 1))
+        return -1;
+
+    list = deny ? g_deny : g_allow;
+    count = deny ? &g_deny_count : &g_allow_count;
+    list_sweep(list, count);
+
+    live = *count;
+    n = live < max ? live : max;
+    now = mono_seconds();
+
+    for (int i = 0; i < n; i++)
+    {
+        SessionEntry *e = &list[i];
+        SessionRecord *r = &out[i];
+
+        snprintf(r->rule_id, sizeof(r->rule_id), "%s", e->rule_id);
+        r->sid = e->sid;
+        r->leader_start = e->leader_start;
+        snprintf(r->binary, sizeof(r->binary), "%s", e->binary);
+        snprintf(r->target, sizeof(r->target), "%s", e->target);
+        if (e->expiry == 0)
+        {
+            r->ttl_remaining = -1; /* lives until the session leader exits */
+        }
+        else
+        {
+            long ttl = (long)(e->expiry - now);
+            /* The sweep kept entries live at its instant; the clock may
+             * have ticked since, so an about-to-expire entry reports at
+             * least one second rather than zero/negative. */
+            r->ttl_remaining = ttl < 1 ? 1 : ttl;
+        }
+    }
+
+    *total_out = live;
+    return n;
+}
+
+int session_remove_by_id(int deny, const char *id)
+{
+    SessionEntry *list;
+    int *count;
+    int found = -1;
+
+    if (deny != 0 && deny != 1)
+        return -1;
+    /* Validate the prefix before walking (or skipping) the table: with an
+     * empty list there is no stored ID to match against, yet a short or
+     * malformed prefix must still be an argument error, not "not found". */
+    if (ruleid_prefix_match(g_probe_id, id) < 0)
+        return -1;
+
+    list = deny ? g_deny : g_allow;
+    count = deny ? &g_deny_count : &g_allow_count;
+
+    for (int i = 0; i < *count; i++)
+    {
+        SessionEntry *e = &list[i];
+        int matches;
+
+        /* An entry without an ID (generation failed) can never be
+         * addressed by ID; a damaged stored ID fails the lookup closed. */
+        if (!e->used || e->rule_id[0] == '\0')
+            continue;
+        matches = ruleid_prefix_match(e->rule_id, id);
+        if (matches < 0)
+            return -1;
+        if (matches == 1)
+        {
+            if (found >= 0)
+                return -2; /* ambiguous: remove nothing */
+            found = i;
+        }
+    }
+
+    if (found < 0)
+        return 0;
+
+    log_msg(LOG_INFO, "session %s rule %s (%s -> %s) removed by ID",
+            deny ? "deny" : "allow", list[found].rule_id,
+            list[found].binary, list[found].target);
+    list_remove_at(list, count, found);
+    return 1;
 }
 
 /* Test seam (session.h): table capacity. */
