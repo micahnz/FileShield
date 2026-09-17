@@ -89,8 +89,20 @@ static int open_atomic_temp(const char *filepath, const char *what,
                             char *tmp_file, size_t tmp_size)
 {
     int fd;
+    int need;
 
-    snprintf(tmp_file, tmp_size, "%s.tmp.%d", filepath, (int)getpid());
+    /* A filepath near PATH_MAX would silently truncate the ".tmp.<pid>"
+     * suffix, and the EEXIST retry below would then unlink a file whose
+     * name this function never verified fits.  Refuse instead of
+     * guessing (callers surface the failure; writes fail closed). */
+    need = snprintf(tmp_file, tmp_size, "%s.tmp.%d", filepath,
+                    (int)getpid());
+    if (need < 0 || (size_t)need >= tmp_size)
+    {
+        log_msg(LOG_ERR, "%s: temp path for %s is too long", what, filepath);
+        tmp_file[0] = '\0';
+        return -1;
+    }
 
     fd = open(tmp_file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
               0600);

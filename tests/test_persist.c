@@ -580,6 +580,33 @@ static int test_persist_write_text_roundtrip(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: persist_write_text refuses a truncated temp path            */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_write_text_temp_path_guard(void)
+{
+    char path[PATH_MAX];
+    size_t n = sizeof(path) - 3; /* strlen(path) == PATH_MAX - 3 */
+
+    /*
+     * A filepath whose ".tmp.<pid>" suffix cannot fit in PATH_MAX must
+     * fail the write cleanly.  Without the guard the temp name would be
+     * silently truncated, and the stale-temp retry could unlink a file
+     * at the truncated name.  Short parent ("/tmp") keeps
+     * ensure_parent_dir() out of the way so the temp guard is what is
+     * exercised.
+     */
+    memcpy(path, "/tmp/", 5);
+    memset(path + 5, 'a', n - 5);
+    path[n] = '\0';
+
+    ASSERT(persist_write_text(path, "x") == -1,
+           "over-long temp path fails the write");
+    TEST_PASS("persist_write_text temp-path truncation refused");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  test: persist_write_text replaces an existing file                */
 /* ------------------------------------------------------------------ */
 
@@ -968,6 +995,7 @@ int main(void)
     failed |= test_persist_over_cap();
     failed |= test_persist_remove();
     failed |= test_persist_write_text_roundtrip();
+    failed |= test_persist_write_text_temp_path_guard();
     failed |= test_persist_write_text_overwrite();
     failed |= test_persist_write_text_creates_dir();
     failed |= test_persist_write_text_failure();
