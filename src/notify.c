@@ -1472,7 +1472,10 @@ static int g_notify_send_ok = 0;
 static int notify_rate_allow(int kind, const char *binary, const char *target,
                              int dedup_seconds, int max_per_window)
 {
-    time_t now = time(NULL);
+    /* The project deadline clock: wall-clock steps must not extend the
+     * dedup suppression of a security tripwire or reset the flood
+     * budget early (mono_seconds, see utils.h). */
+    time_t now = mono_seconds();
     int cap = max_per_window > 0 ? max_per_window : NOTIFY_GLOBAL_MAX;
 
     if (now - g_notify_window_start >= NOTIFY_GLOBAL_WINDOW_S)
