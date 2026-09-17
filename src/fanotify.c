@@ -1661,6 +1661,8 @@ typedef struct
 {
     char *path; /* strdup'd */
     unsigned int mask;
+    int is_auto; /* created by auto_mark_created_path (counted against
+                  * MAX_AUTO_MARKS); recomputed by clear_marks */
 } MarkEntry;
 
 static MarkEntry g_marks[MAX_MARK_TABLE];
@@ -1687,7 +1689,19 @@ static int mark_table_add(const char *path, unsigned int mask)
     MarkEntry *e = mark_find(path);
     if (e)
     {
-        e->mask = mask;
+        /* Re-adding the same path with a DIFFERENT mask would leave the
+         * old kernel bits unremovable (clear_marks removes with the
+         * recorded mask), so fail loudly instead of overwriting the
+         * record.  Every current caller installs fanotify_mark_mask(),
+         * making a mismatch a bug rather than a configuration. */
+        if (e->mask != mask)
+        {
+            log_msg(LOG_ERR,
+                    "mark table: %s re-added with a different mask "
+                    "(0x%x != 0x%x); refusing the mark set",
+                    path, mask, e->mask);
+            return -1;
+        }
         return 0;
     }
     if (g_mark_count >= MAX_MARK_TABLE)
@@ -1705,6 +1719,7 @@ static int mark_table_add(const char *path, unsigned int mask)
     }
     g_marks[g_mark_count].path = copy;
     g_marks[g_mark_count].mask = mask;
+    g_marks[g_mark_count].is_auto = 0;
     g_mark_count++;
     return 0;
 }
@@ -2044,6 +2059,12 @@ static void auto_mark_created_path(int fan_fd, const char *path)
         return;
     if (fanotify_add_mark(fan_fd, path) == 0)
     {
+        /* Flag the tracked entry so clear_marks can recompute the
+         * budget after a partial removal (a stale count would keep
+         * throttling auto-marking forever). */
+        MarkEntry *e = mark_find(path);
+        if (e)
+            e->is_auto = 1;
         g_auto_mark_count++;
         log_msg(LOG_INFO, "auto-marked created object: %s", path);
     }
@@ -3731,8 +3752,15 @@ void fanotify_clear_marks(int fd)
         }
     }
     g_mark_count = kept;
-    if (kept == 0)
-        g_auto_mark_count = 0;
+
+    /* Recompute the auto-mark budget from the SURVIVING entries: a
+     * partial removal failure (kept > 0) previously left the old count,
+     * which never decays and throttles auto-marking forever even though
+     * most auto marks are gone. */
+    g_auto_mark_count = 0;
+    for (int i = 0; i < kept; i++)
+        if (g_marks[i].is_auto)
+            g_auto_mark_count++;
 
     int kept_mounts = 0;
     for (int i = 0; i < g_mount_count; i++)
