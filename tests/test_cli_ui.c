@@ -731,25 +731,239 @@ static void test_confirm(void)
 
     ASSERT(cli_confirm("delete?", 1) == 1, "--yes bypasses the prompt");
 
-    /* A non-tty stdin without --yes refuses without reading. */
+    /* A non-tty stdin without --yes refuses without reading.  The setup
+     * failure must be visible: silently passing because stdin could not
+     * be redirected would hide a broken check. */
     {
         int saved = dup(STDIN_FILENO);
         int devnull = open("/dev/null", O_RDONLY);
 
-        if (saved >= 0 && devnull >= 0)
+        if (saved < 0 || devnull < 0 || dup2(devnull, STDIN_FILENO) < 0)
         {
-            if (dup2(devnull, STDIN_FILENO) >= 0)
-            {
-                int got = cli_confirm("delete?", 0);
+            printf("SKIP: could not redirect stdin for the non-tty "
+                   "confirmation check\n");
+        }
+        else
+        {
+            int got = cli_confirm("delete?", 0);
 
-                ASSERT(got == 0, "non-tty stdin without --yes refuses");
-                dup2(saved, STDIN_FILENO);
-            }
+            ASSERT(got == 0, "non-tty stdin without --yes refuses");
+            ASSERT(dup2(saved, STDIN_FILENO) >= 0, "restore stdin");
         }
         if (saved >= 0)
             close(saved);
         if (devnull >= 0)
             close(devnull);
+    }
+}
+
+/*
+ * C1 regression: the confirmation listing shapes its dynamic fields
+ * exactly like table cells.  Control bytes become '?', long cells are
+ * tail-truncated per the equal-share cap (never below CLI_UI_COL_MIN),
+ * and --wide disables only truncation, never sanitization.
+ */
+static void test_confirm_line(void)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *ms;
+
+    /* Single-field golden shape. */
+    ms = open_memstream(&buf, &len);
+    ASSERT(ms != NULL, "open_memstream for the single-field confirm line");
+    if (ms)
+    {
+        cli_ui_render_confirm_line(ms, "0123456789abcdef", "/usr/bin/tool",
+                                   NULL, 200, 1);
+        fclose(ms);
+        ASSERT(buf != NULL &&
+                   strcmp(buf, "  0123456789abcdef: /usr/bin/tool\n") == 0,
+               "single-field confirm line golden");
+        free(buf);
+    }
+
+    /* Two-field golden shape with an over-long id: it is clipped to the
+     * stored-ID width. */
+    buf = NULL;
+    len = 0;
+    ms = open_memstream(&buf, &len);
+    ASSERT(ms != NULL, "open_memstream for the two-field confirm line");
+    if (ms)
+    {
+        cli_ui_render_confirm_line(ms, "0123456789abcdefZZZZ",
+                                   "/usr/bin/tool", "/home/u/secret", 200, 1);
+        fclose(ms);
+        ASSERT(buf != NULL &&
+                   strcmp(buf, "  0123456789abcdef: /usr/bin/tool -> "
+                               "/home/u/secret\n") == 0,
+               "two-field confirm line clips the ID and keeps the arrow");
+        free(buf);
+    }
+
+    /* Escapes in from/to are neutralized: raw control bytes never reach
+     * the terminal even with --wide. */
+    buf = NULL;
+    len = 0;
+    ms = open_memstream(&buf, &len);
+    ASSERT(ms != NULL, "open_memstream for the escaped confirm line");
+    if (ms)
+    {
+        cli_ui_render_confirm_line(ms, "0123456789abcdef",
+                                   "/bin/a\x1b[31mb", "/t/\x01x", 200, 1);
+        fclose(ms);
+        ASSERT(buf != NULL && strchr(buf, '\x1b') == NULL,
+               "no raw escape byte in the confirm line");
+        ASSERT(buf != NULL && strchr(buf, '\x01') == NULL,
+               "no raw control byte in the confirm line");
+        ASSERT(buf != NULL && strstr(buf, "?[31mb") != NULL &&
+                   strstr(buf, "/t/?x") != NULL,
+               "control bytes become '?'");
+        free(buf);
+    }
+
+    /*
+     * Narrow terminal: each dynamic cell is capped at an equal share
+     * (width 40, two fields, 24 fixed columns -> cap 8), so only the
+     * informative tail survives; a width below the fixed parts floors
+     * the cap at CLI_UI_COL_MIN (4).
+     */
+    buf = NULL;
+    len = 0;
+    ms = open_memstream(&buf, &len);
+    ASSERT(ms != NULL, "open_memstream for the narrow confirm line");
+    if (ms)
+    {
+        cli_ui_render_confirm_line(ms, "0123456789abcdef",
+                                   "/from/abcdef", "/to/uvwxyz", 40, 0);
+        fclose(ms);
+        ASSERT(buf != NULL && strstr(buf, "...bcdef") != NULL &&
+                   strstr(buf, "...vwxyz") != NULL,
+               "narrow confirm line keeps the cell tails");
+        ASSERT(buf != NULL && strstr(buf, "/from/abcdef") == NULL &&
+                   strstr(buf, "/to/uvwxyz") == NULL,
+               "narrow confirm line actually truncates");
+        free(buf);
+    }
+
+    buf = NULL;
+    len = 0;
+    ms = open_memstream(&buf, &len);
+    ASSERT(ms != NULL, "open_memstream for the over-narrow confirm line");
+    if (ms)
+    {
+        cli_ui_render_confirm_line(ms, "0123456789abcdef", "abcdefgh",
+                                   "ijklmnop", 10, 0);
+        fclose(ms);
+        ASSERT(buf != NULL && strstr(buf, "...h") != NULL &&
+                   strstr(buf, "...p") != NULL,
+               "cap floors at CLI_UI_COL_MIN on an over-narrow terminal");
+        free(buf);
+    }
+}
+
+/*
+ * C5 regression: a damaged PersistEntry may carry chain_depth beyond
+ * PERSIST_CHAIN_MAX.  Every chain renderer must clamp it, so rendering
+ * never reads past the stored arrays.  The sentinels placed right after
+ * the arrays are what a pre-fix over-read would print (chain_comm is
+ * immediately followed by chain_sha512 in PersistEntry).
+ */
+static void test_chain_depth_clamp(void)
+{
+    struct
+    {
+        char comms[PERSIST_CHAIN_MAX][CLI_UI_COMM_MAX];
+        char sentinel[CLI_UI_COMM_MAX];
+    } buf;
+    const char (*comms)[CLI_UI_COMM_MAX] =
+        (const char (*)[CLI_UI_COMM_MAX])buf.comms;
+    char out[256];
+    int i;
+
+    memset(&buf, 0, sizeof(buf));
+    for (i = 0; i < PERSIST_CHAIN_MAX; i++)
+        snprintf(buf.comms[i], sizeof(buf.comms[i]), "c%d", i);
+    snprintf(buf.sentinel, sizeof(buf.sentinel), "%s", "SENTINEL-COMM");
+
+    cli_ui_chain_column(comms, PERSIST_CHAIN_MAX + 4, out, sizeof(out));
+    ASSERT(strcmp(out, "c0 > c1 > c2") == 0,
+           "chain_column renders only the stored levels");
+    ASSERT(strstr(out, "SENTINEL-COMM") == NULL,
+           "chain_column never reads past the array");
+
+    /* The rule table's CHAIN cell takes the same path. */
+    {
+        PersistEntry e;
+        CliRuleRow row;
+        char *rendered = NULL;
+        size_t rlen = 0;
+        FILE *ms;
+
+        memset(&e, 0, sizeof(e));
+        snprintf(e.binary, sizeof(e.binary), "%s", "sh");
+        snprintf(e.cmdline, sizeof(e.cmdline), "%s", "sh");
+        snprintf(e.target_path, sizeof(e.target_path), "%s", "t");
+        for (i = 0; i < PERSIST_CHAIN_MAX; i++)
+            snprintf(e.chain_comm[i], sizeof(e.chain_comm[i]), "c%d", i);
+        snprintf(e.chain_sha512[0], sizeof(e.chain_sha512[0]), "%s",
+                 "SENTINEL-SHA");
+        e.chain_depth = PERSIST_CHAIN_MAX + 4;
+
+        memset(&row, 0, sizeof(row));
+        row.entry = &e;
+        ms = open_memstream(&rendered, &rlen);
+        ASSERT(ms != NULL, "open_memstream for the clamped rule table");
+        if (ms)
+        {
+            cli_ui_render_rules(ms, &row, 1, 200, 0);
+            fclose(ms);
+            ASSERT(rendered != NULL &&
+                       strstr(rendered, "SENTINEL-SHA") == NULL,
+                   "rule table chain cell never reads past the array");
+            ASSERT(rendered != NULL &&
+                       strstr(rendered, "c0 > c1 > c2") != NULL,
+                   "rule table renders the clamped chain");
+            free(rendered);
+        }
+    }
+
+    /* The JSON chain array uses the same clamped depth. */
+    {
+        PersistEntry e;
+        CliRuleRow row;
+        char *rendered = NULL;
+        size_t rlen = 0;
+        FILE *ms;
+        int comms_seen = 0;
+        const char *p;
+
+        memset(&e, 0, sizeof(e));
+        snprintf(e.binary, sizeof(e.binary), "%s", "sh");
+        for (i = 0; i < PERSIST_CHAIN_MAX; i++)
+            snprintf(e.chain_comm[i], sizeof(e.chain_comm[i]), "c%d", i);
+        snprintf(e.chain_sha512[0], sizeof(e.chain_sha512[0]), "%s",
+                 "SENTINEL-SHA");
+        e.chain_depth = PERSIST_CHAIN_MAX + 4;
+
+        memset(&row, 0, sizeof(row));
+        row.entry = &e;
+        ms = open_memstream(&rendered, &rlen);
+        ASSERT(ms != NULL, "open_memstream for the clamped JSON");
+        if (ms)
+        {
+            cli_ui_render_rule_describe_json(ms, &row);
+            fclose(ms);
+            ASSERT(rendered != NULL &&
+                       strstr(rendered, "\"comm\": \"SENTINEL-SHA\"") == NULL,
+                   "JSON chain never renders a sentinel as a comm");
+            for (p = rendered; p != NULL &&
+                               (p = strstr(p, "\"comm\":")) != NULL; p++)
+                comms_seen++;
+            ASSERT(comms_seen == PERSIST_CHAIN_MAX,
+                   "JSON chain array holds exactly PERSIST_CHAIN_MAX levels");
+            free(rendered);
+        }
     }
 }
 
@@ -765,6 +979,7 @@ int main(void)
     test_truncate_tail();
     test_arg_column();
     test_chain_column();
+    test_chain_depth_clamp();
     test_terminal_width();
     test_rule_table();
     test_pin_table();
@@ -773,6 +988,7 @@ int main(void)
     test_describe();
     test_json();
     test_confirm();
+    test_confirm_line();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

@@ -381,21 +381,66 @@ static int test_persist_malformed_depth(void)
     ASSERT(out[0].chain_depth == PERSIST_CHAIN_MAX, "huge depth clamped");
     free(out);
 
-    const char *garbage =
+    /* A string where a numeric field belongs is a damaged entry: it is
+     * dropped (never admitted with a silently weakened default), while
+     * genuinely numeric out-of-range values keep the documented clamp. */
+    const char *garbage_depth =
         "{\n  \"entries\": [\n    {\n"
         "      \"binary\": \"/usr/bin/evil\",\n"
         "      \"chain_depth\": \"not-a-number\",\n"
         "      \"created_at\": 1\n"
         "    }\n  ]\n}\n";
 
-    ASSERT(write_raw_file(path, garbage) == 0, "write garbage depth file");
+    ASSERT(write_raw_file(path, garbage_depth) == 0,
+           "write garbage depth file");
 
     out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
     ASSERT(out != NULL, "alloc garbage depth output");
 
     n = persist_load(path, out, PERSIST_MAX_ENTRIES);
-    ASSERT(n == 1, "garbage depth entry still loads");
-    ASSERT(out[0].chain_depth == 0, "garbage depth ignored");
+    ASSERT(n == 0, "a string-valued chain_depth drops the entry");
+    free(out);
+
+    const char *garbage_time =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": 1,\n"
+        "      \"created_at\": \"yesterday\"\n"
+        "    }\n  ]\n}\n";
+
+    ASSERT(write_raw_file(path, garbage_time) == 0,
+           "write garbage created_at file");
+
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc garbage created_at output");
+
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "a string-valued created_at drops the entry");
+    free(out);
+
+    /* A valid sibling survives a dropped entry: only the damaged entry
+     * is removed, the rest of the file still loads. */
+    const char *mixed =
+        "{\n  \"entries\": [\n"
+        "    {\n"
+        "      \"binary\": \"/usr/bin/good\",\n"
+        "      \"chain_depth\": 1,\n"
+        "      \"created_at\": 1\n"
+        "    },\n"
+        "    {\n"
+        "      \"binary\": \"/usr/bin/evil\",\n"
+        "      \"chain_depth\": \"not-a-number\",\n"
+        "      \"created_at\": 1\n"
+        "    }\n"
+        "  ]\n}\n";
+
+    ASSERT(write_raw_file(path, mixed) == 0, "write mixed damaged entry");
+    out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc mixed output");
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "only the valid sibling of a damaged entry is admitted");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/good") == 0,
+           "the surviving entry is the valid one");
     free(out);
 
     /* A value beyond long's range must be a defined rejection (strtol
@@ -421,6 +466,61 @@ static int test_persist_malformed_depth(void)
 
     unlink(path);
     TEST_PASS("malformed chain_depth handling");
+    return 0;
+}
+
+/*
+ * D4: chain-slot keys are parsed with strtol plus range and trailing-junk
+ * checks, so a hand-edited or over-long index can never write outside
+ * chain_comm[]/chain_sha512[] (the old sscanf("%d") overflow was
+ * undefined behavior).  Out-of-range and trailing-junk keys are ignored;
+ * the entry still loads with only its valid slots populated.
+ */
+static int test_persist_chain_slot_junk(void)
+{
+    char path[PATH_MAX];
+    const char *content =
+        "{\n  \"entries\": [\n    {\n"
+        "      \"binary\": \"/usr/bin/slot\",\n"
+        "      \"chain_depth\": 2,\n"
+        "      \"created_at\": 5,\n"
+        "      \"chain_comm[0]\": \"sh\",\n"
+        "      \"chain_comm[99999999999999999999]\": \"overflow\",\n"
+        "      \"chain_comm[-1]\": \"negative\",\n"
+        "      \"chain_comm[1]\": \"loader\",\n"
+        "      \"chain_comm[1]junk\": \"trailing-junk\",\n"
+        "      \"chain_comm[3]\": \"out-of-range\",\n"
+        "      \"chain_sha512[99999999999999999999]\": \"bad\",\n"
+        "      \"chain_sha512[0]\": \"d0\",\n"
+        "      \"chain_sha512[3]\": \"bad2\"\n"
+        "    }\n  ]\n}\n";
+
+    make_test_path(path, sizeof(path), "chain_slot_junk.json");
+    unlink(path);
+    ASSERT(write_raw_file(path, content) == 0, "write chain-slot junk file");
+
+    PersistEntry *out = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+    ASSERT(out != NULL, "alloc chain-slot output");
+
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "chain-slot junk entries still load");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/slot") == 0, "entry binary kept");
+    ASSERT(out[0].chain_depth == 2, "chain depth kept");
+    ASSERT(strcmp(out[0].chain_comm[0], "sh") == 0,
+           "in-range chain slot loaded");
+    ASSERT(strcmp(out[0].chain_comm[1], "loader") == 0,
+           "a trailing-junk key does not overwrite the real slot");
+    ASSERT(out[0].chain_comm[2][0] == '\0',
+           "a slot beyond chain_depth stays empty");
+    ASSERT(strcmp(out[0].chain_sha512[0], "d0") == 0,
+           "in-range chain digest loaded");
+    ASSERT(out[0].chain_sha512[1][0] == '\0' &&
+               out[0].chain_sha512[2][0] == '\0',
+           "no out-of-range chain digest slot was written");
+
+    free(out);
+    unlink(path);
+    TEST_PASS("chain-slot index parsing is range-checked");
     return 0;
 }
 
@@ -566,23 +666,36 @@ static int test_persist_over_cap(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  test: state file removal                                           */
+/*  test: a save fully replaces the previous state file               */
 /* ------------------------------------------------------------------ */
 
-static int test_persist_remove(void)
+static int test_persist_save_replaces(void)
 {
     char path[PATH_MAX];
-    make_test_path(path, sizeof(path), "delete_me.json");
+    PersistEntry in[2];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n;
+
+    make_test_path(path, sizeof(path), "replace.json");
     unlink(path);
 
-    PersistEntry dummy[1];
-    memset(dummy, 0, sizeof(dummy));
-    ASSERT(persist_save(path, dummy, 0) == 0, "persist_save for remove test");
-    ASSERT(unlink(path) == 0, "remove existing state file");
-    ASSERT(unlink(path) != 0 && errno == ENOENT,
-           "removing a missing state file reports ENOENT");
+    memset(in, 0, sizeof(in));
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/keep");
+    snprintf(in[0].rule_id, sizeof(in[0].rule_id), RULE_ID_A);
+    snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/drop");
+    snprintf(in[1].rule_id, sizeof(in[1].rule_id), RULE_ID_B);
 
-    TEST_PASS("state file removal");
+    ASSERT(persist_save(path, in, 2) == 0, "save two entries");
+    ASSERT(persist_save(path, in, 1) == 0, "save one entry over it");
+
+    n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "the second save replaced the file, not appended");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/keep") == 0,
+           "the kept entry is intact");
+    ASSERT(strcmp(out[0].rule_id, RULE_ID_A) == 0, "the kept ID is intact");
+
+    unlink(path);
+    TEST_PASS("persist_save replaces the previous state");
     return 0;
 }
 
@@ -638,23 +751,42 @@ static int test_persist_write_text_roundtrip(void)
 
 static int test_persist_write_text_temp_path_guard(void)
 {
+    char dir[PATH_MAX];
     char path[PATH_MAX];
+    size_t dlen;
     size_t n = sizeof(path) - 3; /* strlen(path) == PATH_MAX - 3 */
+    struct stat st;
 
     /*
-     * A filepath whose ".tmp.<pid>" suffix cannot fit in PATH_MAX must
-     * fail the write cleanly.  Without the guard the temp name would be
-     * silently truncated, and the stale-temp retry could unlink a file
-     * at the truncated name.  Short parent ("/tmp") keeps
-     * ensure_parent_dir() out of the way so the temp guard is what is
-     * exercised.
+     * A filepath whose ".tmp.<pid>" suffix cannot fit in the reader's
+     * PATH_MAX buffer must fail the write cleanly.  Without the guard the
+     * temp name would be silently truncated, and the stale-temp retry
+     * could unlink a file at the truncated name.
+     *
+     * The parent is a test-owned 0700 directory: persist_write_text()
+     * refuses a parent whose mode cannot be forced to 0700 (D6), and a
+     * shared /tmp parent would fail there before the temp-length guard
+     * was ever reached.  The test dir keeps the intended guard in play.
      */
-    memcpy(path, "/tmp/", 5);
-    memset(path + 5, 'a', n - 5);
+    snprintf(dir, sizeof(dir), "%s/temp_guard_%d", g_test_dir, (int)getpid());
+    rmdir(dir);
+    ASSERT(mkdir(dir, 0700) == 0, "create the temp-guard parent dir");
+    ASSERT(stat(dir, &st) == 0 && (st.st_mode & 0777) == 0700,
+           "temp-guard parent is 0700");
+
+    dlen = strlen(dir);
+    ASSERT(dlen + 1 < n, "parent dir leaves room for the over-long name");
+    memcpy(path, dir, dlen);
+    path[dlen] = '/';
+    memset(path + dlen + 1, 'a', n - dlen - 1);
     path[n] = '\0';
+    ASSERT(strlen(path) == n, "constructed path hits PATH_MAX - 3");
 
     ASSERT(persist_write_text(path, "x") == -1,
            "over-long temp path fails the write");
+    ASSERT(access(path, F_OK) != 0, "no file left behind by the refusal");
+
+    rmdir(dir);
     TEST_PASS("persist_write_text temp-path truncation refused");
     return 0;
 }
@@ -1296,12 +1428,13 @@ int main(void)
     failed |= test_persist_chain_depths();
     failed |= test_persist_json_escaping();
     failed |= test_persist_malformed_depth();
+    failed |= test_persist_chain_slot_junk();
     failed |= test_persist_truncated();
     failed |= test_persist_no_structure();
     failed |= test_persist_long_line();
     failed |= test_persist_fsync_failure();
     failed |= test_persist_over_cap();
-    failed |= test_persist_remove();
+    failed |= test_persist_save_replaces();
     failed |= test_persist_write_text_roundtrip();
     failed |= test_persist_write_text_temp_path_guard();
     failed |= test_persist_write_text_overwrite();

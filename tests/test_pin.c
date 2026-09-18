@@ -750,7 +750,8 @@ static int test_unwritable_dir_non_root(void)
 
     if (geteuid() == 0)
     {
-        TEST_PASS("unwritable-dir store failure skipped as root");
+        printf("SKIP: unwritable-dir store failure needs an unprivileged "
+               "user\n");
         return 0;
     }
 
@@ -882,6 +883,147 @@ static int test_pin_strict_structure(void)
 
     unlink(path);
     TEST_PASS("pin structure strictness");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  D9: duplicate patterns damage the whole file (fail closed)        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Two rows with the same pattern derive one CLI ID and can never be
+ * managed unambiguously, so the file is damaged as a whole.  The live
+ * table is not silently replaced by either duplicate row: the previously
+ * loaded table stays untrusted (pin_damaged), store refuses, and the file
+ * is left untouched.  Pre-fix the file loaded with both rows and the
+ * table was swapped in.
+ */
+static int test_duplicate_pattern_damaged(void)
+{
+    char path[TPATH];
+    char json[PATH_MAX + 512];
+    char old[129];
+    long stored;
+    const char *pattern = "/usr/bin/dup-pin";
+
+    make_test_path(path, sizeof(path), "duplicate.json");
+    ASSERT(reset_pins(path) == 0, "reset for the duplicate test");
+    ASSERT(pin_store(pattern, SHA_A) == 0, "seed the live pin");
+
+    snprintf(json, sizeof(json),
+             "{\n  \"pins\": [\n"
+             "    {\n"
+             "      \"pattern\": \"%s\",\n"
+             "      \"sha512\": \"" SHA_A "\",\n"
+             "      \"updated_at\": 1000\n"
+             "    },\n"
+             "    {\n"
+             "      \"pattern\": \"%s\",\n"
+             "      \"sha512\": \"" SHA_B "\",\n"
+             "      \"updated_at\": 2000\n"
+             "    }\n"
+             "  ]\n}\n",
+             pattern, pattern);
+    ASSERT(write_raw_file(path, json) == 0, "write duplicate-pattern file");
+    stored = read_file(path);
+    ASSERT(stored > 0, "duplicate-pattern file readable");
+
+    ASSERT(pin_load(path) == -1, "duplicate patterns damage the whole file");
+    ASSERT(pin_damaged() == 1, "duplicate patterns set the damaged flag");
+
+    /* The live table is untrusted, not silently replaced. */
+    ASSERT(pin_check(pattern, SHA_A, old) == PIN_CHECK_DAMAGED,
+           "the previously loaded table is untrusted after the damaged load");
+    ASSERT(pin_store("/usr/bin/new", SHA_A) == -1,
+           "store refuses while the duplicate-damaged file is active");
+    ASSERT(read_file(path) == stored && strstr(g_file_buf, pattern) != NULL,
+           "duplicate-pattern file left untouched");
+
+    /* The pure file API agrees and returns no partial table. */
+    {
+        PinRecord out[4];
+        int damaged = -1;
+
+        ASSERT(pin_load_file(path, out, 4, &damaged) == -1,
+               "pin_load_file rejects duplicate patterns");
+        ASSERT(damaged == 1, "pin_load_file reports the damage");
+        ASSERT(out[0].pattern[0] == '\0', "no partial table is returned");
+    }
+
+    unlink(path);
+    TEST_PASS("duplicate patterns mark the file damaged");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  D11: only [0-9a-f] digests load; uppercase hex is damage           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A digest is exactly 128 lowercase hex characters (sha512sum's canonical
+ * form).  Uppercase hex used to load but could never match, because
+ * pin_check compares byte-for-byte: it is rejected at every boundary -
+ * load, store, check and the pure file API - so the file is damaged
+ * instead of being silently useless.  Pre-fix both the load and the
+ * write accepted the uppercase value.
+ */
+static int test_uppercase_digest_rejected(void)
+{
+    char path[TPATH];
+    char json[PATH_MAX + 512];
+    char upper[129];
+    char old[129];
+    PinRecord rows[1];
+    PinRecord out[2];
+    int damaged = -1;
+    size_t i;
+
+    for (i = 0; i < 128; i++)
+        upper[i] = (SHA_A[i] >= 'a' && SHA_A[i] <= 'f')
+                       ? (char)(SHA_A[i] - 'a' + 'A')
+                       : SHA_A[i];
+    upper[128] = '\0';
+
+    make_test_path(path, sizeof(path), "uppercase.json");
+    unlink(path);
+
+    /* Load: an uppercase digest damages the whole file. */
+    snprintf(json, sizeof(json),
+             "{\n  \"pins\": [\n    {\n"
+             "      \"pattern\": \"/usr/bin/upper\",\n"
+             "      \"sha512\": \"%s\",\n"
+             "      \"updated_at\": 5\n"
+             "    }\n  ]\n}\n",
+             upper);
+    ASSERT(write_raw_file(path, json) == 0, "write uppercase-digest file");
+    pin_set_state_file(path);
+    ASSERT(pin_load(path) == -1, "uppercase digest marks the file damaged");
+    ASSERT(pin_damaged() == 1, "uppercase digest sets the damaged flag");
+
+    /* Store/check: an uppercase digest is an invalid argument. */
+    ASSERT(reset_pins(path) == 0, "reset for the store check");
+    ASSERT(pin_store("/usr/bin/upper", upper) == -1,
+           "pin_store refuses an uppercase digest");
+    ASSERT(pin_check("/usr/bin/upper", upper, old) == PIN_CHECK_DAMAGED,
+           "pin_check refuses an uppercase digest argument");
+
+    /* Pure file API: both load and write reject it. */
+    ASSERT(write_raw_file(path, json) == 0, "rewrite uppercase-digest file");
+    ASSERT(pin_load_file(path, out, 2, &damaged) == -1,
+           "pin_load_file rejects an uppercase digest");
+    ASSERT(damaged == 1, "pin_load_file reports the uppercase damage");
+
+    memset(rows, 0, sizeof(rows));
+    snprintf(rows[0].pattern, sizeof(rows[0].pattern), "%s", "/usr/bin/upper");
+    memcpy(rows[0].sha512, upper, sizeof(rows[0].sha512));
+    rows[0].updated_at = 5;
+    unlink(path);
+    ASSERT(pin_write_file(path, rows, 1) == -1,
+           "pin_write_file refuses an uppercase digest");
+    ASSERT(access(path, F_OK) != 0, "refused write creates no file");
+
+    unlink(path);
+    TEST_PASS("uppercase hex digests are rejected");
     return 0;
 }
 
@@ -1410,6 +1552,8 @@ int main(void)
     failed |= test_unwritable_dir_non_root();
     failed |= test_failed_append_then_store();
     failed |= test_pin_strict_structure();
+    failed |= test_duplicate_pattern_damaged();
+    failed |= test_uppercase_digest_rejected();
     failed |= test_file_api_roundtrip();
     failed |= test_remove_by_id();
     failed |= test_remove_ambiguous_id();

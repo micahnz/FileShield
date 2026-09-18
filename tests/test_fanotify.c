@@ -301,6 +301,7 @@ static void test_exclusions_deny_wins(void) {
     cfg.protected[1].base_len = (int)strlen(base);
     cfg.protected_count = 2;
     cfg.exclude_count = 1;
+    cfg.exclude_idx[0] = 0; /* the exclusion's protected[] index */
 
     Config *saved = g_config;
     g_config = &cfg;
@@ -322,6 +323,35 @@ static void test_exclusions_deny_wins(void) {
            "globstar exclusion matches zero segments");
     ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/id_ed25519.pub") == 1,
            "globstar exclusion matches nested files");
+
+    /*
+     * Non-zero exclusion index: the exclusion sits after the positives in
+     * protected[], so a matcher that assumes exclude_idx == 0 (the old
+     * accidentally-passing setup) would miss it and wrongly treat the
+     * excluded files as protected.
+     */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "%s",
+             "/home/u/.ssh");
+    cfg.protected[0].base_len = (int)strlen(cfg.protected[0].path);
+    snprintf(cfg.protected[1].path, sizeof(cfg.protected[1].path), "%s",
+             "/home/u/.ssh/sub/*.pub");
+    cfg.protected[1].is_glob = 1;
+    cfg.protected[1].is_exclude = 1;
+    cfg.protected[1].base_len = (int)strlen("/home/u/.ssh/sub");
+    snprintf(cfg.protected[2].path, sizeof(cfg.protected[2].path), "%s",
+             "/home/u/.ssh/sub");
+    cfg.protected[2].base_len = (int)strlen(cfg.protected[2].path);
+    cfg.protected_count = 3;
+    cfg.exclude_count = 1;
+    cfg.exclude_idx[0] = 1;
+
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/key.pub") == 1,
+           "exclusion recorded at a non-zero index is honored");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/key") == 0,
+           "the positive entry at index 2 still protects");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/top.pub") == 0,
+           "a non-matching exclusion leaves other paths protected");
 
     g_config = saved;
     inode_set_clear();
@@ -874,7 +904,9 @@ static void test_notify_rate_windows(void)
 /*
  * Unsafe hits surface once per process: the first hit qualifies for the
  * warning + notification, repeats are suppressed, and another process is
- * a new instance.
+ * a new instance.  The gate key is (pid, /proc/<pid>/stat start time):
+ * the same pid number after the process is gone must surface again, so a
+ * pid-only gate fails the last two assertions.
  */
 static void test_unsafe_hit_once_per_process(void)
 {
@@ -886,6 +918,34 @@ static void test_unsafe_hit_once_per_process(void)
            "repeat unsafe hit for the same process is suppressed");
     ASSERT(fanotify_test_unsafe_first_hit(getppid()) == 1,
            "another process is surfaced independently");
+
+    /*
+     * (pid, start) coverage: a live child gets its own key; once it is
+     * reaped, the same pid number has no readable start time (and a
+     * recycled pid would carry a new one), so the gate must treat it as
+     * a new instance instead of inheriting the dead process's decision.
+     */
+    pid_t child = fork();
+    ASSERT(child >= 0, "fork the unsafe-gate child");
+    if (child == 0)
+    {
+        for (;;)
+            pause();
+        _exit(0);
+    }
+    if (child > 0)
+    {
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 1,
+               "the child's first hit is surfaced");
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 0,
+               "the child's repeat hit is suppressed");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 1,
+               "same pid with a different/unknown start is a new instance");
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 0,
+               "the new (pid, start) key is remembered");
+    }
 }
 
 /*
@@ -1752,24 +1812,206 @@ static void test_menu_choice_mapping(void) {
 }
 
 /*
+ * Exec-capable fixture directory for the kdialog stand-ins.
+ *
+ * The dialog tests must fork/exec a helper script, but /tmp is commonly
+ * mounted noexec (the CI environment does exactly that).  The fixture
+ * creates a per-run directory next to the test binary (TMPDIR and /tmp
+ * are fallbacks) and proves it can execute a file with a shebang probe:
+ * when no candidate directory is exec-capable, the dialog tests print
+ * SKIP and return instead of failing.  Every dump path lives in this
+ * directory and is passed to the script through the environment, so no
+ * fixed global path is ever used and parallel runs cannot collide.
+ */
+#define DLG_DIR_MAX (PATH_MAX + 64)
+#define DLG_PATH_MAX (PATH_MAX + 160)
+
+static char g_dlg_dir[DLG_DIR_MAX];
+static int g_dlg_ready = 0;
+
+/* Run a tiny shebang script in 'dir' to prove it can exec. */
+static int dlg_probe_is_exec(const char *dir)
+{
+    char probe[DLG_PATH_MAX];
+    FILE *f;
+    pid_t pid;
+    int status = 0;
+
+    snprintf(probe, sizeof(probe), "%s/probe.sh", dir);
+    f = fopen(probe, "w");
+    if (!f)
+        return -1;
+    fputs("#!/bin/sh\nexit 0\n", f);
+    if (ferror(f) || fclose(f) != 0)
+    {
+        unlink(probe);
+        return -1;
+    }
+    if (chmod(probe, 0700) != 0)
+    {
+        unlink(probe);
+        return -1;
+    }
+
+    pid = fork();
+    if (pid == 0)
+    {
+        execl(probe, probe, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0 || waitpid(pid, &status, 0) != pid)
+    {
+        unlink(probe);
+        return -1;
+    }
+    unlink(probe);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int dlg_fixture_init(void)
+{
+    const char *candidates[4];
+    const char *tmpdir;
+    char exe[PATH_MAX];
+    char exe_dir[PATH_MAX];
+    ssize_t n;
+    int nc = 0;
+    int i;
+
+    if (g_dlg_ready)
+        return 0;
+
+    exe_dir[0] = '\0';
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0)
+    {
+        char *slash;
+
+        exe[n] = '\0';
+        slash = strrchr(exe, '/');
+        if (slash && slash != exe)
+        {
+            *slash = '\0';
+            snprintf(exe_dir, sizeof(exe_dir), "%s", exe);
+            candidates[nc++] = exe_dir;
+        }
+    }
+    tmpdir = getenv("TMPDIR");
+    if (tmpdir && tmpdir[0] != '\0')
+        candidates[nc++] = tmpdir;
+    candidates[nc++] = "/tmp";
+    candidates[nc] = NULL;
+
+    for (i = 0; candidates[i] != NULL; i++)
+    {
+        snprintf(g_dlg_dir, sizeof(g_dlg_dir), "%s/.fileshield_dlg_XXXXXX",
+                 candidates[i]);
+        if (!mkdtemp(g_dlg_dir))
+            continue;
+        if (dlg_probe_is_exec(g_dlg_dir) == 0)
+        {
+            g_dlg_ready = 1;
+            return 0;
+        }
+        rmdir(g_dlg_dir);
+        g_dlg_dir[0] = '\0';
+    }
+    return -1;
+}
+
+static void dlg_fixture_cleanup(void)
+{
+    static const char *const names[] = {
+        "menu.sh", "hashchange.sh", "menu-body.txt", "menu-labels.txt",
+        "menu-default.txt", "hashchange-body.txt", "hashchange-default.txt"};
+    char path[DLG_PATH_MAX];
+    size_t i;
+
+    if (!g_dlg_ready)
+        return;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, names[i]);
+        unlink(path);
+    }
+    rmdir(g_dlg_dir);
+    g_dlg_ready = 0;
+}
+
+/* Create one fixture script inside the exec-capable directory. */
+static int dlg_write_script(const char *name, const char *body)
+{
+    char path[DLG_PATH_MAX];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, name);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs(body, f);
+    if (ferror(f) || fclose(f) != 0)
+        return -1;
+    return chmod(path, 0700);
+}
+
+/* Read one dump file from the fixture directory into out. */
+static long dlg_read_dump(const char *name, char *out, size_t outsz)
+{
+    char path[DLG_PATH_MAX];
+    FILE *f;
+    size_t n;
+
+    snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, name);
+    f = fopen(path, "r");
+    if (!f)
+    {
+        out[0] = '\0';
+        return -1;
+    }
+    n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return (long)n;
+}
+
+/*
  * Menu end-to-end: drive the real notify_ask -> run_kdialog_menu fork
  * with a scripted kdialog stand-in (notify_test_set_kdialog_path), so
  * the child's argv shape, the stdout pipe drain and the token->decision
  * mapping are proven together — without needing a desktop click.
  * The script asserts the KF6 --menu shape (kdialog --title Fileshield
  * --menu BODY + 6 tag/label pairs = 16 args after argv[0]) and then
- * behaves per FAKE_KDIALOG_MODE.
+ * behaves per FAKE_KDIALOG_MODE.  Dump paths arrive via the environment
+ * (per-run, next to the test binary) instead of fixed /tmp names, so the
+ * test works where /tmp is noexec and parallel runs stay independent.
  */
 static void test_menu_end_to_end(void) {
     log_msg(LOG_DEBUG, "warm up syslog before menu child fork");
 
-    char script[PATH_MAX];
-    snprintf(script, sizeof(script), "/tmp/fileshield_fakekdialog_%d.sh",
-             (int)getpid());
-    FILE *f = fopen(script, "w");
-    ASSERT(f != NULL, "create fake kdialog script");
-    if (!f)
+    /* Root without a detected desktop session makes notify_ask() fail
+     * closed before any dialog; that is a genuine environment skip. */
+    if (getuid() == 0) {
+        printf("SKIP: dialog tests run unprivileged (root prompts need a "
+               "detected desktop session)\n");
         return;
+    }
+    if (dlg_fixture_init() < 0) {
+        printf("SKIP: no exec-capable temp directory for the fake-kdialog "
+               "script (all candidates are noexec or read-only)\n");
+        return;
+    }
+
+    char script[DLG_PATH_MAX];
+    char body_dump[DLG_PATH_MAX];
+    char labels_dump[DLG_PATH_MAX];
+    char default_dump[DLG_PATH_MAX];
+    snprintf(script, sizeof(script), "%s/menu.sh", g_dlg_dir);
+    snprintf(body_dump, sizeof(body_dump), "%s/menu-body.txt", g_dlg_dir);
+    snprintf(labels_dump, sizeof(labels_dump), "%s/menu-labels.txt",
+             g_dlg_dir);
+    snprintf(default_dump, sizeof(default_dump), "%s/menu-default.txt",
+             g_dlg_dir);
+
     /* timeout execs the script with argv[0] = script path, so:
      * $1=--title $2=Fileshield $3=--menu $4=BODY $5=first TAG $6=first
      * label ... $16=last label, then $17=--default $18=deny label
@@ -1779,27 +2021,34 @@ static void test_menu_end_to_end(void) {
      * the tag/item alignment.  The --default pair must name the Deny
      * Once row so a confirm with no selection denies instead of
      * granting. */
-    fputs("#!/bin/sh\n"
-          "[ \"$#\" -eq 18 ] || exit 0\n"
-          "[ \"$1\" = \"--title\" ] || exit 0\n"
-          "[ \"$3\" = \"--menu\" ] || exit 0\n"
-          "[ \"$5\" = \"once\" ] || exit 0\n"
-          "[ \"${17}\" = \"--default\" ] || exit 0\n"
-          "case \"$FAKE_KDIALOG_MODE\" in\n"
-          "  pick) echo once; exit 0 ;;\n"
-          "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
-          "  empty-ok) exit 0 ;;\n"
-          "  dump) printf '%s' \"$4\" > /tmp/fileshield_body_dump; "
-          "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
-          "\"${14}\" \"${16}\" > /tmp/fileshield_labels_dump; "
-          "printf '%s|%s' \"${17}\" \"${18}\" "
-          "> /tmp/fileshield_default_dump; "
-          "echo once; exit 0 ;;\n"
-          "esac\n"
-          "exit 1\n",
-          f);
-    fclose(f);
-    chmod(script, 0755);
+    ASSERT(dlg_write_script(
+               "menu.sh",
+               "#!/bin/sh\n"
+               "[ \"$#\" -eq 18 ] || exit 0\n"
+               "[ \"$1\" = \"--title\" ] || exit 0\n"
+               "[ \"$3\" = \"--menu\" ] || exit 0\n"
+               "[ \"$5\" = \"once\" ] || exit 0\n"
+               "[ \"${17}\" = \"--default\" ] || exit 0\n"
+               "case \"$FAKE_KDIALOG_MODE\" in\n"
+               "  pick) echo once; exit 0 ;;\n"
+               "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
+               "  empty-ok) exit 0 ;;\n"
+               "  dump) printf '%s' \"$4\" > \"$FAKE_KDIALOG_BODY_DUMP\"; "
+               "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
+               "\"${14}\" \"${16}\" > \"$FAKE_KDIALOG_LABELS_DUMP\"; "
+               "printf '%s|%s' \"${17}\" \"${18}\" "
+               "> \"$FAKE_KDIALOG_DEFAULT_DUMP\"; "
+               "echo once; exit 0 ;;\n"
+               "esac\n"
+               "exit 1\n") == 0,
+           "write fake kdialog menu script");
+
+    /* The script's dumps are read by the parent after the child exits;
+     * the over-long buffer bounds are compile-time only (VAR names are
+     * short), so the snprintf result is not checked. */
+    (void)setenv("FAKE_KDIALOG_BODY_DUMP", body_dump, 1);
+    (void)setenv("FAKE_KDIALOG_LABELS_DUMP", labels_dump, 1);
+    (void)setenv("FAKE_KDIALOG_DEFAULT_DUMP", default_dump, 1);
 
     NotifyRequest req;
     memset(&req, 0, sizeof(req));
@@ -1841,20 +2090,13 @@ static void test_menu_end_to_end(void) {
     /*
      * Dump mode: pin the design contract of the text a real kdialog
      * would render, plus the row labels — verified as text, no GUI.
-     * The dumps stay in /tmp for manual inspection (overwritten on
-     * every run).
+     * The per-run dumps are removed by dlg_fixture_cleanup().
      */
     ASSERT(setenv("FAKE_KDIALOG_MODE", "dump", 1) == 0, "set dump mode");
     ASSERT(notify_ask(&req) == NOTIFY_ALLOW_ONCE, "dump run still grants");
 
     char dump[4096];
-    size_t dlen = 0;
-    FILE *df = fopen("/tmp/fileshield_body_dump", "r");
-    if (df) {
-        dlen = fread(dump, 1, sizeof(dump) - 1, df);
-        fclose(df);
-    }
-    dump[dlen] = '\0';
+    long dlen = dlg_read_dump("menu-body.txt", dump, sizeof(dump));
     ASSERT(dlen > 0, "rendered body dump written");
     ASSERT(strstr(dump, "<div align=\"left\">") != NULL,
            "body pinned left-aligned against kdialog's center label");
@@ -1892,13 +2134,8 @@ static void test_menu_end_to_end(void) {
            "old wordy Allow Always description is gone");
 
     char labels[512];
-    size_t llen = 0;
-    FILE *lf = fopen("/tmp/fileshield_labels_dump", "r");
-    if (lf) {
-        llen = fread(labels, 1, sizeof(labels) - 1, lf);
-        fclose(lf);
-    }
-    labels[llen] = '\0';
+    long llen = dlg_read_dump("menu-labels.txt", labels, sizeof(labels));
+    ASSERT(llen > 0, "labels dump written");
     ASSERT(strcmp(labels,
                   "Allow Once - this file and process, cached 60 seconds|"
                   "Allow Session - this binary and file until the session ends|"
@@ -1912,19 +2149,132 @@ static void test_menu_end_to_end(void) {
     /* A confirm with no deliberate selection must deny, not grant: the
      * --default row is the deny row. */
     char defdump[128];
-    size_t fllen = 0;
-    FILE *ddf = fopen("/tmp/fileshield_default_dump", "r");
-    if (ddf) {
-        fllen = fread(defdump, 1, sizeof(defdump) - 1, ddf);
-        fclose(ddf);
-    }
-    defdump[fllen] = '\0';
+    long fllen = dlg_read_dump("menu-default.txt", defdump, sizeof(defdump));
+    ASSERT(fllen > 0, "default dump written");
     ASSERT(strcmp(defdump,
                   "--default|Deny Once - block this access only") == 0,
            "no-selection confirm defaults to Deny Once (deny, never allow)");
 
     notify_test_set_kdialog_path(NULL);
-    unlink(script);
+}
+
+/*
+ * Hash-change yesnocancel end-to-end (B1 regression): the scripted
+ * kdialog stand-in asserts the exact argv shape (12 args, the
+ * --yesnocancel pair, the three labels and --default Deny) and dumps the
+ * body, so the test can prove every interpolated value is HTML-escaped.
+ * Pre-fix the body carried raw <, > and & (markup injection) and no
+ * --default existed, so Enter approved a re-pin: this fails on both
+ * counts there.
+ */
+static void test_hash_change_prompt_escapes(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before hash-change child fork");
+
+    if (getuid() == 0) {
+        printf("SKIP: dialog tests run unprivileged (root prompts need a "
+               "detected desktop session)\n");
+        return;
+    }
+    if (dlg_fixture_init() < 0) {
+        printf("SKIP: no exec-capable temp directory for the fake-kdialog "
+               "script (all candidates are noexec or read-only)\n");
+        return;
+    }
+
+    char script[DLG_PATH_MAX];
+    char body_dump[DLG_PATH_MAX];
+    char default_dump[DLG_PATH_MAX];
+    snprintf(script, sizeof(script), "%s/hashchange.sh", g_dlg_dir);
+    snprintf(body_dump, sizeof(body_dump), "%s/hashchange-body.txt",
+             g_dlg_dir);
+    snprintf(default_dump, sizeof(default_dump), "%s/hashchange-default.txt",
+             g_dlg_dir);
+
+    /*
+     * timeout execs the script, so $1..$12 are the kdialog arguments:
+     * --title Fileshield --yesnocancel BODY --yes-label "Update & Allow"
+     * --no-label Deny --cancel-label Cancel --default Deny.
+     * Any mismatch writes a diagnostic to the body dump and exits; a
+     * missing dump then fails the assertions below (that is how the
+     * pre-fix argv fails this test).
+     */
+    ASSERT(dlg_write_script(
+               "hashchange.sh",
+               "#!/bin/sh\n"
+               "body=\"$FAKE_KDIALOG_YESNO_BODY_DUMP\"\n"
+               "[ \"$#\" -eq 12 ] || { printf 'argv-count:%s' \"$#\" > "
+               "\"$body\"; exit 1; }\n"
+               "[ \"$1\" = \"--title\" ] && [ \"$2\" = \"Fileshield\" ] || "
+               "{ printf 'argv-title' > \"$body\"; exit 1; }\n"
+               "[ \"$3\" = \"--yesnocancel\" ] || { printf 'argv-mode' > "
+               "\"$body\"; exit 1; }\n"
+               "[ \"$5\" = \"--yes-label\" ] && [ \"$6\" = \"Update & "
+               "Allow\" ] || { printf 'argv-yes-label' > \"$body\"; exit 1; "
+               "}\n"
+               "[ \"$7\" = \"--no-label\" ] && [ \"$8\" = \"Deny\" ] || { "
+               "printf 'argv-no-label' > \"$body\"; exit 1; }\n"
+               "[ \"$9\" = \"--cancel-label\" ] && [ \"${10}\" = \"Cancel\" "
+               "] || { printf 'argv-cancel-label' > \"$body\"; exit 1; }\n"
+               "printf '%s|%s' \"${11}\" \"${12}\" > "
+               "\"$FAKE_KDIALOG_YESNO_DEFAULT_DUMP\"\n"
+               "printf '%s' \"$4\" > \"$body\"\n"
+               "case \"$FAKE_KDIALOG_YESNO_MODE\" in approve) exit 0 ;; esac\n"
+               "exit 1\n") == 0,
+           "write fake kdialog hash-change script");
+
+    (void)setenv("FAKE_KDIALOG_YESNO_BODY_DUMP", body_dump, 1);
+    (void)setenv("FAKE_KDIALOG_YESNO_DEFAULT_DUMP", default_dump, 1);
+
+    /* Every field carries markup an attacker could use to forge the
+     * body; all of them must arrive as entities. */
+    NotifyHashChange req;
+    memset(&req, 0, sizeof(req));
+    req.rule_pattern = "/opt/<tool>&co";
+    req.exe = "/usr/bin/<exe>&runner";
+    req.old_hash = PIN_SHA_A;
+    req.new_hash = PIN_SHA_B;
+    req.path = "/home/u/<secret>&file";
+    req.cmdline = "run --x <y> & z";
+    req.pid = getpid();
+    req.user_uid = getuid();
+
+    notify_test_set_kdialog_path(script);
+
+    ASSERT(setenv("FAKE_KDIALOG_YESNO_MODE", "deny", 1) == 0, "deny mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_DENY,
+           "hash-change deny mode denies (old pin kept)");
+
+    char dump[8192];
+    ASSERT(dlg_read_dump("hashchange-body.txt", dump, sizeof(dump)) > 0,
+           "hash-change body dump written (argv shape matched)");
+    ASSERT(strstr(dump, "/opt/&lt;tool&gt;&amp;co") != NULL,
+           "rule pattern is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/usr/bin/&lt;exe&gt;&amp;runner") != NULL,
+           "binary path is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/home/u/&lt;secret&gt;&amp;file") != NULL,
+           "target path is HTML-escaped in the body");
+    ASSERT(strstr(dump, "run --x &lt;y&gt; &amp; z") != NULL,
+           "command line is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/opt/<tool>") == NULL &&
+               strstr(dump, "<exe>") == NULL &&
+               strstr(dump, "<secret>") == NULL &&
+               strstr(dump, "<y>") == NULL,
+           "no raw interpolated markup anywhere in the body");
+
+    char defdump[64];
+    ASSERT(dlg_read_dump("hashchange-default.txt", defdump,
+                         sizeof(defdump)) > 0,
+           "hash-change default dump written");
+    ASSERT(strcmp(defdump, "--default|Deny") == 0,
+           "--default preselects the deny button (Enter never re-pins)");
+
+    /* An explicit approve (kdialog exit 0) still updates the pin. */
+    ASSERT(setenv("FAKE_KDIALOG_YESNO_MODE", "approve", 1) == 0,
+           "approve mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_ALLOW_ALWAYS,
+           "explicit approve grants the update");
+
+    notify_test_set_kdialog_path(NULL);
 }
 
 /*
@@ -2838,7 +3188,26 @@ static void test_kernel_bounded_queue_overflow(void) {
         }
     }
 
+    /*
+     * Bound the drain to the kernel queue limit: fs.fanotify
+     * max_queued_events (the kernel default is 16384).  The previous
+     * `events_drained < SAT_FILES` was satisfied even by an unbounded
+     * queue that drained all 20000, hiding the drop this test proves.
+     * One extra slot tolerates the FAN_Q_OVERFLOW pseudo-event the kernel
+     * may deliver alongside the bounded queue.
+     */
+    long queue_max = 16384; /* fanotify(7) kernel default */
+    FILE *qf = fopen("/proc/sys/fs/fanotify/max_queued_events", "r");
+    if (qf)
+    {
+        long v = 0;
+        if (fscanf(qf, "%ld", &v) == 1 && v > 0)
+            queue_max = v;
+        fclose(qf);
+    }
     ASSERT(overflow_seen, "FAN_Q_OVERFLOW reported after saturation");
+    ASSERT(events_drained <= queue_max + 1,
+           "the bounded queue held at most max_queued_events");
     ASSERT(events_drained < SAT_FILES,
            "bounded queue dropped events instead of growing unbounded");
 
@@ -3535,6 +3904,7 @@ int main(void) {
     test_kdialog_status_mapping();
     test_menu_choice_mapping();
     test_menu_end_to_end();
+    test_hash_change_prompt_escapes();
     test_html_escape();
     test_verdict_stage_order();
     test_session_allow_requires_digest();
@@ -3581,6 +3951,7 @@ int main(void) {
     test_cmdline_fingerprint_overflow();
     test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
+    dlg_fixture_cleanup();
     dyn_fixture_cleanup();
     pin_fixture_cleanup();
     if (failures) {
