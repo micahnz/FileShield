@@ -3014,6 +3014,80 @@ static void test_pump_flag_claims_inflight_buffer(void) {
 }
 
 /*
+ * Part 0c-quinquies: queue saturation while a dialog is open must deny
+ * every deferred event (the pump's FAN_Q_OVERFLOW handler).  A regression
+ * that drops the flush would leave the suspended opens to auto-ALLOW at
+ * group close -- the fail-open the handler exists to close.
+ */
+static void test_pump_overflow_flushes_deferred(void) {
+    int sv[2] = { -1, -1 };
+    int efd[2] = { -1, -1 };
+    static char rec[sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)rec;
+
+    log_msg(LOG_DEBUG, "warm up syslog before overflow pump socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    for (int i = 0; i < 2; i++) {
+        struct fanotify_event_metadata ev;
+
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open deferred event fd");
+        if (efd[i] < 0)
+            break;
+        memset(&ev, 0, sizeof(ev));
+        ev.event_len = sizeof(ev);
+        ev.vers = FANOTIFY_METADATA_VERSION;
+        ev.mask = FAN_OPEN_PERM;
+        ev.fd = efd[i];
+        ev.pid = (int)getpid();
+        ASSERT(fanotify_defer_event(&ev) == 0,
+               "defer an event before the overflow record");
+    }
+
+    memset(rec, 0, sizeof(rec));
+    md->event_len = sizeof(*md);
+    md->metadata_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->mask = FAN_Q_OVERFLOW;
+    md->fd = FAN_NOFD;
+    md->pid = (int)getpid();
+    ASSERT(write(sv[1], rec, sizeof(*md)) == (ssize_t)sizeof(*md),
+           "feed the FAN_Q_OVERFLOW record");
+
+    int r = fanotify_pump(sv[0], getpid());
+    ASSERT(r >= 0, "pump handles the overflow record");
+    ASSERT(fanotify_test_active_dialog_pid() == 0,
+           "dialog pid restored after the overflow pump");
+
+    struct fanotify_response resp;
+    for (int i = 0; i < 2; i++) {
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[i] &&
+                   resp.response == FAN_DENY,
+               "deferred event denied on queue overflow (fail closed)");
+        ASSERT(fcntl(efd[i], F_GETFD) == -1 && errno == EBADF,
+               "deferred event fd closed after the overflow denial");
+    }
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
  * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
  * retried on the next clear) instead of being forgotten, which would
  * leave an untracked kernel mark behind.  A negative fd means no group
@@ -3056,6 +3130,11 @@ static void test_cmdline_fingerprint_overflow(void) {
 
     pid_t pid = fork();
     ASSERT(pid >= 0, "fork long-argv child");
+    if (pid < 0) {
+        /* Never let a failed fork turn kill(pid) into kill(-1). */
+        free(arg);
+        return;
+    }
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0)
@@ -3912,6 +3991,7 @@ int main(void) {
     test_pump_dialog_group_allow();
     test_pump_bounded_and_lossless();
     test_pump_flag_claims_inflight_buffer();
+    test_pump_overflow_flushes_deferred();
     test_pin_change_defers_in_pump();
     test_unsafe_allowlist_wins_over_pinned();
     test_dialog_rate_limiter();
