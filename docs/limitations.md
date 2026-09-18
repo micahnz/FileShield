@@ -1,0 +1,22 @@
+# Limitations
+
+- **Root processes**: A process running as root can bypass fanotify. Fileshield protects against unprivileged or compromised user-space processes.
+- **GUI dependency**: Requires a desktop session for popups. On non-KDE desktops the popup matches the system theme only when a Qt platform theme integration is installed (e.g. `qgnomeplatform`/adwaita-qt for GNOME, `qt6ct`).
+- **Kernel version**: `fanotify` permission events on directories require kernel 5.0+.
+- **Networked filesystems**: `fanotify` marks do not propagate to NFS/CIFS mounts.
+- **Bind mounts and `mmap`**: `fanotify` only reports events on the mount the mark was placed on and does not report `mmap(2)` accesses. Bind-mount aliases and processes with open descriptors are outside the threat model.
+- **Hard links**: Protected paths are canonicalized at load, so symlinked homes are matched. Files present at startup are tracked by inode; opening one through a path outside every protected prefix always prompts. Files created after startup, deeper than 8 levels, or past the 32,768-entry inode table cap are not tracked. `FAN_REPORT_FID` is a planned follow-up.
+- **TOCTOU on binary identity**: The daemon resolves `/proc/<pid>/exe` while the process is kernel-suspended. The process cannot `execve()` at that moment, but its binary on disk could theoretically be replaced between `readlink()` and the allowlist check. Inherent to all fanotify-based permission systems; low-risk in practice.
+- **Dialog rate limiting**: 20 prompts per binary within 60 s → 30 s deny cooldown. 40 prompts across all binaries within 60 s (flood that rotates paths hits fresh per-binary entries, so the global budget bounds it), same cooldown.
+- **Reload is not atomic**: marks are cleared before the new set is installed — a short unmediated window during admin-triggered reload. The resulting mark set is always the configured one or the daemon shuts down.
+- **GUI consent is session-scoped**: a same-uid process can in principle forge GUI input (X11 synthetic events, planted Wayland socket). The prompt protects against other users and unattended access, not a fully compromised session.
+- **Command-line matching**: _Always_ entries pin the exact command line, so tools whose arguments change every run re-prompt. Use _Allow Session_ or _Allow Once_ for those.
+- **Allowlist pins keyed by pattern**: a glob rule pins the pattern itself, so two binaries matching the same rule share one pin — switching between them prompts. Use `[unsafe_allowlist]` for tools with binary churn. A pin file with two rows sharing one pattern is treated as damaged and falls back to prompting. Table capped at 256 entries (oldest evicted).
+- **Allowlisted binaries must be hashable**: a binary under a protected path is not hashed, and fork/timeout failures leave the digest unavailable — `[allowlist]` match falls back to the prompt. A damaged `allowlist-hashes.json` fails closed until repaired. A failed hash is retried once per 60 s per binary.
+- **Denylist rules are never hash-checked**: a deny blocks the access regardless of which binary matches.
+- **Pin removal goes through the daemon**: CLI deletes pins via the control socket; the change dialog is the only way to add or update one. `allowlist-hashes.json` is root-readable; a repaired file takes effect on reload.
+- **Control socket**: mutations travel over `/run/fileshield/control.sock` (root-owned, 0600, peer uid checked, bounded non-blocking reads). The directory is created 0700 by the systemd unit or on demand by a foreground run. `list`/`describe` read state files directly; mutations fall back to direct edits only when no listener answers.
+- **No CLI for adding rules or pins**: kdialog remains the only grant channel. `fileshield-cli` can list, describe, remove, clear, prune, manage sessions and request reload — but not create.
+- **Config limits are hard refusals**: more than **1024** protected entries (each `~/…` expands once per real user) or more than **128** rules in any section rejects the whole config. Startup exits; reload keeps the previous config.
+- **Shipped default list assumes ≤12 real users**: 91 `~/…` entries × 12 users exceeds the 1024 cap. Trim on shared hosts.
+- **Notifications are best-effort and attacker-triggerable**: need a desktop session and `notify-send`; deduplicated (`notify_dedup_ttl`), capped (`notify_max` per 60 s), unsafe hits once per process. The journal is the record.
