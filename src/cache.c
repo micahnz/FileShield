@@ -92,7 +92,11 @@ int cache_lookup(pid_t pid, const char *binary, const char *target)
             continue;
         }
 
-        if (cache[i].expiry_time < now)
+        /* <= : a slot whose remaining TTL is zero is expired.  With <
+         * it would return 0 ("covers nothing") while the header
+         * promises "> 0 when covered", leaving a boundary second in
+         * which the entry looks live but reports a miss. */
+        if (cache[i].expiry_time <= now)
         {
             cache[i].pid = 0;
             continue;
@@ -198,7 +202,8 @@ void cache_expire(void)
     {
         if (cache[i].pid == 0)
             continue;
-        if (cache[i].expiry_time < now)
+        /* Matches cache_lookup: zero remaining TTL is expired. */
+        if (cache[i].expiry_time <= now)
             cache[i].pid = 0;
     }
 }
@@ -210,5 +215,12 @@ void cache_clear(void)
     else
         memset(cache, 0, sizeof(cache));
     cache_high = 0; /* empty table: restart the scan bound at zero */
+}
+
+/* Test seam (cache.h): table capacity, so the full-table drop behavior
+ * is testable without hardcoding the internal size. */
+int cache_test_capacity(void)
+{
+    return CACHE_MAX_ENTRIES;
 }
 

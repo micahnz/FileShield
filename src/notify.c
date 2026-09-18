@@ -161,22 +161,58 @@ static int merge_proc_environ(const char *buf, size_t len,
     return count;
 }
 
+/*
+ * Test seam (notify.h): run merge_proc_environ over a synthetic
+ * NUL-separated blob (like /proc/<pid>/environ).  Returns the number of
+ * collected entries and, when out/outsz are non-NULL, copies the value
+ * collected for key ("" when the key was not collected).
+ */
+int notify_test_merge_env(const char *blob, size_t len, const char *key,
+                          char *out, size_t outsz)
+{
+    DialogEnvSetting merged[DIALOG_ENV_MAX];
+    int count;
+
+    memset(merged, 0, sizeof(merged));
+    count = merge_proc_environ(blob, len, merged, 0, DIALOG_ENV_MAX);
+    if (out && outsz > 0)
+    {
+        out[0] = '\0';
+        for (int i = 0; i < count; i++)
+            if (strcmp(merged[i].key, key) == 0)
+                snprintf(out, outsz, "%s", merged[i].value);
+    }
+    return count;
+}
+
 static int read_proc_environ(pid_t pid, char *buf, size_t bufsz)
 {
     char path[64];
     int fd;
-    ssize_t n;
+    ssize_t total = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", (int)pid);
     fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    n = read(fd, buf, bufsz - 1);
+
+    /* Drain what fits: a short read is not EOF on procfs, and SIGHUP
+     * (handlers run without SA_RESTART) must not silently drop the
+     * user's environment -- the dialog would lose its theme variables. */
+    while (total < (ssize_t)bufsz - 1)
+    {
+        ssize_t n = read(fd, buf + total, bufsz - 1 - (size_t)total);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        total += n;
+    }
     close(fd);
-    if (n <= 0)
+    if (total <= 0)
         return -1;
-    buf[n] = '\0';
-    return (int)n;
+    buf[total] = '\0';
+    return (int)total;
 }
 
 /*
@@ -1472,7 +1508,10 @@ static int g_notify_send_ok = 0;
 static int notify_rate_allow(int kind, const char *binary, const char *target,
                              int dedup_seconds, int max_per_window)
 {
-    time_t now = time(NULL);
+    /* The project deadline clock: wall-clock steps must not extend the
+     * dedup suppression of a security tripwire or reset the flood
+     * budget early (mono_seconds, see utils.h). */
+    time_t now = mono_seconds();
     int cap = max_per_window > 0 ? max_per_window : NOTIFY_GLOBAL_MAX;
 
     if (now - g_notify_window_start >= NOTIFY_GLOBAL_WINDOW_S)
@@ -1666,8 +1705,16 @@ static void spawn_notify_send(const DisplaySession *session,
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
             ;
     }
-    /* A 127 exit means exec failed (notify-send may have been removed
-     * since the cached check): re-check it on the next hit. */
+    /*
+     * The intermediate exits 0 as soon as it has forked the helper, so
+     * the only 127 observable here is its own fork() failure — a
+     * transient condition, NOT "notify-send is gone": the helper's exec
+     * failure happens in the reparented grandchild and is deliberately
+     * unobservable (fire-and-forget).  A genuinely missing helper is
+     * caught by notify_send_available()'s access() probe on the next
+     * hit.  Reset the cached availability so that next hit re-probes
+     * before spending another fork pair.
+     */
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
         g_notify_send_ok = 0;
 }

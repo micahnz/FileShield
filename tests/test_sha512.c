@@ -157,6 +157,34 @@ static void test_string_differential(void)
         ASSERT(strcmp(hex_file, hex_str) == 0,
                "in-process digest matches sha512sum");
     }
+
+    /*
+     * Padding rollover: when len % 128 is in [112, 127] the 0x80 pad
+     * plus the 16-byte length field no longer fit the final block and
+     * the length must land in a second block.  Every fixed sample above
+     * misses that branch, so cover the whole boundary here.
+     */
+    for (size_t len = 111; len <= 128; len++)
+    {
+        char buf[129];
+        for (size_t k = 0; k < len; k++)
+            buf[k] = (char)('a' + (int)(k % 26));
+        buf[len] = '\0';
+
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ASSERT(fd >= 0, "open rollover temp file");
+        if (fd < 0)
+            return;
+        ASSERT(write(fd, buf, len) == (ssize_t)len, "write rollover sample");
+        close(fd);
+
+        char hex_file[129], hex_str[129];
+        ASSERT(sha512_file(path, hex_file) == 0, "helper digest (rollover)");
+        ASSERT(sha512_string(buf, hex_str) == 0,
+               "in-process digest (rollover)");
+        ASSERT(strcmp(hex_file, hex_str) == 0,
+               "rollover-length digest matches sha512sum");
+    }
     unlink(path);
 }
 

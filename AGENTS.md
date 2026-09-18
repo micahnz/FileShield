@@ -25,18 +25,28 @@ Fileshield/
 │   ├── persist.c / persist.h    # runtime allow/deny JSON state files
 │   ├── pin.c / pin.h            # [allowlist] SHA-512 pins (TOFU, 256-entry table, change state)
 │   ├── reload.c / reload.h      # SIGHUP reload: mark install, state/pin loading, reject/rollback
+│   ├── ruleid.c / ruleid.h      # stored rule IDs: canonical identity + nonce, prefix lookup, pin IDs
+│   ├── prune.c / prune.h        # pure duplicate grouping over persisted rule lists (newest kept)
+│   ├── control.c / control.h    # root-only control socket server: mutation and session dispatch
+│   ├── control_client.c / control_client.h # control wire protocol + CLI client helper
+│   ├── cli_ui.c / cli_ui.h      # pure CLI rendering (tables, describe, JSON) + confirmation gate
+│   ├── cli.c                    # fileshield-cli: list/describe/remove/clear/prune/session/reload
 │   ├── sha512.c / sha512.h      # digests: helper fork for files, in-process strings/buffers
 │   └── utils.c / utils.h        # /proc helpers, path matching, logging, home expansion
 └── tests/
     ├── test_cache.c             # unit tests for cache module
     ├── test_config.c            # unit tests for config parser
-    ├── test_session.c           # unit tests for session decisions
-    ├── test_persist.c           # unit tests for JSON state files
-    ├── test_pin.c               # unit tests for allowlist hash pins
+    ├── test_session.c           # session decisions (stored IDs, snapshot sweep, remove by ID)
+    ├── test_persist.c           # JSON state files (rule_id round-trip, legacy migration)
+    ├── test_pin.c               # allowlist hash pins (file API, remove/clear, eviction)
     ├── test_reload.c            # reload decision path (parse failure, rollback, shutdown)
     ├── test_sha512.c            # known-answer + differential digest tests
     ├── test_inode.c             # protected-inode set (exact keys, overflow)
-    ├── test_fanotify.c          # mark mask, deferred queue, fingerprints, state loading
+    ├── test_fanotify.c          # mark mask, deferred queue, state loading, IDs, mutations
+    ├── test_ruleid.c            # rule ID canonicalization, nonces, prefix lookup
+    ├── test_prune.c             # duplicate grouping and removal compaction
+    ├── test_cli_ui.c            # table/describe/JSON rendering, truncation, confirmation
+    ├── test_control.c           # control protocol codec, request parsing, dispatch, socket lifecycle
     ├── test_utils.c             # unit tests for utility functions
     └── bench_hotpath.c          # `make bench` microbenchmarks (not part of `make test`)
 ```
@@ -48,8 +58,14 @@ Headers are the source of truth for signatures; this table is the map.
 | Module         | Owns                                                                                                                                                                                                                                                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.c`       | daemonize, signal flags, startup orchestration                                                                                                                                                                                                                                |
-| `reload.c/h`   | mark installation, persisted-state and pin-table loading, `reload_protection()` with fail-closed reject/rollback (unit-tested with `fan_fd = -1`) |
-| `fanotify.c/h` | fanotify init, inode marks and init-namespace mount marks via `/proc/1/root` (glob entries mark their static base), startup scope guard, protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists, config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, failed-response retry queue (event fds stay open until answered or force-denied before group close), dialog pump (full-pipeline defer-mode evaluation: rule/cache decisions land mid-dialog, only genuine asks defer) |
+| `reload.c/h`   | mark installation, persisted-state loading (including legacy rule-ID migration) and pin-table loading, `reload_protection()` with fail-closed reject/rollback (unit-tested with `fan_fd = -1`) |
+| `ruleid.c/h`   | stored rule IDs: 16-hex prefix of SHA-512 over the canonical NUL-separated identity (binary, binary SHA-512, target, cmdline SHA-512, chain, `created_at`) with a collision nonce, uniqueness against the list, pin IDs derived from the pattern, `>= 8`-char prefix lookup with ambiguity detection |
+| `prune.c/h`    | pure, offline duplicate grouping over `PersistEntry` arrays (binary + target + raw cmdline + call chain; newest kept), removal-index validation and in-place compaction — never hashes a binary or opens a path |
+| `control.c/h`  | root-only `/run/fileshield.sock` (0600, `SO_PEERCRED` same-uid check, non-blocking, one bounded read per connection), request parsing and dispatch into the rule/pin/session mutation APIs, `RELOAD` flag, session snapshot serialization |
+| `control_client.c/h` | control wire protocol shared by daemon and CLI: JSON field codec, response parser, `control_client_call()`; libc + `persist.h` only, so `fileshield-cli` links without daemon state |
+| `cli_ui.c/h`   | pure CLI rendering: sanitization, tail truncation, rule/pin/session tables, kubectl-style describe, JSON output, totals footer, confirmation policy/parse |
+| `cli.c`        | `fileshield-cli` main: global flags (`-y`, `-n`, `--wide`, `--json`), command dispatch, state-file reads, socket calls with the stopped-daemon direct-file fallback for rules/pins, exit codes 0/1/2 |
+| `fanotify.c/h` | fanotify init, inode marks and init-namespace mount marks via `/proc/1/root` (glob entries mark their static base), startup scope guard, protected-path verdict (glob + `!` exclusion match, deny wins), per-event decision pipeline, runtime allow/deny lists (`DynEntry.rule_id` + real per-entry `created_at`, legacy-ID migration at load, remove/clear/prune mutation APIs that update memory and disk together and restore on write failure), config `[unsafe_allowlist]` and hash-pinned `[allowlist]` verdicts, lazy ancestor-chain hashing, negative hash-failure cache, deferred-event queue, failed-response retry queue (event fds stay open until answered or force-denied before group close), dialog pump (full-pipeline defer-mode evaluation: rule/cache decisions land mid-dialog, only genuine asks defer) |
 | `inode.c/h`    | open-addressing `(dev, ino)` set for hard-link detection (fixed capacity; overflow logs and degrades)                                                                                                                                                                                                                                                         |
 | `config.c/h`   | INI parse (`[protected_paths]`, `[allowlist]`, `[unsafe_allowlist]`, `[denylist]`, `[settings]`; unknown sections refused), `~` expansion, canonicalization, glob pattern compile (static base + suffix, shared by protected paths and rule sides), `!` exclusions, TTL clamps                                                                                                          |
 | `cache.c/h`    | PID+target allow cache with TTL and PID-reuse check (`/proc/<pid>/stat` start time)                                                                                                                                                                                                                                                                           |
@@ -152,12 +168,21 @@ the grant stages entirely and always prompts. Persisted entries without a
 `target_path` or a recorded command line, and entries whose fingerprint
 predates full-line hashing, do not match (fail closed, re-prompt).
 
+Persisted allow/deny entries and live session entries carry a stored 16-hex
+`rule_id` (ruleid.h), and `created_at` is the real creation time, stamped once
+at creation and preserved across every save; legacy state files get IDs assigned
+at load and are rewritten immediately (grants are kept, never dropped).
+`fileshield-cli` addresses entries by ID through the control socket. Prune —
+shared by the CLI and the daemon — groups the persisted lists by binary + target
++ raw command line + call chain, keeps the newest member and removes the rest;
+it never hashes a binary and never opens a path.
+
 ## Build & Test
 
-- `make` — compile the `fileshield` binary
+- `make` — compile the `fileshield` daemon and the `fileshield-cli` management binary
 - `make test` — compile and run all test suites
 - `make bench` — build and run `tests/bench_hotpath.c` (hot-path microbenchmarks)
-- `make install` — install binary, systemd unit and `fileshield.conf` (only when the target config is absent); `make install-config` or `REPLACE_CONFIG=1` overwrites the config with the shipped defaults
+- `make install` — install the daemon and `fileshield-cli` (`/usr/local/bin`), the systemd unit and `fileshield.conf` (only when the target config is absent); `make install-config` or `REPLACE_CONFIG=1` overwrites the config with the shipped defaults
 - `make clean` — remove artifacts
 - `make lint` — cppcheck static analysis
 - `make debug` — ASan/UBSan build for the daemon
@@ -168,13 +193,17 @@ predates full-line hashing, do not match (fail closed, re-prompt).
 
 - **`test_cache`**: target-scoped insert/lookup/expire, wildcard vs file-scoped, PID reuse, TTL clamp
 - **`test_config`**: parse valid/invalid .conf, rule globs on both sides, `[unsafe_allowlist]`, ~ expansion, user_ttl/session_ttl, clamping, edge cases
-- **`test_session`**: SID resolution, allow/deny matching, hash verification, TTL, dead leaders
-- **`test_persist`**: save/load roundtrip, escaping, malformed input, truncation warnings
-- **`test_pin`**: strict load/save roundtrip, missing vs damaged file, escaping, 256-entry eviction (oldest `updated_at`, tie-breaks), write-failure behavior
+- **`test_session`**: SID resolution, allow/deny matching, hash verification, TTL, dead leaders, stored rule IDs, snapshot sweep, remove by ID, per-list clear
+- **`test_persist`**: save/load roundtrip, escaping, malformed input, truncation warnings, `rule_id` round-trip, legacy entries without an ID, invalid-ID rejection
+- **`test_pin`**: strict load/save roundtrip, missing vs damaged file, escaping, 256-entry eviction (oldest `updated_at`, tie-breaks), write-failure behavior, file API, remove by ID/ambiguity/clear
 - **`test_sha512`**: FIPS 180-4 known-answer vectors, differential tests vs `sha512sum`, NUL-safe buffer hashing
 - **`test_inode`**: exact-key lookup, device separation, duplicates, clear, overflow degradation
 - **`test_reload`**: parse failure keeps the old config, a rejected reload keeps the old config published (unprivileged runs with `fan_fd = -1` cannot install marks, so the mark-set restoration itself is covered by the root canary), a failed rollback requests shutdown
-- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, kernel queue saturation (root)
+- **`test_fanotify`**: mark mask, deferred queue fail-closed flush, incomplete state entries dropped, command-line scoping, full-cmdline fingerprints, rule glob matching, unsafe-first ordering, pin verdicts, first-seen TOFU, damaged-pin fall-through, `created_at` preservation, legacy ID migration, remove/clear/prune mutations with write-failure restore, kernel queue saturation (root)
+- **`test_ruleid`**: canonical identity determinism, field boundaries, chain depth, collision nonces, pin IDs, prefix matching and lookups
+- **`test_prune`**: group detection (interleaved, key-field separation, hash fields not part of the key), malformed-entry exclusion, chain-depth boundary, capacity errors, apply validation and compaction
+- **`test_cli_ui`**: sanitize/tail truncation, ARG/CHAIN cells, rule/pin/session tables, totals footer, describe, JSON output, confirmation policy
+- **`test_control`**: field codec, request/response parsing, PING/RELOAD, bad and slow clients, rule/session/pin dispatch, setup/teardown, accept handling, client call
 - **`test_utils`**: `proc_exe_path`, `/proc` readers, home expansion, `path_under`
 - **`bench_hotpath`**: cache, path matching, SHA-512, runtime matchers, inode set, fast-path verdict, path resolution (`make bench`; kept only when a change wins)
 - Tests are self-contained C files linked against the module `.o` files
@@ -223,6 +252,10 @@ scope as a safety-critical surface:
 - The shipped `~/...`-based protected list expands once per real user, so it exceeds `MAX_PATHS` at 12 real users (trim it on shared hosts)
 - Permanent _Always_ entries pin the exact command line, so invocations whose arguments change re-prompt
 - Allowlist hash pins are keyed by the rule's canonical binary pattern: a glob rule shares one pin across every binary that matches it, so switching between them prompts (`[unsafe_allowlist]` is the escape). Binaries under a protected path are never hashed, and a missing digest or a damaged `allowlist-hashes.json` falls back to the prompt (fail closed); the prompt names the failure reason and points at `[unsafe_allowlist]` for a permanent grant, failed hashes are retried at most once per 60 s, and ancestor hashing is skipped while no runtime _Always_ entries exist; the table is capped at 256 entries (oldest evicted)
-- Denylist rules are never hash-checked, and there is no CLI for pins: updates go through the change dialog, or root edits `/var/lib/fileshield/allowlist-hashes.json` and reloads
+- Denylist rules are never hash-checked, and pin updates go through the change dialog (or a root edit of `/var/lib/fileshield/allowlist-hashes.json` and a reload); `fileshield-cli` can list, remove and clear pins, but adding or updating one is dialog-only
+- Control socket: `fileshield-cli` mutations travel over the root-only `/run/fileshield.sock` (0600, `SO_PEERCRED` peer-uid check, non-blocking, one bounded read per connection); reads parse the state files directly; the direct-file fallback applies only when no listener answers (`ENOENT`/`ECONNREFUSED`), never on `EACCES`; session commands require the running daemon because session rules live only in memory
+- Rule IDs: 16 lowercase hex stored per entry (first 8 shown by default, 16 with `--wide`, full in `describe`); lookups accept an unambiguous `>= 8`-char prefix; the daemon assigns IDs to legacy entries at load and rewrites the state file immediately (grants preserved); pins store no ID and derive it from the pattern
+- Prune keeps the newest entry of each duplicate group (binary + target + raw command line + call chain, by insertion order, not `created_at`) and never hashes a binary, so it does not verify which rule matches what is on disk
+- No CLI `add`: the dialog remains the only grant channel; `fileshield-cli` can only list, describe, remove, clear, prune, manage session rules and trigger a reload
 - Rule-hit notifications are best-effort (need a detected desktop session and `notify-send`), attacker-triggerable, deduplicated for `notify_dedup_ttl` and capped at `notify_max` per 60 s window; user dialog decisions never notify and no notification ever affects a decision
 - Config caps are hard: more than `MAX_PATHS` protected entries (1024; each `~/...` line expands once per real user) or more than `MAX_RULES` (128) in a section makes `config_load()` fail — startup exits, a reload keeps the previous config. `mark_table_add()` failure removes the just-installed kernel mark and fails the installation (no untracked marks across reloads); inode-set and mount-table overflows stay non-fatal but log at `ERR`

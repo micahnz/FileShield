@@ -5,6 +5,10 @@
  * atomically written JSON file.  Parsing fails closed: one anomaly
  * anywhere in an existing file marks the whole file damaged instead of
  * silently dropping entries, because dropping one would re-TOFU its rule.
+ *
+ * pin_load_file()/pin_write_file() expose that parser and serializer
+ * without daemon state, so fileshield-cli can manage the pin file
+ * directly; the daemon's pin_load()/pin_store() are built on them.
  */
 
 #include <ctype.h>
@@ -19,6 +23,7 @@
 
 #include "pin.h"
 #include "persist.h"
+#include "ruleid.h"
 #include "utils.h"
 
 /*
@@ -39,10 +44,10 @@ typedef struct
     unsigned long seq; /* store order: updated_at tie-break */
 } PinEntry;
 
-/* One table row plus "was this key seen in the current entry" flags. */
+/* One entry under construction plus "was this key seen" flags. */
 typedef struct
 {
-    PinEntry pin;
+    PinRecord pin;
     int have_pattern;
     int have_sha512;
     int have_updated_at;
@@ -55,10 +60,18 @@ static unsigned long g_pin_seq;
 static char g_state_file[PATH_MAX] = PIN_STATE_FILE;
 
 /*
- * A damaged file must not disturb the loaded table: parse into staging
- * and commit only after the whole file validated cleanly.
+ * Staging for pin_load() (a damaged file is parsed here and never
+ * disturbs g_pins) and, on the write side, the public row copy that the
+ * table mutations serialize.  The single-threaded daemon never overlaps
+ * the two uses.
  */
-static PinDraft g_stage[PIN_MAX];
+static PinRecord g_stage[PIN_MAX];
+
+/*
+ * Restore-on-write-failure snapshot for pin_store(), pin_remove_by_id()
+ * and pin_clear(): memory is committed only after the write succeeded.
+ */
+static PinEntry g_snapshot[PIN_MAX];
 
 /* Exactly 128 hex characters: sha512sum's canonical output form. */
 static int is_valid_sha512(const char *s)
@@ -163,8 +176,8 @@ static int apply_string_field(PinDraft *d, const char *key, const char *value)
 }
 
 /*
- * pin_load: read allowlist-hashes.json.  The reader accepts exactly the
- * shape pin_serialize() writes, scanned line by line:
+ * Parse an open pin file into out[0..max-1].  The reader accepts exactly
+ * the shape pin_serialize_records() writes, scanned line by line:
  *
  *   {
  *     "pins": [
@@ -179,23 +192,22 @@ static int apply_string_field(PinDraft *d, const char *key, const char *value)
  *
  * State machine: S_OUTSIDE -> ("pins": [) S_IN_PINS -> ({) S_IN_ENTRY
  * -> (} with all three fields) S_IN_PINS -> (]) S_OUTSIDE -> (}) S_DONE.
- * Entries are staged in g_stage and committed only when the whole file
- * is complete, so a damaged file never partially replaces the live
- * table.  Blank lines, comments (#) and unknown keys are tolerated; a
- * second "pins" array, junk after an entry close, an incomplete entry or
- * a missing closer marks the whole file damaged (fail closed).  A
- * missing file is a clean empty table (first-use TOFU); any other open
- * error is damage.
+ * An entry reaches 'out' only when it is complete, and the caller zeroes
+ * 'out' on failure, so a damaged file never yields a partial table.
+ * Blank lines, comments (#) and unknown keys are tolerated; a second
+ * "pins" array, junk after an entry close, an incomplete entry, a
+ * missing closer or more entries than max marks the whole file damaged
+ * (fail closed).  Returns the entry count, or -1 on any anomaly.
  */
-int pin_load(const char *filepath)
+static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
+                            int max)
 {
-    FILE *fp;
     char line[PIN_LINE_MAX];
     char key[256];
     char value[PIN_LINE_MAX];
+    PinDraft draft;
     PinDraft *cur = NULL;
     int count = 0;
-    int i;
     int saw_pins = 0;
     int closed_array = 0;
     int closed_object = 0;
@@ -207,38 +219,19 @@ int pin_load(const char *filepath)
         S_IN_ENTRY,
         S_DONE
     } state = S_OUTSIDE;
-    const char *path = (filepath && filepath[0] != '\0') ? filepath
-                                                         : g_state_file;
 
-    memset(g_stage, 0, sizeof(g_stage));
-
-    fp = fopen(path, "r");
-    if (!fp)
-    {
-        if (errno == ENOENT)
-        {
-            g_pin_count = 0;
-            g_pin_damaged = 0;
-            g_pin_seq = 0;
-            log_msg(LOG_INFO, "pin_load: %s not present; starting with no pins",
-                    path);
-            return 0;
-        }
-        log_msg(LOG_ERR, "pin_load: open %s: %s", path, strerror(errno));
-        g_pin_damaged = 1;
-        return -1;
-    }
+    memset(&draft, 0, sizeof(draft));
 
     while (ok && fgets(line, sizeof(line), fp))
     {
         if (!strchr(line, '\n') && !feof(fp))
         {
-            /* A line longer than any pin_store() can emit: the file was
-             * not written by the daemon or is corrupt.  Fail instead of
+            /* A line longer than any writer can emit: the file was not
+             * written by the daemon or is corrupt.  Fail instead of
              * parsing a split line as valid structure (the same
              * convention persist_load() enforces). */
             log_msg(LOG_ERR,
-                    "pin_load: %s has a line longer than %d bytes; "
+                    "pin_load_file: %s has a line longer than %d bytes; "
                     "ignoring the pin file",
                     path, PIN_LINE_MAX - 1);
             ok = 0;
@@ -330,13 +323,15 @@ int pin_load(const char *filepath)
             }
             else if (*p == '{')
             {
-                if (count >= PIN_MAX || strchr(p, '}') != NULL)
+                if (count >= max || strchr(p, '}') != NULL)
                 {
-                    ok = 0; /* too many entries / unsupported one-liner */
+                    /* More entries than the caller can hold / unsupported
+                     * one-liner: damage, never a silent drop. */
+                    ok = 0;
                     break;
                 }
-                cur = &g_stage[count];
-                memset(cur, 0, sizeof(*cur));
+                memset(&draft, 0, sizeof(draft));
+                cur = &draft;
                 state = S_IN_ENTRY;
             }
             else if (*p == ']')
@@ -384,7 +379,7 @@ int pin_load(const char *filepath)
                              * never dropped or tolerated silently */
                     break;
                 }
-                cur->pin.seq = (unsigned long)count;
+                out[count] = cur->pin;
                 count++;
                 cur = NULL;
                 state = S_IN_PINS;
@@ -434,20 +429,100 @@ int pin_load(const char *filepath)
 
     if (ferror(fp))
         ok = 0;
-    fclose(fp);
 
     if (!ok || !saw_pins || !closed_array || !closed_object ||
         state == S_IN_ENTRY)
     {
         log_msg(LOG_ERR,
-                "pin_load: %s is damaged; keeping the previous pin table "
-                "(fail closed)", path);
+                "pin_load_file: %s is damaged; no table was loaded "
+                "(fail closed)",
+                path);
+        return -1;
+    }
+    return count;
+}
+
+int pin_load_file(const char *filepath, PinRecord *out, int max,
+                  int *damaged_out)
+{
+    FILE *fp;
+    int count;
+
+    if (damaged_out)
+        *damaged_out = 0;
+    if (!filepath || filepath[0] == '\0' || !out || max < 1)
+    {
+        if (damaged_out)
+            *damaged_out = 1;
+        log_msg(LOG_ERR, "pin_load_file: invalid arguments");
+        return -1;
+    }
+    /* A missing file reports an empty table; a parse failure zeroes the
+     * table again below, so 'out' is never left partially filled. */
+    memset(out, 0, (size_t)max * sizeof(*out));
+
+    fp = fopen(filepath, "r");
+    if (!fp)
+    {
+        if (errno == ENOENT)
+        {
+            log_msg(LOG_INFO,
+                    "pin_load_file: %s not present; starting with no pins",
+                    filepath);
+            return 0;
+        }
+        log_msg(LOG_ERR, "pin_load_file: open %s: %s", filepath,
+                strerror(errno));
+        if (damaged_out)
+            *damaged_out = 1;
+        return -1;
+    }
+
+    count = pin_read_entries(fp, filepath, out, max);
+    fclose(fp);
+
+    if (count < 0)
+    {
+        memset(out, 0, (size_t)max * sizeof(*out));
+        if (damaged_out)
+            *damaged_out = 1;
+        return -1;
+    }
+    log_msg(LOG_INFO, "pin_load_file: loaded %d pin(s) from %s", count,
+            filepath);
+    return count;
+}
+
+int pin_damaged(void)
+{
+    return g_pin_damaged;
+}
+
+int pin_load(const char *filepath)
+{
+    const char *path = (filepath && filepath[0] != '\0') ? filepath
+                                                         : g_state_file;
+    int count;
+    int i;
+
+    /* Stage into g_stage: pin_load_file() zeroes its output on failure,
+     * so a damaged file leaves the previously loaded (now untrusted)
+     * table in g_pins untouched. */
+    count = pin_load_file(path, g_stage, PIN_MAX, NULL);
+    if (count < 0)
+    {
         g_pin_damaged = 1;
         return -1;
     }
 
     for (i = 0; i < count; i++)
-        g_pins[i] = g_stage[i].pin;
+    {
+        memcpy(g_pins[i].pattern, g_stage[i].pattern,
+               sizeof(g_pins[i].pattern));
+        memcpy(g_pins[i].sha512, g_stage[i].sha512, sizeof(g_pins[i].sha512));
+        g_pins[i].updated_at = g_stage[i].updated_at;
+        g_pins[i].seq = (unsigned long)i;
+    }
     g_pin_count = count;
     g_pin_seq = (unsigned long)count;
     g_pin_damaged = 0;
@@ -455,13 +530,7 @@ int pin_load(const char *filepath)
      * larger load must never become live (or be serialized) again. */
     for (i = count; i < PIN_MAX; i++)
         memset(&g_pins[i], 0, sizeof(g_pins[i]));
-    log_msg(LOG_INFO, "pin_load: loaded %d pin(s) from %s", count, path);
     return 0;
-}
-
-int pin_damaged(void)
-{
-    return g_pin_damaged;
 }
 
 int pin_check(const char *pattern, const char *sha512, char old_out[129])
@@ -528,19 +597,53 @@ static int sb_append(char **buf, size_t *cap, size_t *len, const char *s)
 }
 
 /*
- * Serialize the live table into a freshly allocated JSON text (caller
+ * Append one serialized row.  The live table and the pure writer share
+ * this so the file a mutation persists and the file the CLI persists are
+ * always the same shape.
+ */
+static int sb_append_pin_row(char **buf, size_t *cap, size_t *len,
+                             const char *pattern, const char *sha512,
+                             time_t updated_at, int comma)
+{
+    char escaped[PIN_ESCAPED_MAX];
+    char num[32];
+    int n;
+
+    if (persist_json_escape(pattern, escaped, sizeof(escaped)) < 0)
+        return -1;
+    n = snprintf(num, sizeof(num), "%ld", (long)updated_at);
+    if (n < 0 || (size_t)n >= sizeof(num))
+        return -1;
+
+    if (sb_append(buf, cap, len, "    {\n      \"pattern\": \"") < 0 ||
+        sb_append(buf, cap, len, escaped) < 0 ||
+        sb_append(buf, cap, len, "\",\n      \"sha512\": \"") < 0 ||
+        sb_append(buf, cap, len, sha512) < 0 ||
+        sb_append(buf, cap, len, "\",\n      \"updated_at\": ") < 0 ||
+        sb_append(buf, cap, len, num) < 0 ||
+        sb_append(buf, cap, len, "\n    }") < 0)
+        return -1;
+    if (comma && sb_append(buf, cap, len, ",") < 0)
+        return -1;
+    return sb_append(buf, cap, len, "\n");
+}
+
+/*
+ * Serialize rows[0..count-1] into a freshly allocated JSON text (caller
  * frees).  Returns 0 on success, -1 on allocation failure or when a
- * pattern cannot be represented (defense in depth: load and store both
+ * pattern cannot be represented (defense in depth: load and write both
  * bound patterns to PATH_MAX-1, so this cannot happen for valid state).
  */
-static int pin_serialize(char **out_text)
+static int pin_serialize_records(const PinRecord *rows, int count,
+                                 char **out_text)
 {
     char *buf;
     size_t cap = 4096;
     size_t len = 0;
-    char escaped[PIN_ESCAPED_MAX];
-    char num[32];
     int i;
+
+    if (count < 0 || (count > 0 && !rows) || !out_text)
+        return -1;
 
     buf = malloc(cap);
     if (!buf)
@@ -550,29 +653,16 @@ static int pin_serialize(char **out_text)
     if (sb_append(&buf, &cap, &len, "{\n  \"pins\": [\n") < 0)
         goto fail;
 
-    for (i = 0; i < g_pin_count; i++)
+    for (i = 0; i < count; i++)
     {
-        if (persist_json_escape(g_pins[i].pattern, escaped,
-                                sizeof(escaped)) < 0)
+        if (sb_append_pin_row(&buf, &cap, &len, rows[i].pattern,
+                              rows[i].sha512, rows[i].updated_at,
+                              i + 1 < count) < 0)
         {
-            log_msg(LOG_ERR, "pin_serialize: entry %d pattern does not fit", i);
+            log_msg(LOG_ERR, "pin_serialize_records: entry %d does not fit",
+                    i);
             goto fail;
         }
-
-        snprintf(num, sizeof(num), "%ld", (long)g_pins[i].updated_at);
-
-        if (sb_append(&buf, &cap, &len, "    {\n      \"pattern\": \"") < 0 ||
-            sb_append(&buf, &cap, &len, escaped) < 0 ||
-            sb_append(&buf, &cap, &len, "\",\n      \"sha512\": \"") < 0 ||
-            sb_append(&buf, &cap, &len, g_pins[i].sha512) < 0 ||
-            sb_append(&buf, &cap, &len, "\",\n      \"updated_at\": ") < 0 ||
-            sb_append(&buf, &cap, &len, num) < 0 ||
-            sb_append(&buf, &cap, &len, "\n    }") < 0)
-            goto fail;
-        if (i + 1 < g_pin_count && sb_append(&buf, &cap, &len, ",") < 0)
-            goto fail;
-        if (sb_append(&buf, &cap, &len, "\n") < 0)
-            goto fail;
     }
 
     if (sb_append(&buf, &cap, &len, "  ]\n}\n") < 0)
@@ -586,11 +676,80 @@ fail:
     return -1;
 }
 
+int pin_write_file(const char *filepath, const PinRecord *rows, int count)
+{
+    char *text = NULL;
+    int i;
+
+    /* The format cap is checked before any row is touched: a table over
+     * PIN_MAX would make the daemon load the file as damaged. */
+    if (count > PIN_MAX)
+    {
+        log_msg(LOG_WARNING,
+                "pin_write_file: count %d exceeds the %d-pin file limit",
+                count, PIN_MAX);
+        return -1;
+    }
+    if (!filepath || filepath[0] == '\0' || count < 0 ||
+        (count > 0 && !rows))
+    {
+        log_msg(LOG_WARNING, "pin_write_file: invalid arguments");
+        return -1;
+    }
+
+    /* Validate at the boundary: pin_write_file must never create a file
+     * the strict loader would reject as damaged (absolute pattern below
+     * PATH_MAX, 128-hex digest, non-negative timestamp). */
+    for (i = 0; i < count; i++)
+    {
+        if (!is_valid_pattern(rows[i].pattern) ||
+            !is_valid_sha512(rows[i].sha512) ||
+            (long)rows[i].updated_at < 0)
+        {
+            log_msg(LOG_ERR,
+                    "pin_write_file: row %d is not a valid pin; refusing "
+                    "to write %s",
+                    i, filepath);
+            return -1;
+        }
+    }
+
+    if (pin_serialize_records(rows, count, &text) < 0)
+    {
+        log_msg(LOG_WARNING,
+                "pin_write_file: could not serialize the pin table");
+        return -1;
+    }
+    if (persist_write_text(filepath, text) < 0)
+    {
+        free(text);
+        log_msg(LOG_WARNING, "pin_write_file: could not write %s", filepath);
+        return -1;
+    }
+    free(text);
+    return 0;
+}
+
+/*
+ * Copy the live table into the public row shape for serialization.  The
+ * seq tie-break is daemon-only state and is deliberately not persisted.
+ */
+static void pin_table_rows(PinRecord *rows)
+{
+    int i;
+
+    for (i = 0; i < g_pin_count; i++)
+    {
+        memcpy(rows[i].pattern, g_pins[i].pattern, sizeof(rows[i].pattern));
+        memcpy(rows[i].sha512, g_pins[i].sha512, sizeof(rows[i].sha512));
+        rows[i].updated_at = g_pins[i].updated_at;
+    }
+}
+
 int pin_store(const char *pattern, const char *sha512)
 {
     int i;
     int idx = -1;
-    char *text = NULL;
 
     if (!is_valid_pattern(pattern) || !is_valid_sha512(sha512))
     {
@@ -618,10 +777,9 @@ int pin_store(const char *pattern, const char *sha512)
      * store would serialize (empty pattern -> damaged file, or a stale
      * pattern from an earlier larger load -> silent re-grant).
      */
-    static PinEntry snapshot[PIN_MAX];
     int snap_count = g_pin_count;
     unsigned long snap_seq = g_pin_seq;
-    memcpy(snapshot, g_pins, sizeof(g_pins));
+    memcpy(g_snapshot, g_pins, sizeof(g_pins));
 
     for (i = 0; i < g_pin_count; i++)
     {
@@ -655,29 +813,153 @@ int pin_store(const char *pattern, const char *sha512)
     g_pins[idx].updated_at = time(NULL);
     g_pins[idx].seq = g_pin_seq++;
 
-    if (pin_serialize(&text) < 0)
+    pin_table_rows(g_stage);
+    if (pin_write_file(g_state_file, g_stage, g_pin_count) < 0)
     {
-        log_msg(LOG_WARNING, "pin_store: could not serialize the pin table");
-        goto restore;
-    }
-    if (persist_write_text(g_state_file, text) < 0)
-    {
-        free(text);
         log_msg(LOG_WARNING, "pin_store: could not write %s; the pre-store "
                              "table is kept in memory",
                 g_state_file);
         goto restore;
     }
-    free(text);
     log_msg(LOG_INFO, "pin_store: wrote %d pin(s) to %s", g_pin_count,
             g_state_file);
     return 0;
 
 restore:
-    memcpy(g_pins, snapshot, sizeof(g_pins));
+    memcpy(g_pins, g_snapshot, sizeof(g_pins));
     g_pin_count = snap_count;
     g_pin_seq = snap_seq;
     return -1;
+}
+
+/*
+ * Validate a lookup prefix without consulting the table, so an invalid
+ * argument is -1 even when the table is empty and "not found" is 0.
+ * ruleid_prefix_match() validates both of its arguments: against a
+ * well-formed constant it returns -1 exactly when 'id' is malformed, so
+ * only the sign of its result is used here.
+ */
+static int pin_id_valid(const char *id)
+{
+    static const char probe[RULEID_HEX_LEN + 1] = "0000000000000000";
+
+    return ruleid_prefix_match(probe, id) >= 0;
+}
+
+int pin_remove_by_id(const char *id)
+{
+    char ids[PIN_MAX][RULEID_HEX_LEN + 1];
+    const char *id_ptrs[PIN_MAX] = {0}; /* count 0 passes an empty list */
+    int ambiguous = 0;
+    int snap_count;
+    unsigned long snap_seq;
+    int idx;
+    int i;
+
+    if (!id || !pin_id_valid(id))
+    {
+        log_msg(LOG_WARNING, "pin_remove_by_id: invalid id argument");
+        return -1;
+    }
+    if (g_pin_damaged)
+    {
+        log_msg(LOG_ERR, "pin_remove_by_id: pin table is damaged; refusing "
+                         "to overwrite %s (repair the file and reload first)",
+                g_state_file);
+        return -1;
+    }
+
+    /* Resolve through the same matcher the CLI uses: an unambiguous
+     * 8..16-character lower-case hex prefix, full ID allowed. */
+    for (i = 0; i < g_pin_count; i++)
+    {
+        if (ruleid_pin(g_pins[i].pattern, ids[i]) < 0)
+        {
+            /* Live patterns are always canonical; failing here means
+             * the in-memory table cannot be trusted (fail closed). */
+            log_msg(LOG_ERR, "pin_remove_by_id: pin %d has no usable ID", i);
+            return -1;
+        }
+        id_ptrs[i] = ids[i];
+    }
+
+    idx = ruleid_find(id_ptrs, g_pin_count, id, &ambiguous);
+    if (idx < 0)
+    {
+        if (ambiguous)
+        {
+            log_msg(LOG_WARNING, "pin_remove_by_id: id %s matches more "
+                                 "than one pin; nothing removed",
+                    id);
+            return -2;
+        }
+        return 0; /* well-formed prefix, but no pin matches it */
+    }
+
+    snap_count = g_pin_count;
+    snap_seq = g_pin_seq;
+    memcpy(g_snapshot, g_pins, sizeof(g_pins));
+
+    for (i = idx; i + 1 < g_pin_count; i++)
+        memcpy(&g_pins[i], &g_pins[i + 1], sizeof(g_pins[i]));
+    g_pin_count--;
+    /* Clear the vacated slot: a later append must not resurrect it. */
+    memset(&g_pins[g_pin_count], 0, sizeof(g_pins[g_pin_count]));
+
+    pin_table_rows(g_stage);
+    if (pin_write_file(g_state_file, g_stage, g_pin_count) < 0)
+    {
+        log_msg(LOG_WARNING, "pin_remove_by_id: could not write %s; the "
+                             "pre-removal table is kept in memory",
+                g_state_file);
+        goto restore;
+    }
+    log_msg(LOG_INFO, "pin_remove_by_id: removed pin %s (id %s) from %s",
+            g_snapshot[idx].pattern, ids[idx], g_state_file);
+    return 1;
+
+restore:
+    memcpy(g_pins, g_snapshot, sizeof(g_pins));
+    g_pin_count = snap_count;
+    g_pin_seq = snap_seq;
+    return -1;
+}
+
+int pin_clear(void)
+{
+    int snap_count;
+    unsigned long snap_seq;
+
+    if (g_pin_damaged)
+    {
+        log_msg(LOG_ERR, "pin_clear: pin table is damaged; refusing to "
+                         "overwrite %s (repair the file and reload first)",
+                g_state_file);
+        return -1;
+    }
+
+    snap_count = g_pin_count;
+    snap_seq = g_pin_seq;
+    memcpy(g_snapshot, g_pins, sizeof(g_pins));
+    /* Zero the whole table, not just the count: stale patterns must
+     * never become live (or be serialized) again. */
+    memset(g_pins, 0, sizeof(g_pins));
+    g_pin_count = 0;
+    g_pin_seq = 0;
+
+    if (pin_write_file(g_state_file, NULL, 0) < 0)
+    {
+        log_msg(LOG_WARNING, "pin_clear: could not write %s; the pre-clear "
+                             "table is kept in memory",
+                g_state_file);
+        memcpy(g_pins, g_snapshot, sizeof(g_pins));
+        g_pin_count = snap_count;
+        g_pin_seq = snap_seq;
+        return -1;
+    }
+    log_msg(LOG_INFO, "pin_clear: removed %d pin(s) from %s", snap_count,
+            g_state_file);
+    return 0;
 }
 
 void pin_set_state_file(const char *path)

@@ -157,6 +157,34 @@ static void test_clear(void) {
     cache_expire();
 }
 
+static void test_full_table_drop(void) {
+    int cap = cache_test_capacity();
+    cache_clear();
+
+    /*
+     * Table-full behavior: the cache has no eviction policy, so an
+     * insert beyond capacity is DROPPED (fail closed) — it must not
+     * overwrite a live grant, and the table must stay usable.
+     */
+    char tgt[64];
+    for (int i = 0; i < cap; i++) {
+        snprintf(tgt, sizeof(tgt), "/tmp/full/%d", i);
+        cache_insert(700, "/bin/full", tgt, 60);
+    }
+    ASSERT(cache_lookup(700, "/bin/full", "/tmp/full/0") > 0,
+           "earliest entry present after filling to capacity");
+
+    cache_insert(700, "/bin/full", "/tmp/full/overflow", 60);
+    ASSERT(cache_lookup(700, "/bin/full", "/tmp/full/overflow") == 0,
+           "insert beyond capacity is dropped, not stored");
+    ASSERT(cache_lookup(700, "/bin/full", "/tmp/full/0") > 0,
+           "existing grants are untouched by the dropped insert");
+    ASSERT(cache_lookup(700, "/bin/full", "/tmp/full/123") > 0,
+           "mid-table grants still match when full");
+
+    cache_clear();
+}
+
 int main(void) {
     printf("=== test_cache ===\n");
     test_insert_lookup();
@@ -170,6 +198,7 @@ int main(void) {
     test_pid_reuse();
     test_ttl_clamp();
     test_clear();
+    test_full_table_drop();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;

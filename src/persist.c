@@ -481,35 +481,112 @@ static void apply_entry_field(const char *filepath, PersistEntry *e,
                    sizeof(e->chain_sha512[idx]), value);
 }
 
-/* Apply the numeric fields (chain_depth, created_at) of one line. */
+/*
+ * Apply the numeric fields (chain_depth, created_at) of one line.
+ * strtol (not sscanf %d/%ld): an out-of-range value in a hand-edited or
+ * corrupt file is undefined behavior with scanf conversions, while
+ * ERANGE is a defined rejection here.  The same reason pin.c parses its
+ * numeric fields with strtol.
+ */
 static void apply_entry_number(PersistEntry *e, const char *line)
 {
     char key_buf[256];
-    int tmp_int;
-    long created_tmp;
+    const char *rest;
+    char *end;
+    long value;
+    int pos = 0;
 
-    if (sscanf(line, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
-        strcmp(key_buf, "chain_depth") == 0)
+    if (sscanf(line, " \"%255[^\"]\": %n", key_buf, &pos) != 1)
+        return;
+    rest = line + pos;
+    errno = 0;
+    value = strtol(rest, &end, 10);
+    if (end == rest || errno == ERANGE)
+        return; /* malformed or out of range: leave the field untouched */
+
+    if (strcmp(key_buf, "chain_depth") == 0)
     {
         /* chain_depth is used as an array bound: reject anything outside
          * [0, PERSIST_CHAIN_MAX] at the parse boundary. */
-        if (tmp_int >= 0 && tmp_int <= PERSIST_CHAIN_MAX)
+        if (value >= 0 && value <= PERSIST_CHAIN_MAX)
         {
-            e->chain_depth = tmp_int;
+            e->chain_depth = (int)value;
         }
         else
         {
             log_msg(LOG_WARNING,
-                    "persist_load: chain_depth %d out of range [0,%d], clamping",
-                    tmp_int, PERSIST_CHAIN_MAX);
-            e->chain_depth = tmp_int < 0 ? 0 : PERSIST_CHAIN_MAX;
+                    "persist_load: chain_depth %ld out of range [0,%d], "
+                    "clamping",
+                    value, PERSIST_CHAIN_MAX);
+            e->chain_depth = value < 0 ? 0 : PERSIST_CHAIN_MAX;
         }
     }
-    else if (sscanf(line, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
-             strcmp(key_buf, "created_at") == 0)
+    else if (strcmp(key_buf, "created_at") == 0)
     {
-        e->created_at = (time_t)created_tmp;
+        e->created_at = (time_t)value;
     }
+}
+
+/*
+ * A stored rule ID is exactly 16 lowercase hex digits.  ruleid.c generates
+ * the values; this parser is the trust boundary that keeps a hand-edited
+ * state file from admitting an ID the CLI could never address.  The field
+ * holds one byte more than the canonical value, so a valid ID is copied
+ * whole and never reaches copy_field()'s truncation path.
+ */
+static int valid_rule_id(const char *value)
+{
+    int i;
+
+    if (!value || strlen(value) != 16)
+        return 0;
+    for (i = 0; i < 16; i++)
+    {
+        if (!((value[i] >= '0' && value[i] <= '9') ||
+              (value[i] >= 'a' && value[i] <= 'f')))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * The value reaches this point through the JSON extractor, which decodes
+ * escapes: a \n in a hand-edited value could otherwise forge journal
+ * lines.  Log a capped, sanitized copy instead of the raw bytes.
+ */
+static void log_bad_rule_id(const char *filepath, const char *value)
+{
+    char safe[33];
+    size_t i;
+
+    for (i = 0; i < sizeof(safe) - 1 && value[i] != '\0'; i++)
+    {
+        unsigned char c = (unsigned char)value[i];
+        safe[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    safe[i] = '\0';
+    log_msg(LOG_WARNING,
+            "persist_load: %s: invalid rule_id \"%s%s\"; dropping the entry "
+            "(want 16 lowercase hex chars)",
+            filepath, safe, value[i] != '\0' ? "..." : "");
+}
+
+/*
+ * Validate and store one parsed "rule_id".  Returns 0 for a present but
+ * malformed value: the caller drops the whole entry, mirroring the
+ * per-entry admission fanotify's load_dyn_list applies to incomplete
+ * entries.
+ */
+static int apply_rule_id(const char *filepath, PersistEntry *e,
+                         const char *value)
+{
+    if (!valid_rule_id(value))
+    {
+        log_bad_rule_id(filepath, value);
+        return 0;
+    }
+    memcpy(e->rule_id, value, sizeof(e->rule_id));
+    return 1;
 }
 
 /*
@@ -519,6 +596,7 @@ static void apply_entry_number(PersistEntry *e, const char *line)
  *   {
  *     "entries": [
  *       {
+ *         "rule_id": "0123456789abcdef",
  *         "binary": "...", "binary_sha512": "...", "target_path": "...",
  *         "cmdline": "...", "cmdline_sha512": "...",
  *         "chain_depth": 2, "created_at": 123,
@@ -534,7 +612,9 @@ static void apply_entry_number(PersistEntry *e, const char *line)
  * entry cut off mid-way), a malformed line, or a line longer than
  * JSON_LINE_MAX (which the writer can never emit) returns -1: the
  * caller then clears the in-memory lists (fail secure) and the journal
- * records the damage.
+ * records the damage.  A line without a rule_id is legacy state and
+ * loads with an empty ID (the daemon assigns one when migrating); a
+ * present-but-malformed rule_id drops only that entry, never the file.
  */
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
 {
@@ -549,6 +629,10 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     int saw_entries = 0;
     int closed_array = 0;
     int closed_object = 0;
+    /* Per-entry rule_id tracking: PersistEntry stays flag-free, so an
+     * absent key and a present-but-malformed value are told apart here. */
+    int have_rule_id = 0;
+    int rule_id_valid = 0;
 
     /*
      * Minimal line-oriented scanner: just enough JSON structure to find
@@ -613,6 +697,8 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry start: opening brace inside the entries array. */
         if (state == S_IN_ENTRIES && *p == '{')
         {
+            have_rule_id = 0;
+            rule_id_valid = 0;
             if (count >= max_entries)
             {
                 /* Make truncation at the caller's cap visible: silently
@@ -638,7 +724,10 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry end: closing brace.  Sanitise and finalise. */
         if (state == S_IN_ENTRY && *p == '}')
         {
-            if (current)
+            /* A present-but-malformed rule_id (logged at the field) drops
+             * this entry only: one damaged line must not fail the rest of
+             * the file. */
+            if (current && (!have_rule_id || rule_id_valid))
             {
                 /* Defense in depth: never index arrays with an out-of-range
                  * depth, even if a previous validation step was bypassed. */
@@ -685,9 +774,37 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         char key_buf[256], val_buf[JSON_ESCAPED_MAX];
         if (persist_json_extract_string(p, key_buf, sizeof(key_buf), val_buf,
                                         sizeof(val_buf)))
-            apply_entry_field(filepath, current, key_buf, val_buf);
+        {
+            /* rule_id is tracked separately: a present-but-malformed value
+             * must drop the whole entry, not be copied like a free-form
+             * field. */
+            if (strcmp(key_buf, "rule_id") == 0)
+            {
+                have_rule_id = 1;
+                rule_id_valid = apply_rule_id(filepath, current, val_buf);
+            }
+            else
+                apply_entry_field(filepath, current, key_buf, val_buf);
+        }
         else
-            apply_entry_number(current, p);
+        {
+            /* A rule_id line the extractor could not decode (truncated,
+             * malformed escape, oversized value) is still a present key:
+             * reject the entry instead of letting it load as legacy state.
+             * val_buf is empty on extraction failure, so the warning shows
+             * an empty offending value. */
+            char failed_key[256];
+
+            if (sscanf(p, " \"%255[^\"]\"", failed_key) == 1 &&
+                strcmp(failed_key, "rule_id") == 0)
+            {
+                have_rule_id = 1;
+                rule_id_valid = 0;
+                log_bad_rule_id(filepath, val_buf);
+            }
+            else
+                apply_entry_number(current, p);
+        }
     }
 
     if (ferror(fp))
@@ -816,6 +933,10 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         const PersistEntry *e = &entries[i];
 
         fprintf(fp, "    {\n");
+
+        /* First field in the object so the ID is visible at a glance. */
+        SAVE_ESCAPED("rule_id", e->rule_id);
+        fprintf(fp, "      \"rule_id\": \"%s\",\n", escaped);
 
         SAVE_ESCAPED("binary", e->binary);
         fprintf(fp, "      \"binary\": \"%s\",\n", escaped);

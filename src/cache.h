@@ -42,4 +42,7 @@ void cache_test_insert_with_starttime(pid_t pid, unsigned long long starttime,
                                       const char *binary, const char *target,
                                       int ttl_seconds);
 
+/* Test seam: table capacity (the full-table behavior drops inserts). */
+int cache_test_capacity(void);
+
 #endif

@@ -974,7 +974,15 @@ int config_load(const char *path, Config *cfg)
             /* [settings] key = value */
             char *eq = strchr(s, '=');
             if (!eq)
+            {
+                /* Silently dropping this made a typo like "user_ttl 300"
+                 * look like it took effect; report it instead (the line
+                 * is still skipped, matching the unknown-key warning). */
+                log_msg(LOG_ERR,
+                        "config_load: malformed settings line (missing "
+                        "'='), ignored: %s", s);
                 continue;
+            }
             *eq = '\0';
             apply_setting(cfg, trim(s), trim(eq + 1));
         }
