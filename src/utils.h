@@ -150,7 +150,10 @@ int glob_match_path(const char *pattern, const char *path);
  * expand_home_all_users: expand a ~/... path template for every user in
  * /etc/passwd and return a NULL-terminated array of malloc'd strings.
  * For paths that do not start with ~/ the array contains a single copy.
- * Returns NULL on allocation failure.  Caller must call free_string_array().
+ * Returns NULL on allocation failure or when the passwd enumeration
+ * fails mid-way (a partial expansion would silently leave some users'
+ * paths unprotected while the config still loads).  The caller must call
+ * free_string_array().
  */
 char **expand_home_all_users(const char *path);
 void free_string_array(char **arr);

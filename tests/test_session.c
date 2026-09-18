@@ -154,12 +154,67 @@ static void test_allow_match(void)
     ASSERT(session_allow_match(sid, bin, "bbbbbbbbbbbbbbbb", target) == 0,
            "wrong hash does not match");
 
-    /* An entry recorded without a hash matches any provided hash. */
-    session_clear();
-    session_allow_add(sid, start, bin, "", target, 0);
-    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc", target) == 1,
-           "hashless entry matches without verification");
+    stop_leader(leader);
+}
 
+/*
+ * Fail-closed digest rule: an entry that stores no binary SHA-512 must
+ * never match, even when the requester presents a digest.  Pre-fix,
+ * hash_matches() returned 1 for an empty stored digest, so one
+ * hash-failure grant covered any later binary at the same path for the
+ * session's lifetime.  session_allow_add() still stores such an entry
+ * (the recorder, not this module, owns that guard), which is exactly what
+ * lets this test pin the matcher's behavior.
+ */
+/*
+ * A digest-less session entry is deliberate: unhashable binaries
+ * (AppImages under /tmp/.mount_*, self-updating tools) rely on "Allow
+ * Session" as their scoped grant.  The entry matches any requester digest
+ * for the same binary path and target while the session lives; a recorded
+ * digest still must match.  A past review turned the empty stored digest
+ * into a fail-closed rejection and broke that use case — this test pins
+ * the restored, intended behavior so it is not "fixed" again.
+ */
+static void test_empty_digest_matches_for_session(void)
+{
+    pid_t leader;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+    const char *bin = "/usr/bin/evil";
+    const char *target = "/home/u/.ssh/id_rsa";
+    SessionRecord recs[4];
+    int total = 0;
+
+    session_clear();
+    leader = spawn_leader();
+    ASSERT(fixture_session(leader, &sid, &start) == 0, "fixture session");
+    if (leader <= 0)
+        return;
+
+    session_allow_add(sid, start, bin, "", target, 0);
+    ASSERT(session_snapshot(0, recs, 4, &total) == 1 && total == 1,
+           "the digest-less allow entry is stored");
+    ASSERT(session_allow_match(sid, bin, "", target) == 1,
+           "empty stored digest matches without a requester digest");
+    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc", target) == 1,
+           "empty stored digest matches any requester digest (session-scoped)");
+    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc",
+                               "/home/u/other") == 0,
+           "the target must still match");
+
+    session_deny_add(sid, start, bin, "", target, 0);
+    ASSERT(session_deny_match(sid, bin, "cccccccccccccccc", target) == 1,
+           "a digest-less deny entry also matches (conservative)");
+
+    /* Control: a recorded digest must still match exactly. */
+    session_clear();
+    session_allow_add(sid, start, bin, "dddddddddddddddd", target, 0);
+    ASSERT(session_allow_match(sid, bin, "dddddddddddddddd", target) == 1,
+           "a recorded digest still matches its requester digest");
+    ASSERT(session_allow_match(sid, bin, "eeeeeeeeeeeeeeee", target) == 0,
+           "a recorded digest mismatch re-prompts");
+
+    session_clear();
     stop_leader(leader);
 }
 
@@ -223,6 +278,7 @@ static void test_dead_leader(void)
 static void test_full_table_reclaims_dead(void)
 {
     int cap = session_test_max();
+    const char *hash = "aaaaaaaaaaaaaaaa";
     session_clear();
 
     pid_t dead = spawn_leader();
@@ -238,29 +294,29 @@ static void test_full_table_reclaims_dead(void)
     }
 
     /* Slot 0: an entry whose leader dies before the fill below. */
-    session_allow_add(dsid, dstart, "/bin/doomed", "", "/doomed", 0);
+    session_allow_add(dsid, dstart, "/bin/doomed", hash, "/doomed", 0);
     stop_leader(dead);
 
     /* Fill the remaining slots with live-session entries. */
     char target[64];
     for (int i = 1; i < cap; i++) {
         snprintf(target, sizeof(target), "/live/%d", i);
-        session_allow_add(lsid, lstart, "/bin/live", "", target, 0);
+        session_allow_add(lsid, lstart, "/bin/live", hash, target, 0);
     }
-    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/1") == 1,
+    ASSERT(session_allow_match(lsid, "/bin/live", hash, "/live/1") == 1,
            "oldest live entry matches before overflow (memmove victim)");
 
     /* The overflow add: the sweep must reclaim the doomed slot, keeping
      * every live entry in place. */
-    session_allow_add(lsid, lstart, "/bin/live", "", "/live/extra", 0);
+    session_allow_add(lsid, lstart, "/bin/live", hash, "/live/extra", 0);
 
-    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/extra") == 1,
+    ASSERT(session_allow_match(lsid, "/bin/live", hash, "/live/extra") == 1,
            "overflow entry stored via dead-slot reclaim");
-    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/1") == 1,
+    ASSERT(session_allow_match(lsid, "/bin/live", hash, "/live/1") == 1,
            "oldest live entry survived the overflow add");
-    ASSERT(session_allow_match(lsid, "/bin/live", "", "/live/2") == 1,
+    ASSERT(session_allow_match(lsid, "/bin/live", hash, "/live/2") == 1,
            "second live entry survived the overflow add");
-    ASSERT(session_allow_match(dsid, "/bin/doomed", "", "/doomed") == 0,
+    ASSERT(session_allow_match(dsid, "/bin/doomed", hash, "/doomed") == 0,
            "doomed entry matches nothing (its session is dead)");
 
     session_clear();
@@ -293,12 +349,6 @@ static void test_deny(void)
     ASSERT(session_deny_match(sid, bin, "0000000000000000", target) == 0,
            "deny match with wrong hash");
 
-    /* Hashless deny matches even when no current hash is available. */
-    session_clear();
-    session_deny_add(sid, start, bin, "", target, 0);
-    ASSERT(session_deny_match(sid, bin, "", target) == 1,
-           "hashless deny matches without hash");
-
     stop_leader(leader);
 }
 
@@ -318,21 +368,22 @@ static void test_clear_and_entries(void)
     pid_t leader = spawn_leader();
     pid_t sid = 0;
     unsigned long long start = 0;
+    const char *hash = "aaaaaaaaaaaaaaaa";
     ASSERT(fixture_session(leader, &sid, &start) == 0, "fixture session");
     if (leader <= 0)
         return;
 
-    session_allow_add(sid, start, "/bin/a", "", "/tmp/a", 0);
-    session_deny_add(sid, start, "/bin/b", "", "/tmp/b", 0);
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 1,
+    session_allow_add(sid, start, "/bin/a", hash, "/tmp/a", 0);
+    session_deny_add(sid, start, "/bin/b", hash, "/tmp/b", 0);
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 1,
            "allow entry present after add");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 1,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 1,
            "deny entry present after add");
 
     session_clear();
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 0,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 0,
            "clear removes allow entries");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 0,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 0,
            "clear removes deny entries");
 
     stop_leader(leader);
@@ -528,13 +579,14 @@ static void test_remove_by_id(void)
     pid_t leader = spawn_leader();
     pid_t sid = 0;
     unsigned long long start = 0;
+    const char *hash = "aaaaaaaaaaaaaaaa";
     ASSERT(fixture_session(leader, &sid, &start) == 0, "fixture session");
     if (leader <= 0)
         return;
 
-    session_allow_add(sid, start, "/bin/a", "", "/tmp/a", 0);
-    session_allow_add(sid, start, "/bin/b", "", "/tmp/b", 0);
-    session_deny_add(sid, start, "/bin/c", "", "/tmp/c", 0);
+    session_allow_add(sid, start, "/bin/a", hash, "/tmp/a", 0);
+    session_allow_add(sid, start, "/bin/b", hash, "/tmp/b", 0);
+    session_deny_add(sid, start, "/bin/c", hash, "/tmp/c", 0);
 
     SessionRecord recs[4];
     memset(recs, 0, sizeof(recs));
@@ -583,20 +635,20 @@ static void test_remove_by_id(void)
     ASSERT(unknown[0] != id_a[0] && strncmp(unknown, id_b, 8) != 0,
            "constructed an unknown prefix");
     ASSERT(session_remove_by_id(0, unknown) == 0, "unknown prefix not found");
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 1,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 1,
            "not-found removal leaves the entry in place");
 
     ASSERT(session_remove_by_id(0, prefix_a) == 1,
            "unique 8-char prefix removes exactly one");
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 0,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 0,
            "removed allow entry no longer matches");
-    ASSERT(session_allow_match(sid, "/bin/b", "", "/tmp/b") == 1,
+    ASSERT(session_allow_match(sid, "/bin/b", hash, "/tmp/b") == 1,
            "the other allow entry survives");
     ASSERT(session_remove_by_id(0, prefix_a) == 0,
            "the same prefix no longer matches after removal");
 
     ASSERT(session_remove_by_id(0, id_b) == 1, "full 16-char ID removes");
-    ASSERT(session_allow_match(sid, "/bin/b", "", "/tmp/b") == 0,
+    ASSERT(session_allow_match(sid, "/bin/b", hash, "/tmp/b") == 0,
            "second allow entry removed");
 
     /* An empty list still rejects malformed prefixes (argument error)... */
@@ -616,10 +668,10 @@ static void test_remove_by_id(void)
 
     ASSERT(session_remove_by_id(0, id_c) == 0,
            "deny ID does not match in the allow list");
-    ASSERT(session_deny_match(sid, "/bin/c", "", "/tmp/c") == 1,
+    ASSERT(session_deny_match(sid, "/bin/c", hash, "/tmp/c") == 1,
            "deny entry survives the wrong-list removal");
     ASSERT(session_remove_by_id(1, id_c) == 1, "deny ID removes from deny list");
-    ASSERT(session_deny_match(sid, "/bin/c", "", "/tmp/c") == 0,
+    ASSERT(session_deny_match(sid, "/bin/c", hash, "/tmp/c") == 0,
            "removed deny entry no longer matches");
 
     session_clear();
@@ -636,37 +688,38 @@ static void test_clear_list(void)
     pid_t leader = spawn_leader();
     pid_t sid = 0;
     unsigned long long start = 0;
+    const char *hash = "aaaaaaaaaaaaaaaa";
     ASSERT(fixture_session(leader, &sid, &start) == 0, "fixture session");
     if (leader <= 0)
         return;
 
-    session_allow_add(sid, start, "/bin/a", "", "/tmp/a", 0);
-    session_deny_add(sid, start, "/bin/b", "", "/tmp/b", 0);
+    session_allow_add(sid, start, "/bin/a", hash, "/tmp/a", 0);
+    session_deny_add(sid, start, "/bin/b", hash, "/tmp/b", 0);
 
     session_clear_list(1);
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 1,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 1,
            "deny-list clear leaves allow entries");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 0,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 0,
            "deny-list clear removes deny entries");
 
-    session_deny_add(sid, start, "/bin/b", "", "/tmp/b", 0);
+    session_deny_add(sid, start, "/bin/b", hash, "/tmp/b", 0);
     session_clear_list(2);
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 1,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 1,
            "invalid selector clears no allow entries");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 1,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 1,
            "invalid selector clears no deny entries");
 
     session_clear_list(0);
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 0,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 0,
            "allow-list clear removes allow entries");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 1,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 1,
            "allow-list clear leaves deny entries");
 
-    session_allow_add(sid, start, "/bin/a", "", "/tmp/a", 0);
+    session_allow_add(sid, start, "/bin/a", hash, "/tmp/a", 0);
     session_clear();
-    ASSERT(session_allow_match(sid, "/bin/a", "", "/tmp/a") == 0,
+    ASSERT(session_allow_match(sid, "/bin/a", hash, "/tmp/a") == 0,
            "session_clear clears allow");
-    ASSERT(session_deny_match(sid, "/bin/b", "", "/tmp/b") == 0,
+    ASSERT(session_deny_match(sid, "/bin/b", hash, "/tmp/b") == 0,
            "session_clear clears deny");
 
     stop_leader(leader);
@@ -677,6 +730,7 @@ int main(void)
     printf("=== test_session ===\n");
     test_session_id_of();
     test_allow_match();
+    test_empty_digest_matches_for_session();
     test_ttl_expiry();
     test_dead_leader();
     test_full_table_reclaims_dead();

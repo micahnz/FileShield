@@ -201,15 +201,19 @@ static void bench_fastpath_setup(void)
     }
 
     /* One exclusion mirrors the shipped ssh rule: deny-wins costs an
-     * exclusion scan only after a positive entry matches. */
+     * exclusion scan only after a positive entry matches.  The exclusion
+     * is found through exclude_idx[], so record its protected[] index:
+     * leaving the zeroed array in place would scan index 0 and bench the
+     * wrong entry. */
     {
         ProtectedPath *pp = &g_bench_cfg.protected[g_bench_cfg.protected_count];
         snprintf(pp->path, PATH_MAX, "%s", "/home/u/.ssh/*.pub");
         pp->is_glob = 1;
         pp->is_exclude = 1;
         pp->base_len = (int)strlen("/home/u/.ssh");
-        g_bench_cfg.protected_count++;
+        g_bench_cfg.exclude_idx[0] = g_bench_cfg.protected_count;
         g_bench_cfg.exclude_count = 1;
+        g_bench_cfg.protected_count++;
     }
 
     g_config = &g_bench_cfg;

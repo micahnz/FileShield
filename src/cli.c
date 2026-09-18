@@ -160,9 +160,9 @@ static const char *session_label(int deny)
 }
 
 /*
- * Parse a "allow"/"deny" argument.  Returns 0/1, or -1 when the token is
- * not a list name.  NULL means "not given"; the caller decides the
- * default.
+ * Parse an "allow"/"deny" argument.  Returns 0 for allow, 1 for deny, -2
+ * when the token is not a list name, and -1 for NULL ("not given"; the
+ * caller decides the default).  Every caller only tests for < 0.
  */
 static int parse_list(const char *arg)
 {
@@ -509,6 +509,8 @@ static int cmd_list(const char *filter)
     PersistEntry *allow = NULL, *deny = NULL;
     PinRecord *pins = NULL;
     int na = 0, nd = 0, np = 0;
+    /* Sticky failure flag: a failed load or allocation skips rendering but
+     * must still flow through the single cleanup path below. */
     int rc = 0;
 
     if (want_allow && load_entries(0, &allow, &na) < 0)
@@ -537,6 +539,8 @@ static int cmd_list(const char *filter)
 
     if (want_allow || want_deny)
     {
+        /* +1 keeps the allocation nonzero when both lists are empty, so
+         * an empty table is never mistaken for an allocation failure. */
         rule_rows = calloc((size_t)(na + nd) + 1, sizeof(*rule_rows));
         if (!rule_rows)
         {
@@ -558,6 +562,9 @@ static int cmd_list(const char *filter)
             build_pin_rows(pins, np, pin_rows, &n_pins);
     }
 
+    /* All shaping of stored fields (control bytes -> '?', tail truncation,
+     * JSON escaping) happens inside the cli_ui renderers; cli.c only hands
+     * over the loaded records. */
     if (rc == 0 && g_json)
     {
         cli_ui_render_list_json(stdout, sections, rule_rows, n_rules,
@@ -855,6 +862,25 @@ static int fallback_remove_pins(const char (*full)[RULEID_HEX_LEN + 1], int n)
 }
 
 /*
+ * Append one TAB-separated field to the request under construction.
+ * 'used' is its current length; returns the new length, or -1 when the
+ * field does not fit.  The caller refuses a request that would be
+ * truncated: it is never assembled past the buffer or sent half-formed.
+ */
+static int request_append(char *request, size_t size, int used,
+                          const char *field)
+{
+    int n;
+
+    if (used < 0 || (size_t)used >= size)
+        return -1;
+    n = snprintf(request + used, size - (size_t)used, "\t%s", field);
+    if (n < 0 || (size_t)n >= size - (size_t)used)
+        return -1;
+    return used + n;
+}
+
+/*
  * Send the remove request in chunks of CONTROL_MAX_IDS IDs.  On return:
  * 0 with *removed_out set when the daemon applied the chunks; 0 with
  * *no_listener set when no daemon answered (the caller then edits the
@@ -878,14 +904,25 @@ static int remove_over_socket(const char *verb, const char *list_arg,
             chunk = CONTROL_MAX_IDS;
 
         /* "VERB[\tlist]" then one "\t<id>" per chunk member; IDs are 16
-         * hex chars, so the 4 KiB request bound cannot be reached. */
+         * hex chars, so the 4 KiB request bound cannot be reached.  The
+         * checks below still refuse a request that would not fit instead
+         * of letting sizeof(request) - pos underflow. */
         pos = snprintf(request, sizeof(request), "%s", verb);
+        if (pos < 0 || (size_t)pos >= sizeof(request))
+        {
+            fprintf(stderr, "error: control request does not fit its buffer\n");
+            return -1;
+        }
         if (list_arg)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", list_arg);
-        for (int i = 0; i < chunk; i++)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", full[start + i]);
+            pos = request_append(request, sizeof(request), pos, list_arg);
+        for (int i = 0; i < chunk && pos >= 0; i++)
+            pos = request_append(request, sizeof(request), pos,
+                                 full[start + i]);
+        if (pos < 0)
+        {
+            fprintf(stderr, "error: control request does not fit its buffer\n");
+            return -1;
+        }
 
         int rc = ctl_call(request, &resp);
 
@@ -936,9 +973,13 @@ static int remove_rules(int deny, char *const *inputs, int n)
     n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d %s rule(s):\n", n, rule_label(deny));
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s -> %s\n", entries[indices[i]].rule_id,
-               entries[indices[i]].binary, entries[indices[i]].target_path);
+        cli_ui_render_confirm_line(stdout, full[i], entries[indices[i]].binary,
+                                   entries[indices[i]].target_path, width,
+                                   g_wide);
 
     if (!cli_confirm("Remove these rules?", g_yes))
     {
@@ -996,8 +1037,12 @@ static int remove_pins(char *const *inputs, int n)
     n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d pin(s):\n", n);
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s\n", full[i], rows[indices[i]].pattern);
+        cli_ui_render_confirm_line(stdout, full[i], rows[indices[i]].pattern,
+                                   NULL, width, g_wide);
 
     if (!cli_confirm("Remove these pins?", g_yes))
     {
@@ -1140,13 +1185,12 @@ static void format_time(time_t t, char *out, size_t outsz)
 {
     struct tm tm;
 
-    if (t <= 0)
-    {
+    /* Mirror cli_ui.c's format_epoch(): a time_t the libc cannot convert
+     * (corrupt created_at) must not make strftime() read a struct tm
+     * localtime_r() never filled. */
+    if (t <= 0 || localtime_r(&t, &tm) == NULL ||
+        strftime(out, outsz, "%Y-%m-%d %H:%M:%S", &tm) == 0)
         snprintf(out, outsz, "(unknown)");
-        return;
-    }
-    localtime_r(&t, &tm);
-    strftime(out, outsz, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
 /*
@@ -1339,6 +1383,8 @@ static int cmd_prune(const char *which)
      * removed count (printed below) stays authoritative. */
     int total_groups = 0;
 
+    /* Each prune_list() prints one list's duplicate report and returns its
+     * group count; only the sum matters here, as the prompt gate. */
     if (want_allow)
     {
         int g = prune_list(0);
@@ -1373,6 +1419,9 @@ static int cmd_prune(const char *which)
         return 1;
     }
 
+    /* One request: the daemon prunes its in-memory lists and rewrites the
+     * files together.  "both" mirrors this default scope; the no-listener
+     * branch below recomputes the same groups locally. */
     const char *what = want_allow && want_deny ? "both"
                        : want_allow             ? "allow"
                                                 : "deny";
@@ -1576,9 +1625,33 @@ static int session_by_id(const SessionStore *store, int count,
     return 1;
 }
 
+/*
+ * now + ttl for display, bounded so a corrupt or hostile TTL (it arrives
+ * over the control socket) can never overflow time_t: saturation lands
+ * outside localtime_r()'s range, which renders "(unknown)" instead.  The
+ * unsigned sum is well defined; a failed time(NULL) (-1) is treated as
+ * the epoch for the base.
+ */
+static time_t deadline_after(time_t now, long ttl)
+{
+    unsigned long long sum;
+
+    if (ttl <= 0)
+        return now;
+    if (now < 0)
+        now = 0;
+    sum = (unsigned long long)now + (unsigned long long)ttl;
+    if (sum > (unsigned long long)LLONG_MAX)
+        return (time_t)LLONG_MAX;
+    return (time_t)sum;
+}
+
 static void format_expiry(long ttl, char *out, size_t outsz)
 {
     char human[32];
+    char abs_time[32];
+    struct tm tm;
+    time_t when;
 
     if (ttl < 0)
     {
@@ -1593,12 +1666,13 @@ static void format_expiry(long ttl, char *out, size_t outsz)
     else
         snprintf(human, sizeof(human), "%lds", ttl);
 
-    time_t when = time(NULL) + ttl;
-    struct tm tm;
-    char abs_time[32];
-
-    localtime_r(&when, &tm);
-    strftime(abs_time, sizeof(abs_time), "%Y-%m-%d %H:%M:%S", &tm);
+    /* Mirrors cli_ui.c's format_epoch(): a deadline the libc cannot
+     * convert renders "(unknown)" instead of reading an uninitialized
+     * struct tm. */
+    when = deadline_after(time(NULL), ttl);
+    if (localtime_r(&when, &tm) == NULL ||
+        strftime(abs_time, sizeof(abs_time), "%Y-%m-%d %H:%M:%S", &tm) == 0)
+        snprintf(abs_time, sizeof(abs_time), "(unknown)");
     snprintf(out, outsz, "%s (in %s)", abs_time, human);
 }
 
@@ -1745,6 +1819,9 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
+    /* Session rules live only in daemon memory, so the snapshot the IDs
+     * are resolved against has to come over the socket first; there is no
+     * state file to fall back to (unlike rules and pins). */
     if ((want_allow &&
          session_fetch(0, store, CLI_SESSION_MAX, &count) < 0) ||
         (want_deny &&
@@ -1754,12 +1831,22 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         return 1;
     }
 
-    /* Resolve every ID before asking, then act on the snapshot. */
+    /* Resolve every ID before asking, then act on the snapshot; a failed
+     * resolve aborts before the first request, so a typo cannot remove
+     * part of the batch.  As in the rules/pins paths, repeated IDs
+     * collapse to one: a duplicate would otherwise be removed twice and
+     * the second daemon reply ("no match") would fail an otherwise
+     * successful request. */
     int *indices = calloc((size_t)n + 1, sizeof(*indices));
-    if (!indices)
+    char (*full)[RULEID_HEX_LEN + 1] =
+        calloc((size_t)n + 1, sizeof(*full));
+
+    if (!indices || !full)
     {
         fprintf(stderr, "error: out of memory\n");
         free(store);
+        free(indices);
+        free(full);
         return 1;
     }
     for (int i = 0; i < n; i++)
@@ -1776,44 +1863,57 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         {
             free(store);
             free(indices);
+            free(full);
             return 1;
         }
+        memcpy(full[i], store[indices[i]].row.id, RULEID_HEX_LEN + 1);
     }
+    n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d session rule(s):\n", n);
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s -> %s\n", store[indices[i]].row.id,
-               store[indices[i]].row.binary, store[indices[i]].row.target);
+        cli_ui_render_confirm_line(stdout, full[i],
+                                   store[indices[i]].row.binary,
+                                   store[indices[i]].row.target, width,
+                                   g_wide);
 
     if (!cli_confirm("Remove these session rules?", g_yes))
     {
         printf("aborted; nothing removed\n");
         free(store);
         free(indices);
+        free(full);
         return 1;
     }
 
+    /* One request per ID (the current wire verb removes exactly one
+     * record).  The batch was resolved and deduped up front, so the only
+     * partial state reachable here is the daemon going away mid-loop; the
+     * error branch reports how many IDs already went through. */
     for (int i = 0; i < n; i++)
     {
         char request[128];
         ControlResponse resp;
 
         snprintf(request, sizeof(request), "SESSION_REMOVE\t%s\t%s",
-                 store[indices[i]].row.is_deny ? "deny" : "allow",
-                 store[indices[i]].row.id);
+                 store[indices[i]].row.is_deny ? "deny" : "allow", full[i]);
         int rc = ctl_call(request, &resp);
 
-        if (rc == 1)
+        if (rc != 0)
         {
-            fprintf(stderr, "error: the fileshield daemon is not running\n");
+            if (rc == 1)
+                fprintf(stderr,
+                        "error: the fileshield daemon is not running\n");
+            /* IDs earlier in the batch are already gone; report the
+             * partial count instead of a bare failure. */
+            if (removed > 0)
+                printf("removed %d session rule(s)\n", removed);
             free(store);
             free(indices);
-            return 1;
-        }
-        if (rc < 0)
-        {
-            free(store);
-            free(indices);
+            free(full);
             return 1;
         }
         removed++;
@@ -1821,6 +1921,7 @@ static int session_remove_cmd(const char *list, char **ids, int n)
     printf("removed %d session rule(s)\n", removed);
     free(store);
     free(indices);
+    free(full);
     return 0;
 }
 
@@ -1972,6 +2073,9 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}};
     int opt;
 
+    /* GNU getopt permutes argv, so global flags may follow the command
+     * word (e.g. `prune -n`); when parsing stops, argv[optind..] holds
+     * the command and its arguments only. */
     while ((opt = getopt_long(argc, argv, "ynhv", long_opts, NULL)) != -1)
     {
         switch (opt)
@@ -2005,9 +2109,12 @@ int main(int argc, char *argv[])
     const char *cmd = argv[optind++];
     int rest = argc - optind;
 
-    /* Command dispatch.  Each branch validates its own arity first and
-     * prints the concrete command line on a usage error (exit 2); data
-     * and transport errors are reported by the handlers (exit 1). */
+    /* Command dispatch, a flat if-chain: each branch validates its own
+     * arity first and prints the concrete command line on a usage error
+     * (exit 2); data and transport errors are reported by the handlers
+     * (exit 1).  Exit codes: 0 success (including "nothing to do"), 1
+     * domain failure, 2 usage.  The first match returns; an unknown
+     * command falls through to the usage dump below. */
     if (strcmp(cmd, "list") == 0)
     {
         if (rest > 1)

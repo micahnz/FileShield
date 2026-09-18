@@ -86,6 +86,12 @@ void fanotify_clear_marks(int fd);
  * event.  A nested pump (re-entered from inside a defer-mode decision,
  * e.g. by a hashing helper wait) falls back to the cheap fast-path allow
  * and defers the rest instead of recursing into the pipeline.
+ * Bounded per call: after a small number of read(2) batches, or at the
+ * first record boundary once g_running, g_need_reload or g_fatal is set,
+ * it returns to the caller's poll loop with the rest of the stream left
+ * in the group fd (readable, so the next poll/entry continues).  Every
+ * record already read is responded to or claimed (batch_abandon) before
+ * the return; no record is ever leaked or silently abandoned.
  * Called by notify.c while waiting for the dialog child to finish.
  * Returns the number of events responded to immediately.
  */
@@ -317,6 +323,26 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining);
 
 /*
+ * Test seams: the failed-response retry queue.  fanotify_test_respond()
+ * runs the real fanotify_respond() against any writable fd (a pipe
+ * stand-in receives the fanotify_response writes) and returns 0 when the
+ * response was delivered -- the caller may close the event fd -- or -1
+ * when the caller MUST keep it open (queued in the growing retry queue,
+ * or parked in the bounded stranded list).  The count seams expose the
+ * current queue/stranded depth; the force seam makes the next queue
+ * admission fail (as if its allocation failed) so the stranded fallback
+ * is reachable without real memory pressure.  Draining through
+ * fanotify_drain_and_deny() on a fresh pipe delivers one exact
+ * fanotify_response (stranded fds as FAN_DENY) and closes every event fd.
+ */
+int fanotify_test_respond(int group_fd,
+                          const struct fanotify_event_metadata *ev,
+                          unsigned int response);
+int fanotify_test_unanswered_count(void);
+int fanotify_test_stranded_count(void);
+void fanotify_test_force_unanswered_alloc_fail(int on);
+
+/*
  * Test seam: the dialog pid the current pump stack publishes for the
  * hash-helper wait hook (g_active_dialog_pid).  0 when no dialog pump is
  * on the stack; nonzero only DURING a fanotify_pump() call made with a
@@ -351,6 +377,20 @@ void fanotify_test_recent_clear(void);
 int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,
                                 pid_t sid, int hardlink, int defer);
+
+/*
+ * Test seam: run the real allow-decision recorder over a synthetic dialog
+ * decision and return the fanotify response (FAN_ALLOW).  sid > 0 marks
+ * the context as a member of that session with the given leader start
+ * time; bin_sha512 may be NULL or "" to mirror an unavailable digest.
+ * The event pid is the caller's, so a degraded grant is cached under it.
+ */
+unsigned int fanotify_test_record_allow_decision(const char *binary,
+                                                 const char *bin_sha512,
+                                                 const char *target,
+                                                 pid_t sid,
+                                                 unsigned long long sid_start,
+                                                 int decision);
 
 /* Test seam: the per-binary dialog rate limiter. */
 int fanotify_test_dialog_rate_limited(const char *binary);

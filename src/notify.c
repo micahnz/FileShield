@@ -30,7 +30,7 @@ static long long now_ms(void)
 }
 
 /*
- * Fanotify fd stored here so run_kdialog() can pump pending events
+ * Fanotify fd stored here so the dialog runners can pump pending events
  * while waiting for the dialog child (prevents mount-mark deadlock).
  */
 static int g_fan_fd = -1;
@@ -392,6 +392,8 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
 {
     memset(out, 0, sizeof(*out));
 
+    /* 1. Explicitly configured display (unit override or manual run):
+     * trusted as-is; only the session uid needs resolving. */
     const char *env_wayland = getenv("WAYLAND_DISPLAY");
     const char *env_display = getenv("DISPLAY");
 
@@ -444,6 +446,8 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
         return 0;
     }
 
+    /* 2. The requester's own session: the prompt must never be shown to
+     * a different user. */
     if (preferred_uid != (uid_t)-1 && preferred_uid != 0)
     {
         if (find_wayland_session((unsigned long)preferred_uid, out))
@@ -454,6 +458,14 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
         return 0;
     }
 
+    /*
+     * 3. Last resort for an unknown requester: the first active Wayland
+     * session under /run/user.  Auto-detection is Wayland-only because
+     * an X11 DISPLAY cannot be resolved to a user (the server socket
+     * sits in the shared /tmp/.X11-unix, not under a per-user
+     * directory), so an X11 session must arrive through the explicit
+     * environment above.
+     */
     DIR *top = opendir("/run/user");
     if (!top)
         return 0;
@@ -600,176 +612,11 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
                 (int)pid);
 }
 
-/*
- * Map a reaped dialog child's wait(2) status to its button index
- * (0 = Yes, 1 = No, 2 = Cancel), or -1 for anything that must deny.
- * Pure apart from the timeout log, so the fail-closed mapping can be
- * reviewed and table-tested in one place:
- *   - not a normal exit (killed by the outer timeout path)  -> -1
- *   - 124: coreutils timeout(1) killed kdialog               -> -1
- *   - 0/1/2: Yes / No / Cancel                               -> 0/1/2
- *   - anything else (e.g. 127 exec failure)                  -> -1
- */
-static int kdialog_status_to_choice(int status)
-{
-    if (!WIFEXITED(status))
-        return -1;
-
-    int ec = WEXITSTATUS(status);
-    if (ec == 124) /* coreutils timeout(1) */
-    {
-        log_msg(LOG_WARNING, "[dialog] kdialog timed out (30s)");
-        return -1;
-    }
-    if (ec >= 0 && ec <= 2)
-        return ec;
-    return -1;
-}
-
-/* Test seam (notify.h): the dialog exit-status mapping. */
-int notify_test_kdialog_choice(int status)
-{
-    return kdialog_status_to_choice(status);
-}
-
-/*
- * run_kdialog: show a kdialog --yesnocancel prompt with custom button
- * labels and return 0 = yes, 1 = no, 2 = cancel/window close,
- * -1 = failure/timeout.
- *
- * kdialog is wrapped in timeout(1) so a hung compositor cannot block the
- * event loop forever.  While waiting, pending fanotify events are pumped:
- * kdialog opens its own config files, which can generate FAN_OPEN_PERM
- * events on mount-marked filesystems and would otherwise deadlock the
- * helper behind the daemon's blocked event.
- *
- * kdialog returns 1 both for a deliberate No click and for some runtime
- * errors.  The stage-2 scope dialogs map No to the permanent "Always"
- * choice by explicit UX decision (documented trade-off in the README);
- * timeouts, exec failures and Cancel/window close always deny.
- */
-static int run_kdialog(const DisplaySession *session,
-                       const DialogEnvSetting *env, int env_count,
-                       const char *text, const char *yes_label,
-                       const char *no_label, const char *cancel_label)
-{
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        log_msg(LOG_ERR, "fork failed for kdialog: %m");
-        return -1;
-    }
-
-    if (pid == 0)
-    {
-        /* Own process group so the timeout kill cannot touch the daemon
-         * and so events from every dialog helper can be recognized. */
-        setpgid(0, 0);
-        drop_to_session_user(session);
-        /* Export the detected display only here, in the child: the daemon
-         * environment stays untouched so one user's session cannot leak
-         * into another prompt or into unrelated helpers. */
-        apply_display_env(session);
-        /* Let kdialog see the user's theme/font/scale/locale settings. */
-        apply_dialog_env(env, env_count);
-        close_fds_from(3);
-
-        /* exec resets only caught/default dispositions, so the daemon's
-         * SIG_IGN would leak into kdialog/timeout as ignored SIGPIPE. */
-        signal(SIGPIPE, SIG_DFL);
-
-        /* No argv[0] slot for kdialog here either: timeout sets the
-         * child's argv[0] to the command path itself, so the previous
-         * "kdialog" string landed as a stray positional (KMessageBox
-         * showed it as the details text). */
-        execl("/usr/bin/timeout", "timeout", "30",
-              "/usr/bin/kdialog",
-              "--title", "Fileshield",
-              "--yesnocancel", text,
-              "--yes-label", yes_label,
-              "--no-label", no_label,
-              "--cancel-label", cancel_label,
-              (char *)NULL);
-        _exit(127);
-    }
-
-    /* Parent-only: the child never reaches here (it execs or exits), so
-     * logging before the branch would double-log and stamp the journal
-     * with a second, confusing fileshield[pid]. */
-    log_msg(LOG_DEBUG, "[dialog] forked kdialog child pid=%d", (int)pid);
-
-    log_msg(LOG_DEBUG, "[dialog] parent waiting for kdialog (pid=%d)", (int)pid);
-    int child_exited = 0;
-    int status = 0;
-    long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
-
-    while (!child_exited && now_ms() < deadline)
-    {
-        if (!g_running || g_fatal)
-        {
-            /* Shutdown while a dialog is open: stop waiting so the daemon
-             * terminates promptly (bounded shutdown latency). */
-            log_msg(LOG_WARNING,
-                    "[dialog] shutdown while a dialog is open; denying it");
-            break;
-        }
-
-        struct pollfd pfd;
-        int nfds = 0;
-
-        if (g_fan_fd >= 0)
-        {
-            pfd.fd = g_fan_fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            nfds = 1;
-        }
-
-        int ret = poll(nfds ? &pfd : NULL, (nfds_t)nfds, 200); /* 200 ms tick */
-        if (ret < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-
-        /* Pump fanotify first so the dialog child is never stalled. */
-        if (nfds && (pfd.revents & POLLIN))
-            fanotify_pump(g_fan_fd, pid);
-
-        /* Non-blocking child-exit check. */
-        pid_t wr = waitpid(pid, &status, WNOHANG);
-        if (wr == pid)
-        {
-            child_exited = 1;
-        }
-        else if (wr < 0 && errno != EINTR)
-        {
-            log_msg(LOG_ERR, "waitpid failed: %m");
-            /* Do not leak the child: it may still be on screen, and an
-             * unreaped zombie would linger. */
-            kill_and_reap(pid, &status, &child_exited);
-            return -1;
-        }
-    }
-
-    if (!child_exited)
-    {
-        log_msg(LOG_WARNING,
-                "[dialog] kdialog timeout or shutdown, killing pid=%d",
-                (int)pid);
-        kill_and_reap(pid, &status, &child_exited);
-    }
-
-    log_msg(LOG_DEBUG, "[dialog] kdialog exited status=0x%x ec=%d",
-            status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-
-    /* A child killed by the outer timeout, an exec failure (127) or any
-     * unexpected exit code is a failure: the caller fails closed. */
-    if (!child_exited)
-        return -1;
-    return kdialog_status_to_choice(status);
-}
+/* Both dialog children exec this kdialog; notify_test_set_kdialog_path()
+ * can swap it for a scripted stand-in so the fork/pipe/drain mechanics,
+ * the argv shape and the hash-change body can be proven without a
+ * desktop click. */
+static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
 
 /*
  * Escape a plain string for safe embedding in the prompt's rich text.
@@ -857,13 +704,7 @@ typedef struct
 #define DIALOG_MENU_MAX_ITEMS 8
 #define DIALOG_TOKEN_MAX 64
 
-/* The menu child execs this kdialog. Test seam below swaps it for a
- * scripted stand-in so the fork/pipe/dup2/drain mechanics and the
- * argv shape can be proven without a desktop click; the yesnocancel
- * hash prompt always execs the production path. */
-static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
-
-/* Test seam (notify.h): override the menu kdialog binary (NULL = reset). */
+/* Test seam (notify.h): override the dialog kdialog binary (NULL = reset). */
 void notify_test_set_kdialog_path(const char *path)
 {
     if (!path)
@@ -958,6 +799,11 @@ static int run_kdialog_menu(const DisplaySession *session,
         return -1;
     }
 
+    /*
+     * Phase 1 (child): drop to the desktop user, export the detected
+     * session environment, and exec timeout/kdialog with stdout on the
+     * pipe.  Never returns.
+     */
     if (pid == 0)
     {
         /* Same child posture as run_kdialog: own process group, session
@@ -979,6 +825,8 @@ static int run_kdialog_menu(const DisplaySession *session,
          * --menu tag/item pairs by one (a selected row would then echo a
          * wrong token and deny — the exact bug an earlier build shipped
          * with).  The KF6 --menu shape is: --menu TEXT tag item [...]. */
+        /* Sizing: timeout + seconds + kdialog + --title + title + --menu
+         * + TEXT (7), then 2 per row, the optional --default pair, NULL. */
         char *argv[7 + 2 * DIALOG_MENU_MAX_ITEMS + 2 + 1];
         int n = 0;
         argv[n++] = "/usr/bin/timeout";
@@ -1009,6 +857,12 @@ static int run_kdialog_menu(const DisplaySession *session,
     log_msg(LOG_DEBUG, "[dialog] forked kdialog menu child pid=%d", (int)pid);
     close(pipefd[1]);
 
+    /*
+     * Phase 2: pump fanotify events while the dialog is open -- a
+     * pending permission event on a mount mark would otherwise deadlock
+     * the opener -- and reap the child.  Ends on child exit, the
+     * deadline, or shutdown (the dialog is then killed, which denies).
+     */
     int child_exited = 0;
     int status = 0;
     long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
@@ -1034,6 +888,8 @@ static int run_kdialog_menu(const DisplaySession *session,
             nfds = 1;
         }
 
+        /* With no fanotify fd this is a bounded sleep; the 200 ms tick
+         * keeps waitpid polling without busy-looping. */
         int ret = poll(nfds ? &pfd : NULL, (nfds_t)nfds, 200);
         if (ret < 0)
         {
@@ -1070,7 +926,9 @@ static int run_kdialog_menu(const DisplaySession *session,
     log_msg(LOG_DEBUG, "[dialog] kdialog menu exited status=0x%x ec=%d",
             status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 
-    /* The child flushed its stdout before exiting (kdialog prints the tag
+    /* Phase 3: stdout token drain.
+     *
+     * The child flushed its stdout before exiting (kdialog prints the tag
      * then leaves, and the write is far below the pipe capacity), so one
      * non-blocking drain after the reap captures the token.  Anything
      * unexpected — no data, oversized, no newline — leaves an empty or
@@ -1139,9 +997,10 @@ typedef struct
  * One menu prompt replaces the old two-stage button flow.  Every outcome
  * is an explicit row choice reported by kdialog on stdout; Cancel, window
  * close, timeouts, exec failures and every runtime error leave no token
- * and deny (see run_kdialog_menu).  The first row is the mildest grant:
- * focus lands there, so Enter confirms only the least-permissive allow,
- * and a persistent rule takes selecting "always" deliberately.
+ * and deny (see run_kdialog_menu).  The Deny Once row is preselected via
+ * --default, so an accidental Enter denies this attempt; every grant
+ * takes a deliberate row selection, and a persistent grant takes the
+ * "Allow Always" row.
  */
 int notify_ask(const NotifyRequest *req)
 {
@@ -1268,6 +1127,8 @@ int notify_ask(const NotifyRequest *req)
     snprintf(label_deny_always, sizeof(label_deny_always),
              "Deny Always - %s", deny_always_desc);
 
+    /* Tags are the wire contract with menu_token_to_decision(): labels
+     * are for the user, tags are matched byte-for-byte after the prompt. */
     const DialogMenuItem items[] = {
         { "once",          label_once },
         { "session",       label_session },
@@ -1288,6 +1149,7 @@ int notify_ask(const NotifyRequest *req)
      * Any escape failure or snprintf truncation leaves `body` on the
      * plain msg built above: readable, unstyled, never half-markup.
      */
+    /* Worst-case escape growth: 5 bytes per input byte ("&amp;"). */
     char e_comm[64 * 5 + 1];
     char e_pcomm[64 * 5 + 1];
     char e_exe[512 * 5 + 1];
@@ -1350,6 +1212,8 @@ int notify_ask(const NotifyRequest *req)
             body = html;
     }
 
+    /* Run the menu, then re-vet the returned tag: a zero exit alone is
+     * not a grant (empty and unknown tokens map to NOTIFY_DENY). */
     char token[DIALOG_TOKEN_MAX];
     int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body,
                              label_deny,
@@ -1371,11 +1235,16 @@ int notify_ask(const NotifyRequest *req)
 }
 
 /*
- * Prompt for a changed [allowlist] binary hash.  One decision only:
- * Yes = "Update & Allow" (the caller persists new_hash and grants the
- * access), No/Cancel/window close/timeout/failure = deny this attempt
- * with the old pin kept.  The two-stage grant flow is deliberately not
- * involved: the change already names one rule, one binary and one file.
+ * Prompt for a changed [allowlist] binary hash.  A two-row --menu
+ * (Update & Allow first, Deny preselected): only the "update" tag on
+ * kdialog's stdout with a zero exit code approves (the caller persists
+ * new_hash and grants the access); Deny, window close, timeout, exec or
+ * runtime failures leave no usable tag and deny this attempt with the
+ * old pin kept.  The menu's positive stdout channel is what makes an
+ * accidental Enter safe: the preselected deny row emits "deny", so
+ * kdialog's message-box default-to-Yes behavior is not involved.  The
+ * two-stage grant flow is deliberately not involved: the change already
+ * names one rule, one binary and one file.
  *
  * Rate limiting is the caller's job (see notify.h): the pipeline must
  * reject dialog_rate_limited() binaries before calling so a tampered
@@ -1392,7 +1261,6 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     char path[512];
     char old_hash[64];
     char new_hash[64];
-    char body[4096];
 
     /* Sanitized, bounded copies: even the rule pattern and the digests
      * are treated as untrusted so control characters cannot forge dialog
@@ -1412,20 +1280,58 @@ int notify_ask_hash_change(const NotifyHashChange *req)
                                                             : "(unknown)",
                   new_hash, sizeof(new_hash));
 
-    /* Full digests are journal-logged by the caller; the prompt shows
-     * only the 16-hex prefixes a human can compare at a glance. */
-    snprintf(body, sizeof(body),
-             "SHA-512 changed for allowlist rule:\n"
-             "%s\n\n"
-             "Binary:   %s\n"
-             "Target:   %s\n"
-             "Command:  %s\n\n"
-             "Old SHA-512: %.16s\xe2\x80\xa6\n"
-             "New SHA-512: %.16s\xe2\x80\xa6\n\n"
-             "Update & Allow trusts the new binary and records the new "
-             "hash.\n"
-             "Deny / Cancel blocks this attempt and keeps the old hash.",
-             rule, exe, path, cmd, old_hash, new_hash);
+    /*
+     * kdialog's --menu body renders as rich text (Qt::AutoText QLabel,
+     * like notify_ask()'s body), so every interpolated value must arrive as
+     * entities: sanitize_text() leaves '<', '>' and '&' alone, which a
+     * crafted file name could otherwise use to inject markup into the
+     * prompt itself.  Each escape buffer holds the worst case (5 bytes
+     * per input byte: "&amp;") plus the NUL, exactly like the --menu
+     * body.  body_text stays on the static fallback unless the whole
+     * document rendered: a failed escape or a truncating snprintf must
+     * never leave partial markup on screen, and the fallback contains
+     * no interpolated value at all.
+     */
+    char e_rule[512 * 5 + 1];
+    char e_exe[512 * 5 + 1];
+    char e_cmd[256 * 5 + 1];
+    char e_path[512 * 5 + 1];
+    char e_old_hash[64 * 5 + 1];
+    char e_new_hash[64 * 5 + 1];
+    char body[16384];
+    static const char fallback_body[] =
+        "SHA-512 changed for an allowlist rule.\n\n"
+        "Update & Allow trusts the new binary and records the new hash.\n"
+        "Deny (or closing this dialog) blocks this attempt and keeps the "
+        "old hash.";
+    const char *body_text = fallback_body;
+
+    if (html_escape(rule, e_rule, sizeof(e_rule)) == 0 &&
+        html_escape(exe, e_exe, sizeof(e_exe)) == 0 &&
+        html_escape(path, e_path, sizeof(e_path)) == 0 &&
+        html_escape(cmd, e_cmd, sizeof(e_cmd)) == 0 &&
+        html_escape(old_hash, e_old_hash, sizeof(e_old_hash)) == 0 &&
+        html_escape(new_hash, e_new_hash, sizeof(e_new_hash)) == 0)
+    {
+        /* Full digests are journal-logged by the caller; the prompt
+         * shows only the 16-hex prefixes a human can compare at a
+         * glance. */
+        int need = snprintf(body, sizeof(body),
+                 "SHA-512 changed for allowlist rule:\n"
+                 "%s\n\n"
+                 "Binary:   %s\n"
+                 "Target:   %s\n"
+                 "Command:  %s\n\n"
+                 "Old SHA-512: %.16s\xe2\x80\xa6\n"
+                 "New SHA-512: %.16s\xe2\x80\xa6\n\n"
+                 "Update & Allow trusts the new binary and records the new "
+                 "hash.\n"
+                 "Deny (or closing this dialog) blocks this attempt and "
+                 "keeps the old hash.",
+                 e_rule, e_exe, e_path, e_cmd, e_old_hash, e_new_hash);
+        if (need >= 0 && (size_t)need < sizeof(body))
+            body_text = body;
+    }
 
     DisplaySession session;
     int have_session = detect_display_session(req->user_uid, &session);
@@ -1452,9 +1358,22 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    int r = run_kdialog(&session, dialog_env, dialog_env_count, body,
-                        "Update & Allow", "Deny", "Cancel");
-    if (r == 0)
+    /* Two-row menu, same positive stdout channel as the access prompt:
+     * only the "update" tag grants; the deny row is preselected so an
+     * accidental confirm emits "deny".  Every other outcome leaves no
+     * usable tag and denies. */
+    const DialogMenuItem items[] = {
+        { "update", "Update & Allow" },
+        { "deny", "Deny" },
+    };
+    char token[DIALOG_TOKEN_MAX];
+    int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body_text,
+                             "Deny", items,
+                             (int)(sizeof(items) / sizeof(items[0])), token,
+                             sizeof(token));
+    /* Update tag only: a normal zero exit is not a grant by itself, and
+     * the preselected "deny" row lands in the deny branch below. */
+    if (r == 1 && strcmp(token, "update") == 0)
     {
         log_msg(LOG_WARNING,
                 "hash change approved for allowlist rule %s (%s); "
@@ -1464,8 +1383,9 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     }
 
     log_msg(LOG_WARNING,
-            "hash change denied for allowlist rule %s (%s); old pin kept",
-            rule, exe);
+            "hash change denied for allowlist rule %s (%s, selection '%s'); "
+            "old pin kept",
+            rule, exe, token[0] != '\0' ? token : "(none)");
     return NOTIFY_DENY;
 }
 
@@ -1483,6 +1403,14 @@ int notify_ask_hash_change(const NotifyHashChange *req)
 /* Defensive fallback only: the effective cap comes from [settings] notify_max. */
 #define NOTIFY_GLOBAL_MAX NOTIFY_MAX_DEFAULT
 #define NOTIFY_GLOBAL_WINDOW_S 60
+/*
+ * A *successful* notify-send availability probe is cached for this many
+ * seconds (one notification window, so a helper removed at runtime is
+ * noticed on the first hit after the window).  A failed probe is never
+ * cached: it re-runs on every hit so a re-installed helper is picked up
+ * immediately.  access() is cheap and the probe never reaches a decision.
+ */
+#define NOTIFY_SEND_RECHECK_S 60
 #define NOTIFY_SEND_PATH "/usr/bin/notify-send"
 
 typedef struct
@@ -1501,8 +1429,9 @@ static int g_notify_window_count = 0;
 static time_t g_notify_window_start = 0;
 static int g_notify_window_logged = 0;
 
-static int g_notify_send_checked = 0;
-static int g_notify_send_ok = 0;
+static int g_notify_send_ok = 0;       /* last access() probe result       */
+static int g_notify_send_logged = 0;   /* miss warning already emitted     */
+static time_t g_notify_send_check = 0; /* mono_seconds() of the last probe */
 
 /* 1 = this hit may be delivered (and is counted / remembered). */
 static int notify_rate_allow(int kind, const char *binary, const char *target,
@@ -1576,24 +1505,38 @@ static int notify_rate_allow(int kind, const char *binary, const char *target,
 }
 
 /*
- * One-time, cached availability check for notify-send.  A missing
+ * Availability check for notify-send, cached only briefly.  A missing
  * helper must not spend the dedup or flood budget on notifications that
- * can never be shown; the "not found" warning is emitted once.
+ * can never be shown; the "not found" warning is emitted once per
+ * missing episode.  A success is trusted for NOTIFY_SEND_RECHECK_S, so
+ * a helper removed at runtime is detected (and logged once) on the next
+ * hit after the window; a failure is re-probed every hit, so a
+ * re-installed helper is picked up immediately.  The probe is
+ * best-effort only and never influences an access decision.
  */
 static int notify_send_available(void)
 {
-    if (g_notify_send_ok)
+    time_t now = mono_seconds();
+
+    if (g_notify_send_ok && now - g_notify_send_check < NOTIFY_SEND_RECHECK_S)
         return 1;
 
     g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
-    if (!g_notify_send_ok && !g_notify_send_checked)
+    g_notify_send_check = now;
+
+    if (!g_notify_send_ok)
     {
-        g_notify_send_checked = 1;
-        log_msg(LOG_WARNING,
-                "notify_rule_hit: %s not found; rule notifications "
-                "disabled (see README)",
-                NOTIFY_SEND_PATH);
+        if (!g_notify_send_logged)
+        {
+            g_notify_send_logged = 1;
+            log_msg(LOG_WARNING,
+                    "notify_rule_hit: %s not found; rule notifications "
+                    "disabled (see README)",
+                    NOTIFY_SEND_PATH);
+        }
     }
+    else
+        g_notify_send_logged = 0; /* re-arm for a later removal */
     return g_notify_send_ok;
 }
 
@@ -1645,9 +1588,11 @@ static void build_hit_notification(const NotifyHit *hit, char *title,
 /*
  * Deliver a notification through notify-send from a double-forked
  * grandchild reparented to init: the daemon reaps only the intermediate,
- * with a bounded wait so the event loop never stalls.  A 127 exit means
- * exec failed (notify-send removed since the cached check), so the
- * availability flag is dropped for the next hit to re-check.
+ * with a bounded wait so the event loop never stalls.  The grandchild's
+ * exec failure is deliberately unobservable (fire-and-forget); a 127
+ * observed here is the intermediate's own fork failure, so the
+ * availability flag is dropped to force an immediate re-probe on the
+ * next hit.
  */
 static void spawn_notify_send(const DisplaySession *session,
                               const char *title, const char *body,
@@ -1711,9 +1656,9 @@ static void spawn_notify_send(const DisplaySession *session,
      * transient condition, NOT "notify-send is gone": the helper's exec
      * failure happens in the reparented grandchild and is deliberately
      * unobservable (fire-and-forget).  A genuinely missing helper is
-     * caught by notify_send_available()'s access() probe on the next
-     * hit.  Reset the cached availability so that next hit re-probes
-     * before spending another fork pair.
+     * caught by notify_send_available()'s access() probe within its
+     * recheck window.  Reset the cached success anyway so the next hit
+     * re-probes before spending another fork pair.
      */
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
         g_notify_send_ok = 0;

@@ -66,11 +66,14 @@ int notify_ask(const NotifyRequest *req);
 
 /*
  * Ask the user whether a changed [allowlist] binary hash may replace the
- * pinned value.  Yes = "Update & Allow" -> NOTIFY_ALLOW_ALWAYS (the caller
- * persists the new hash and grants this access); No, Cancel, window close,
- * timeout, kdialog failure and a NULL req all return NOTIFY_DENY with the
- * old pin untouched.  Refuses to prompt without a non-root desktop
- * session, mirroring notify_ask() (fail closed).
+ * pinned value.  A two-row menu: choosing "Update & Allow" ->
+ * NOTIFY_ALLOW_ALWAYS (the caller persists the new hash and grants this
+ * access); the preselected "Deny", window close, timeout, kdialog
+ * failure and a NULL req all return NOTIFY_DENY with the old pin
+ * untouched.  The grant rides on the same positive stdout-tag channel as
+ * notify_ask().  When running as root, refuses to prompt without a
+ * detected non-root desktop session (every other failure path also
+ * denies and keeps the old pin).
  */
 int notify_ask_hash_change(const NotifyHashChange *req);
 
@@ -138,12 +141,6 @@ int notify_test_merge_env(const char *blob, size_t len, const char *key,
 void notify_test_sanitize_ellipsized(const char *in, char *out, size_t outsz);
 
 /*
- * Test seam: map a raw wait(2) status to the kdialog button index
- * (0 = Yes, 1 = No, 2 = Cancel; -1 = no usable answer, fail closed).
- */
-int notify_test_kdialog_choice(int status);
-
-/*
  * Test seam: map a kdialog --menu selection token (the tag echoed on
  * stdout for an explicit pick) to a NOTIFY_* decision.  Every unknown,
  * empty or NULL token denies (fail closed): a grant exists only as a
@@ -152,10 +149,12 @@ int notify_test_kdialog_choice(int status);
 int notify_test_menu_choice(const char *token);
 
 /*
- * Test seam: override the kdialog binary spawned by the --menu prompt
- * (NULL restores /usr/bin/kdialog). Lets an integration test drive the
- * full fork/pipe/drain/token flow with a scripted stand-in, proving the
- * argv shape and that only a stdout tag grants.
+ * Test seam: override the kdialog binary spawned by both prompts (NULL
+ * restores /usr/bin/kdialog). Lets an integration test drive the full
+ * fork/pipe/drain/token flow with a scripted stand-in, proving the
+ * --menu argv shape and that only a stdout tag grants; the hash-change
+ * menu can likewise be driven to pin its two rows, its --default deny
+ * row and its HTML-escaped body.
  */
 void notify_test_set_kdialog_path(const char *path);
 

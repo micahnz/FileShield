@@ -6,8 +6,11 @@
  * control_handle_client() path is used without /run or root (the
  * SO_PEERCRED check passes because the socketpair peer is this process).
  * A control_setup_at() test seam covers the socket lifecycle in a temp
- * directory; control_client_call() is tested against a canned fork()
- * server so the connect/send/read-to-EOF path is real.
+ * directory, including on-demand parent-directory creation and the
+ * teardown identity check (a rebound socket survives); the size cap is
+ * pinned at CONTROL_REQ_MAX including the newline.  control_client_call()
+ * is tested against a canned fork() server so the connect/send/read-to-EOF
+ * path is real.
  *
  * Tests link the real mutation modules: the dispatch assertions check
  * the fanotify/session/pin APIs' side effects, not just response text.
@@ -531,7 +534,8 @@ static void test_bad_requests(void)
 
 /*
  * A slow or partial client must never make control_handle_client() wait:
- * it makes exactly one bounded read attempt and closes.
+ * it makes at most CONTROL_READ_MAX non-blocking read attempts and
+ * closes.
  */
 static void test_slow_clients(void)
 {
@@ -551,7 +555,8 @@ static void test_slow_clients(void)
         close(sv[0]);
     }
 
-    /* Partial line, writer gone: no newline, no response, no wait. */
+    /* Partial line, writer gone: the bounded non-blocking retries find
+     * no further bytes and the handler closes without a response. */
     run_request_bytes("PIN", 3, 1, resp, sizeof(resp));
     ASSERT(resp[0] == '\0', "partial request gets no response");
 
@@ -572,17 +577,29 @@ static void test_slow_clients(void)
         ASSERT(resp[0] == '\0', "over-long request gets no response");
     }
 
-    /* A line whose newline is exactly at the read cap is still read. */
+    /* A line of exactly CONTROL_REQ_MAX bytes including its newline is
+     * accepted: the server buffer holds one extra byte for the NUL. */
     {
         char fits[CONTROL_REQ_MAX];
 
         memset(fits, 'X', sizeof(fits));
         memcpy(fits, "PING\t", 5);
-        fits[sizeof(fits) - 2] = '\n';
-        fits[sizeof(fits) - 1] = '\0';
-        run_request_bytes(fits, sizeof(fits) - 1, 0, resp, sizeof(resp));
+        fits[sizeof(fits) - 1] = '\n';
+        run_request_bytes(fits, sizeof(fits), 0, resp, sizeof(resp));
         ASSERT(strcmp(resp, "ERR\ntoo many arguments\n") == 0,
                "request at the size cap is read");
+    }
+
+    /* One byte over the cap: the newline lies past the read bound, so
+     * the line is closed without a response. */
+    {
+        char over[CONTROL_REQ_MAX + 1];
+
+        memset(over, 'X', sizeof(over));
+        memcpy(over, "PING\t", 5);
+        over[sizeof(over) - 1] = '\n';
+        run_request_bytes(over, sizeof(over), 0, resp, sizeof(resp));
+        ASSERT(resp[0] == '\0', "request past the size cap gets no response");
     }
 }
 
@@ -1003,6 +1020,137 @@ static void test_setup_teardown(void)
     }
 }
 
+/*
+ * control_setup_at() creates a missing parent directory 0700 so a
+ * foreground run works without systemd's RuntimeDirectory=.
+ */
+static void test_setup_parent_dir(void)
+{
+    char dir[PATH_MAX];
+    char sock[PATH_MAX + 32];
+    struct stat st;
+    int fd;
+
+    snprintf(dir, sizeof(dir), "%s/ctl-dir", g_tmp);
+    snprintf(sock, sizeof(sock), "%s/control.sock", dir);
+    rmdir(dir);
+    ASSERT(lstat(dir, &st) != 0, "parent directory absent before setup");
+
+    fd = control_setup_at(sock);
+    ASSERT(fd >= 0, "setup creates the missing parent directory");
+    if (fd < 0)
+    {
+        rmdir(dir);
+        return;
+    }
+
+    ASSERT(lstat(dir, &st) == 0 && S_ISDIR(st.st_mode),
+           "parent is a directory");
+    ASSERT((st.st_mode & 0077) == 0, "parent is not group/other accessible");
+    ASSERT(st.st_uid == geteuid(), "parent owner is the effective uid");
+
+    control_teardown(fd);
+    ASSERT(lstat(sock, &st) != 0, "socket gone after teardown");
+    ASSERT(rmdir(dir) == 0, "parent directory left empty and removable");
+
+    /* An existing non-directory at the parent path is refused (EEXIST
+     * is tolerated only for a usable directory). */
+    {
+        char file[PATH_MAX];
+        char inside[PATH_MAX + 32];
+        int f;
+
+        snprintf(file, sizeof(file), "%s/ctl-file", g_tmp);
+        snprintf(inside, sizeof(inside), "%s/control.sock", file);
+        unlink(file);
+        f = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ASSERT(f >= 0, "create regular file at the parent path");
+        if (f >= 0)
+            close(f);
+        ASSERT(control_setup_at(inside) == -1,
+               "non-directory parent is refused");
+        unlink(file);
+    }
+}
+
+/*
+ * A rebound socket at the same path must survive teardown: the close()
+ * teardown performs can race a restart that already bound a fresh
+ * listener, and unlinking it would leave the new daemon unreachable.
+ */
+static void test_teardown_identity(void)
+{
+    char sock[PATH_MAX];
+    struct sockaddr_un addr;
+    struct stat st;
+    ino_t bound_ino = 0;
+    int fd;
+    int other;
+
+    snprintf(sock, sizeof(sock), "%s/rebind.sock", g_tmp);
+    unlink(sock);
+
+    fd = control_setup_at(sock);
+    ASSERT(fd >= 0, "setup for teardown-identity test");
+    if (fd < 0)
+        return;
+
+    /* Replace the path while this listener's fd is still open: unlink
+     * removes the name, a raw bind installs a fresh socket inode. */
+    ASSERT(unlink(sock) == 0, "drop the path while the listener lives");
+    other = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT(other >= 0, "replacement listener socket");
+    if (other < 0)
+    {
+        control_teardown(fd);
+        return;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    ASSERT(fill_sun_path(&addr, sock) == 0, "replacement path fits");
+    if (bind(other, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        lstat(sock, &st) != 0)
+    {
+        ASSERT(0, "replacement listener setup");
+        control_teardown(fd);
+        close(other);
+        unlink(sock);
+        return;
+    }
+    bound_ino = st.st_ino;
+
+    control_teardown(fd);
+
+    ASSERT(lstat(sock, &st) == 0 && S_ISSOCK(st.st_mode),
+           "teardown keeps a socket it did not bind");
+    ASSERT(st.st_ino == bound_ino, "replacement socket inode unchanged");
+
+    close(other);
+    unlink(sock);
+}
+
+/* A path that vanished before teardown is already clean. */
+static void test_teardown_missing_path(void)
+{
+    char sock[PATH_MAX];
+    struct stat st;
+    int fd;
+
+    snprintf(sock, sizeof(sock), "%s/gone.sock", g_tmp);
+    unlink(sock);
+
+    fd = control_setup_at(sock);
+    ASSERT(fd >= 0, "setup for vanished-path teardown");
+    if (fd < 0)
+        return;
+
+    ASSERT(unlink(sock) == 0, "remove the path before teardown");
+    control_teardown(fd);
+    ASSERT(lstat(sock, &st) != 0 && errno == ENOENT,
+           "teardown tolerates a vanished path");
+}
+
 /* control_handle() accepts and serves a connection on a real listener. */
 static void test_handle_accept(void)
 {
@@ -1263,6 +1411,9 @@ int main(void)
     test_session_dispatch();
     test_pin_dispatch();
     test_setup_teardown();
+    test_setup_parent_dir();
+    test_teardown_identity();
+    test_teardown_missing_path();
     test_handle_accept();
     test_client_call();
 
@@ -1276,6 +1427,14 @@ int main(void)
         snprintf(path, sizeof(path), "%s/pins.json", g_tmp);
         unlink(path);
         snprintf(path, sizeof(path), "%s/ctl.sock", g_tmp);
+        unlink(path);
+        snprintf(path, sizeof(path), "%s/rebind.sock", g_tmp);
+        unlink(path);
+        snprintf(path, sizeof(path), "%s/gone.sock", g_tmp);
+        unlink(path);
+        snprintf(path, sizeof(path), "%s/ctl-dir", g_tmp);
+        rmdir(path);
+        snprintf(path, sizeof(path), "%s/ctl-file", g_tmp);
         unlink(path);
     }
     rmdir(g_tmp);

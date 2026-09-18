@@ -19,6 +19,14 @@
 
 #define DEFAULT_CONFIG "/etc/fileshield.conf"
 
+/*
+ * Lifecycle flags shared with the event loop and the dialog code
+ * (declared in utils.h).  Handlers only set these and poke the wake
+ * pipe; the main loop acts on them: g_running=0 shuts down,
+ * g_need_reload=1 (SIGHUP or a control RELOAD) reloads after the
+ * current pass, and g_fatal=1 (group unusable, failed rollback) exits
+ * through the fail-closed drain with EXIT_FAILURE.
+ */
 volatile sig_atomic_t g_running = 1;
 volatile sig_atomic_t g_need_reload = 0;
 volatile sig_atomic_t g_fatal = 0;
@@ -154,6 +162,7 @@ static int startup_fail(int fan_fd, Config *cfg)
     }
     config_reset(cfg);
     free(cfg);
+    g_config = NULL; /* the freed config must never be dereferenced */
     closelog();
     return EXIT_FAILURE;
 }
@@ -213,6 +222,14 @@ int main(int argc, char *argv[])
 
     openlog("fileshield", LOG_PID | LOG_CONS, LOG_DAEMON);
 
+    /*
+     * Startup order is deliberate: config, optional dry-run exit,
+     * daemonize, signal handling, then the fail-closed sequence --
+     * fanotify group, persisted state and pins BEFORE any mark exists
+     * (a marked open of our own state files could only be answered by
+     * this daemon), marks, control socket, and [settings] debug last,
+     * once startup has fully succeeded.
+     */
     Config *cfg = calloc(1, sizeof(Config));
     if (!cfg)
     {
@@ -245,6 +262,9 @@ int main(int argc, char *argv[])
         daemonize();
     }
 
+    /* SA_RESTART stays unset (the struct is zeroed): the blocking calls
+     * behind the event loop must return EINTR so a flag is observed
+     * promptly; the wake pipe closes the check-then-block race. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigterm_handler;
@@ -274,6 +294,8 @@ int main(int argc, char *argv[])
         log_msg(LOG_ERR, "fanotify_setup failed");
         return startup_fail(-1, cfg);
     }
+    /* Dialogs pump this group while they wait for the user so pending
+     * permission events are not left unanswered (see notify.c). */
     notify_set_fan_fd(fan_fd);
 
     /* Fail closed: a security daemon must never run in a silently
@@ -333,8 +355,9 @@ int main(int argc, char *argv[])
      * setup failure is fatal: a daemon without a listener would push CLI
      * mutations onto the direct-file fallback and reintroduce the
      * lost-update race the socket exists to close.  Setup only creates
-     * /run/fileshield.sock -- it opens no marked path -- and runs after
-     * persisted state and pins were loaded and the marks were installed. */
+     * /run/fileshield/control.sock and its parent directory -- it opens
+     * no marked path -- and runs after persisted state and pins were
+     * loaded and the marks were installed. */
     int control_fd = control_setup();
     if (control_fd < 0)
     {
@@ -344,16 +367,36 @@ int main(int argc, char *argv[])
         return startup_fail(fan_fd, cfg);
     }
 
+    /* [settings] debug is staged by config_load(): apply it only now
+     * that startup has fully accepted the config.  A config refused by
+     * the scope guard, a failed mark install or a failed control-socket
+     * setup must leave the previous logging state (config.h). */
+    if (cfg->debug_set)
+        log_set_debug(cfg->debug);
+
     log_msg(LOG_INFO, "Fileshield started, watching %d paths (%d exclusions)",
             cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
 
+    /* One fanotify_loop() pass per iteration; it returns here when a
+     * signal flag changed.  g_fatal wins over a pending reload, and a
+     * failed reload breaks into the fail-closed drain below. */
     while (g_running)
     {
         fanotify_loop(fan_fd, g_sigwake[0], control_fd);
         if (g_fatal)
             break;
-        if (g_need_reload && reload_protection(fan_fd, config_path, &cfg) < 0)
-            break;
+        if (g_need_reload)
+        {
+            if (reload_protection(fan_fd, config_path, &cfg) < 0)
+                break;
+            /* reload_protection() republishes 'cfg' only when the new
+             * config was accepted; on a rejected reload it still points
+             * at the old config, whose staged debug value is the one
+             * already in effect.  Applying here keeps a rejected or
+             * rolled-back config from toggling global logging. */
+            if (cfg->debug_set)
+                log_set_debug(cfg->debug);
+        }
     }
 
     log_msg(LOG_INFO, "Fileshield shutting down");
@@ -387,5 +430,7 @@ int main(int argc, char *argv[])
     config_reset(cfg);
     free(cfg);
     closelog();
+    /* g_fatal is a failure for the init system: systemd's Restart=
+     * policy must retry from a clean state. */
     return g_fatal ? EXIT_FAILURE : EXIT_SUCCESS;
 }

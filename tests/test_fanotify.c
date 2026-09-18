@@ -37,6 +37,7 @@
 
 #include "../src/fanotify.h"
 #include "../src/config.h"
+#include "../src/cache.h"
 #include "../src/inode.h"
 #include "../src/notify.h"
 #include "../src/pin.h"
@@ -247,6 +248,39 @@ static void test_deleted_suffix_stripped(void) {
 }
 
 /*
+ * Part 0e2: resolve_fd_path() rejects a truncated readlink() result.  The
+ * kernel fills the buffer without a NUL terminator and readlink(2)
+ * returns the number of bytes it would have written; a return of outsz-1
+ * is either a path that did not fit or one that exactly filled the
+ * buffer.  Both are unverifiable, so the resolver must fail — a partial
+ * path must never be treated as a match — exactly like proc_exe_path().
+ */
+static void test_resolve_path_truncation_rejected(void) {
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(fd >= 0, "open /dev/null for resolve-truncation test");
+    if (fd < 0)
+        return;
+
+    /* "/dev/null" is 9 bytes: an 11-byte buffer accepts it with one spare
+     * byte; a 10-byte buffer receives exactly outsz-1 bytes and is
+     * rejected as unverifiable. */
+    char roomy[11];
+    char exact[10];
+    char tiny[4];
+
+    ASSERT(fanotify_test_resolve_path(fd, roomy, sizeof(roomy)) == 0,
+           "a path that fits with room to spare resolves");
+    ASSERT(strcmp(roomy, "/dev/null") == 0, "the resolved path is exact");
+
+    ASSERT(fanotify_test_resolve_path(fd, exact, sizeof(exact)) == -1,
+           "a readlink result exactly filling the buffer is rejected");
+    ASSERT(fanotify_test_resolve_path(fd, tiny, sizeof(tiny)) == -1,
+           "a clearly truncated readlink result is rejected");
+
+    close(fd);
+}
+
+/*
  * Part 0f: '!' exclusions are deny-wins and order-independent.  The
  * exclusion is listed before the positive to prove that config order
  * does not matter.
@@ -267,6 +301,7 @@ static void test_exclusions_deny_wins(void) {
     cfg.protected[1].base_len = (int)strlen(base);
     cfg.protected_count = 2;
     cfg.exclude_count = 1;
+    cfg.exclude_idx[0] = 0; /* the exclusion's protected[] index */
 
     Config *saved = g_config;
     g_config = &cfg;
@@ -288,6 +323,35 @@ static void test_exclusions_deny_wins(void) {
            "globstar exclusion matches zero segments");
     ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/id_ed25519.pub") == 1,
            "globstar exclusion matches nested files");
+
+    /*
+     * Non-zero exclusion index: the exclusion sits after the positives in
+     * protected[], so a matcher that assumes exclude_idx == 0 (the old
+     * accidentally-passing setup) would miss it and wrongly treat the
+     * excluded files as protected.
+     */
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "%s",
+             "/home/u/.ssh");
+    cfg.protected[0].base_len = (int)strlen(cfg.protected[0].path);
+    snprintf(cfg.protected[1].path, sizeof(cfg.protected[1].path), "%s",
+             "/home/u/.ssh/sub/*.pub");
+    cfg.protected[1].is_glob = 1;
+    cfg.protected[1].is_exclude = 1;
+    cfg.protected[1].base_len = (int)strlen("/home/u/.ssh/sub");
+    snprintf(cfg.protected[2].path, sizeof(cfg.protected[2].path), "%s",
+             "/home/u/.ssh/sub");
+    cfg.protected[2].base_len = (int)strlen(cfg.protected[2].path);
+    cfg.protected_count = 3;
+    cfg.exclude_count = 1;
+    cfg.exclude_idx[0] = 1;
+
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/key.pub") == 1,
+           "exclusion recorded at a non-zero index is honored");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/sub/key") == 0,
+           "the positive entry at index 2 still protects");
+    ASSERT(fanotify_test_fastpath_allows(0, 0, "/home/u/.ssh/top.pub") == 0,
+           "a non-matching exclusion leaves other paths protected");
 
     g_config = saved;
     inode_set_clear();
@@ -840,7 +904,9 @@ static void test_notify_rate_windows(void)
 /*
  * Unsafe hits surface once per process: the first hit qualifies for the
  * warning + notification, repeats are suppressed, and another process is
- * a new instance.
+ * a new instance.  The gate key is (pid, /proc/<pid>/stat start time):
+ * the same pid number after the process is gone must surface again, so a
+ * pid-only gate fails the last two assertions.
  */
 static void test_unsafe_hit_once_per_process(void)
 {
@@ -852,6 +918,34 @@ static void test_unsafe_hit_once_per_process(void)
            "repeat unsafe hit for the same process is suppressed");
     ASSERT(fanotify_test_unsafe_first_hit(getppid()) == 1,
            "another process is surfaced independently");
+
+    /*
+     * (pid, start) coverage: a live child gets its own key; once it is
+     * reaped, the same pid number has no readable start time (and a
+     * recycled pid would carry a new one), so the gate must treat it as
+     * a new instance instead of inheriting the dead process's decision.
+     */
+    pid_t child = fork();
+    ASSERT(child >= 0, "fork the unsafe-gate child");
+    if (child == 0)
+    {
+        for (;;)
+            pause();
+        _exit(0);
+    }
+    if (child > 0)
+    {
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 1,
+               "the child's first hit is surfaced");
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 0,
+               "the child's repeat hit is suppressed");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 1,
+               "same pid with a different/unknown start is a new instance");
+        ASSERT(fanotify_test_unsafe_first_hit(child) == 0,
+               "the new (pid, start) key is remembered");
+    }
 }
 
 /*
@@ -1672,20 +1766,6 @@ static void test_cmdline_fingerprint_full(void) {
 }
 
 /*
- * Part 0k: the dialog exit-status mapping fails closed for everything
- * that is not a definite Yes/No/Cancel.
- */
-static void test_kdialog_status_mapping(void) {
-    ASSERT(notify_test_kdialog_choice(0 << 8) == 0, "exit 0 is Yes");
-    ASSERT(notify_test_kdialog_choice(1 << 8) == 1, "exit 1 is No");
-    ASSERT(notify_test_kdialog_choice(2 << 8) == 2, "exit 2 is Cancel");
-    ASSERT(notify_test_kdialog_choice(124 << 8) == -1, "timeout denies");
-    ASSERT(notify_test_kdialog_choice(127 << 8) == -1, "exec failure denies");
-    ASSERT(notify_test_kdialog_choice(3 << 8) == -1, "unknown code denies");
-    ASSERT(notify_test_kdialog_choice(SIGKILL) == -1, "signal death denies");
-}
-
-/*
  * The kdialog --menu decision seam: a grant exists only as an explicit
  * tag the user selected.  Every other string — including empty, NULL,
  * near-misses and tokens an error path or forged stream might produce —
@@ -1718,24 +1798,206 @@ static void test_menu_choice_mapping(void) {
 }
 
 /*
+ * Exec-capable fixture directory for the kdialog stand-ins.
+ *
+ * The dialog tests must fork/exec a helper script, but /tmp is commonly
+ * mounted noexec (the CI environment does exactly that).  The fixture
+ * creates a per-run directory next to the test binary (TMPDIR and /tmp
+ * are fallbacks) and proves it can execute a file with a shebang probe:
+ * when no candidate directory is exec-capable, the dialog tests print
+ * SKIP and return instead of failing.  Every dump path lives in this
+ * directory and is passed to the script through the environment, so no
+ * fixed global path is ever used and parallel runs cannot collide.
+ */
+#define DLG_DIR_MAX (PATH_MAX + 64)
+#define DLG_PATH_MAX (PATH_MAX + 160)
+
+static char g_dlg_dir[DLG_DIR_MAX];
+static int g_dlg_ready = 0;
+
+/* Run a tiny shebang script in 'dir' to prove it can exec. */
+static int dlg_probe_is_exec(const char *dir)
+{
+    char probe[DLG_PATH_MAX];
+    FILE *f;
+    pid_t pid;
+    int status = 0;
+
+    snprintf(probe, sizeof(probe), "%s/probe.sh", dir);
+    f = fopen(probe, "w");
+    if (!f)
+        return -1;
+    fputs("#!/bin/sh\nexit 0\n", f);
+    if (ferror(f) || fclose(f) != 0)
+    {
+        unlink(probe);
+        return -1;
+    }
+    if (chmod(probe, 0700) != 0)
+    {
+        unlink(probe);
+        return -1;
+    }
+
+    pid = fork();
+    if (pid == 0)
+    {
+        execl(probe, probe, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0 || waitpid(pid, &status, 0) != pid)
+    {
+        unlink(probe);
+        return -1;
+    }
+    unlink(probe);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int dlg_fixture_init(void)
+{
+    const char *candidates[4];
+    const char *tmpdir;
+    char exe[PATH_MAX];
+    char exe_dir[PATH_MAX];
+    ssize_t n;
+    int nc = 0;
+    int i;
+
+    if (g_dlg_ready)
+        return 0;
+
+    exe_dir[0] = '\0';
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0)
+    {
+        char *slash;
+
+        exe[n] = '\0';
+        slash = strrchr(exe, '/');
+        if (slash && slash != exe)
+        {
+            *slash = '\0';
+            snprintf(exe_dir, sizeof(exe_dir), "%s", exe);
+            candidates[nc++] = exe_dir;
+        }
+    }
+    tmpdir = getenv("TMPDIR");
+    if (tmpdir && tmpdir[0] != '\0')
+        candidates[nc++] = tmpdir;
+    candidates[nc++] = "/tmp";
+    candidates[nc] = NULL;
+
+    for (i = 0; candidates[i] != NULL; i++)
+    {
+        snprintf(g_dlg_dir, sizeof(g_dlg_dir), "%s/.fileshield_dlg_XXXXXX",
+                 candidates[i]);
+        if (!mkdtemp(g_dlg_dir))
+            continue;
+        if (dlg_probe_is_exec(g_dlg_dir) == 0)
+        {
+            g_dlg_ready = 1;
+            return 0;
+        }
+        rmdir(g_dlg_dir);
+        g_dlg_dir[0] = '\0';
+    }
+    return -1;
+}
+
+static void dlg_fixture_cleanup(void)
+{
+    static const char *const names[] = {
+        "menu.sh", "hashchange.sh", "menu-body.txt", "menu-labels.txt",
+        "menu-default.txt", "hashchange-body.txt", "hashchange-default.txt"};
+    char path[DLG_PATH_MAX];
+    size_t i;
+
+    if (!g_dlg_ready)
+        return;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, names[i]);
+        unlink(path);
+    }
+    rmdir(g_dlg_dir);
+    g_dlg_ready = 0;
+}
+
+/* Create one fixture script inside the exec-capable directory. */
+static int dlg_write_script(const char *name, const char *body)
+{
+    char path[DLG_PATH_MAX];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, name);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fputs(body, f);
+    if (ferror(f) || fclose(f) != 0)
+        return -1;
+    return chmod(path, 0700);
+}
+
+/* Read one dump file from the fixture directory into out. */
+static long dlg_read_dump(const char *name, char *out, size_t outsz)
+{
+    char path[DLG_PATH_MAX];
+    FILE *f;
+    size_t n;
+
+    snprintf(path, sizeof(path), "%s/%s", g_dlg_dir, name);
+    f = fopen(path, "r");
+    if (!f)
+    {
+        out[0] = '\0';
+        return -1;
+    }
+    n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return (long)n;
+}
+
+/*
  * Menu end-to-end: drive the real notify_ask -> run_kdialog_menu fork
  * with a scripted kdialog stand-in (notify_test_set_kdialog_path), so
  * the child's argv shape, the stdout pipe drain and the token->decision
  * mapping are proven together — without needing a desktop click.
  * The script asserts the KF6 --menu shape (kdialog --title Fileshield
  * --menu BODY + 6 tag/label pairs = 16 args after argv[0]) and then
- * behaves per FAKE_KDIALOG_MODE.
+ * behaves per FAKE_KDIALOG_MODE.  Dump paths arrive via the environment
+ * (per-run, next to the test binary) instead of fixed /tmp names, so the
+ * test works where /tmp is noexec and parallel runs stay independent.
  */
 static void test_menu_end_to_end(void) {
     log_msg(LOG_DEBUG, "warm up syslog before menu child fork");
 
-    char script[PATH_MAX];
-    snprintf(script, sizeof(script), "/tmp/fileshield_fakekdialog_%d.sh",
-             (int)getpid());
-    FILE *f = fopen(script, "w");
-    ASSERT(f != NULL, "create fake kdialog script");
-    if (!f)
+    /* Root without a detected desktop session makes notify_ask() fail
+     * closed before any dialog; that is a genuine environment skip. */
+    if (getuid() == 0) {
+        printf("SKIP: dialog tests run unprivileged (root prompts need a "
+               "detected desktop session)\n");
         return;
+    }
+    if (dlg_fixture_init() < 0) {
+        printf("SKIP: no exec-capable temp directory for the fake-kdialog "
+               "script (all candidates are noexec or read-only)\n");
+        return;
+    }
+
+    char script[DLG_PATH_MAX];
+    char body_dump[DLG_PATH_MAX];
+    char labels_dump[DLG_PATH_MAX];
+    char default_dump[DLG_PATH_MAX];
+    snprintf(script, sizeof(script), "%s/menu.sh", g_dlg_dir);
+    snprintf(body_dump, sizeof(body_dump), "%s/menu-body.txt", g_dlg_dir);
+    snprintf(labels_dump, sizeof(labels_dump), "%s/menu-labels.txt",
+             g_dlg_dir);
+    snprintf(default_dump, sizeof(default_dump), "%s/menu-default.txt",
+             g_dlg_dir);
+
     /* timeout execs the script with argv[0] = script path, so:
      * $1=--title $2=Fileshield $3=--menu $4=BODY $5=first TAG $6=first
      * label ... $16=last label, then $17=--default $18=deny label
@@ -1745,27 +2007,34 @@ static void test_menu_end_to_end(void) {
      * the tag/item alignment.  The --default pair must name the Deny
      * Once row so a confirm with no selection denies instead of
      * granting. */
-    fputs("#!/bin/sh\n"
-          "[ \"$#\" -eq 18 ] || exit 0\n"
-          "[ \"$1\" = \"--title\" ] || exit 0\n"
-          "[ \"$3\" = \"--menu\" ] || exit 0\n"
-          "[ \"$5\" = \"once\" ] || exit 0\n"
-          "[ \"${17}\" = \"--default\" ] || exit 0\n"
-          "case \"$FAKE_KDIALOG_MODE\" in\n"
-          "  pick) echo once; exit 0 ;;\n"
-          "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
-          "  empty-ok) exit 0 ;;\n"
-          "  dump) printf '%s' \"$4\" > /tmp/fileshield_body_dump; "
-          "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
-          "\"${14}\" \"${16}\" > /tmp/fileshield_labels_dump; "
-          "printf '%s|%s' \"${17}\" \"${18}\" "
-          "> /tmp/fileshield_default_dump; "
-          "echo once; exit 0 ;;\n"
-          "esac\n"
-          "exit 1\n",
-          f);
-    fclose(f);
-    chmod(script, 0755);
+    ASSERT(dlg_write_script(
+               "menu.sh",
+               "#!/bin/sh\n"
+               "[ \"$#\" -eq 18 ] || exit 0\n"
+               "[ \"$1\" = \"--title\" ] || exit 0\n"
+               "[ \"$3\" = \"--menu\" ] || exit 0\n"
+               "[ \"$5\" = \"once\" ] || exit 0\n"
+               "[ \"${17}\" = \"--default\" ] || exit 0\n"
+               "case \"$FAKE_KDIALOG_MODE\" in\n"
+               "  pick) echo once; exit 0 ;;\n"
+               "  garbage) echo \"Not A Tag\"; exit 0 ;;\n"
+               "  empty-ok) exit 0 ;;\n"
+               "  dump) printf '%s' \"$4\" > \"$FAKE_KDIALOG_BODY_DUMP\"; "
+               "printf '%s|%s|%s|%s|%s|%s' \"$6\" \"$8\" \"${10}\" \"${12}\" "
+               "\"${14}\" \"${16}\" > \"$FAKE_KDIALOG_LABELS_DUMP\"; "
+               "printf '%s|%s' \"${17}\" \"${18}\" "
+               "> \"$FAKE_KDIALOG_DEFAULT_DUMP\"; "
+               "echo once; exit 0 ;;\n"
+               "esac\n"
+               "exit 1\n") == 0,
+           "write fake kdialog menu script");
+
+    /* The script's dumps are read by the parent after the child exits;
+     * the over-long buffer bounds are compile-time only (VAR names are
+     * short), so the snprintf result is not checked. */
+    (void)setenv("FAKE_KDIALOG_BODY_DUMP", body_dump, 1);
+    (void)setenv("FAKE_KDIALOG_LABELS_DUMP", labels_dump, 1);
+    (void)setenv("FAKE_KDIALOG_DEFAULT_DUMP", default_dump, 1);
 
     NotifyRequest req;
     memset(&req, 0, sizeof(req));
@@ -1807,20 +2076,13 @@ static void test_menu_end_to_end(void) {
     /*
      * Dump mode: pin the design contract of the text a real kdialog
      * would render, plus the row labels — verified as text, no GUI.
-     * The dumps stay in /tmp for manual inspection (overwritten on
-     * every run).
+     * The per-run dumps are removed by dlg_fixture_cleanup().
      */
     ASSERT(setenv("FAKE_KDIALOG_MODE", "dump", 1) == 0, "set dump mode");
     ASSERT(notify_ask(&req) == NOTIFY_ALLOW_ONCE, "dump run still grants");
 
     char dump[4096];
-    size_t dlen = 0;
-    FILE *df = fopen("/tmp/fileshield_body_dump", "r");
-    if (df) {
-        dlen = fread(dump, 1, sizeof(dump) - 1, df);
-        fclose(df);
-    }
-    dump[dlen] = '\0';
+    long dlen = dlg_read_dump("menu-body.txt", dump, sizeof(dump));
     ASSERT(dlen > 0, "rendered body dump written");
     ASSERT(strstr(dump, "<div align=\"left\">") != NULL,
            "body pinned left-aligned against kdialog's center label");
@@ -1858,13 +2120,8 @@ static void test_menu_end_to_end(void) {
            "old wordy Allow Always description is gone");
 
     char labels[512];
-    size_t llen = 0;
-    FILE *lf = fopen("/tmp/fileshield_labels_dump", "r");
-    if (lf) {
-        llen = fread(labels, 1, sizeof(labels) - 1, lf);
-        fclose(lf);
-    }
-    labels[llen] = '\0';
+    long llen = dlg_read_dump("menu-labels.txt", labels, sizeof(labels));
+    ASSERT(llen > 0, "labels dump written");
     ASSERT(strcmp(labels,
                   "Allow Once - this file and process, cached 60 seconds|"
                   "Allow Session - this binary and file until the session ends|"
@@ -1878,19 +2135,139 @@ static void test_menu_end_to_end(void) {
     /* A confirm with no deliberate selection must deny, not grant: the
      * --default row is the deny row. */
     char defdump[128];
-    size_t fllen = 0;
-    FILE *ddf = fopen("/tmp/fileshield_default_dump", "r");
-    if (ddf) {
-        fllen = fread(defdump, 1, sizeof(defdump) - 1, ddf);
-        fclose(ddf);
-    }
-    defdump[fllen] = '\0';
+    long fllen = dlg_read_dump("menu-default.txt", defdump, sizeof(defdump));
+    ASSERT(fllen > 0, "default dump written");
     ASSERT(strcmp(defdump,
                   "--default|Deny Once - block this access only") == 0,
            "no-selection confirm defaults to Deny Once (deny, never allow)");
 
     notify_test_set_kdialog_path(NULL);
-    unlink(script);
+}
+
+/*
+ * Hash-change menu end-to-end: the scripted kdialog stand-in asserts the
+ * exact two-row --menu argv (--menu BODY update "Update & Allow" deny
+ * Deny --default Deny) and dumps the body, so the test proves every
+ * interpolated value is HTML-escaped and that only the "update" stdout
+ * tag grants.  Pre-fix (the yesnocancel form) the argv did not match and
+ * the deny default did not gate Enter; the original B1 bug also let raw
+ * <, > and & through, which the escape asserts below catch.
+ */
+static void test_hash_change_prompt_escapes(void) {
+    log_msg(LOG_DEBUG, "warm up syslog before hash-change child fork");
+
+    if (getuid() == 0) {
+        printf("SKIP: dialog tests run unprivileged (root prompts need a "
+               "detected desktop session)\n");
+        return;
+    }
+    if (dlg_fixture_init() < 0) {
+        printf("SKIP: no exec-capable temp directory for the fake-kdialog "
+               "script (all candidates are noexec or read-only)\n");
+        return;
+    }
+
+    char script[DLG_PATH_MAX];
+    char body_dump[DLG_PATH_MAX];
+    char default_dump[DLG_PATH_MAX];
+    snprintf(script, sizeof(script), "%s/hashchange.sh", g_dlg_dir);
+    snprintf(body_dump, sizeof(body_dump), "%s/hashchange-body.txt",
+             g_dlg_dir);
+    snprintf(default_dump, sizeof(default_dump), "%s/hashchange-default.txt",
+             g_dlg_dir);
+
+    /*
+     * timeout execs the script, so $1..$10 are the kdialog arguments:
+     * --title Fileshield --menu BODY update "Update & Allow" deny Deny
+     * --default Deny.  Any mismatch writes a diagnostic to the body dump
+     * and exits; a missing dump then fails the assertions below (that is
+     * how a yesnocancel-shaped argv fails this test).
+     */
+    ASSERT(dlg_write_script(
+               "hashchange.sh",
+               "#!/bin/sh\n"
+               "body=\"$FAKE_KDIALOG_HASH_BODY_DUMP\"\n"
+               "[ \"$#\" -eq 10 ] || { printf 'argv-count:%s' \"$#\" > "
+               "\"$body\"; exit 1; }\n"
+               "[ \"$1\" = \"--title\" ] && [ \"$2\" = \"Fileshield\" ] || "
+               "{ printf 'argv-title' > \"$body\"; exit 1; }\n"
+               "[ \"$3\" = \"--menu\" ] || { printf 'argv-mode' > "
+               "\"$body\"; exit 1; }\n"
+               "[ \"$5\" = \"update\" ] && [ \"$6\" = \"Update & Allow\" ] "
+               "|| { printf 'argv-allow-row' > \"$body\"; exit 1; }\n"
+               "[ \"$7\" = \"deny\" ] && [ \"$8\" = \"Deny\" ] || { "
+               "printf 'argv-deny-row' > \"$body\"; exit 1; }\n"
+               "[ \"$9\" = \"--default\" ] && [ \"${10}\" = \"Deny\" ] || { "
+               "printf 'argv-default' > \"$body\"; exit 1; }\n"
+               "printf '%s|%s' \"$9\" \"${10}\" > "
+               "\"$FAKE_KDIALOG_HASH_DEFAULT_DUMP\"\n"
+               "printf '%s' \"$4\" > \"$body\"\n"
+               "case \"$FAKE_KDIALOG_HASH_MODE\" in "
+               "approve) printf 'update'; exit 0 ;; "
+               "deny) printf 'deny'; exit 0 ;; "
+               "empty) exit 0 ;; esac\n"
+               "exit 1\n") == 0,
+           "write fake kdialog hash-change script");
+
+    (void)setenv("FAKE_KDIALOG_HASH_BODY_DUMP", body_dump, 1);
+    (void)setenv("FAKE_KDIALOG_HASH_DEFAULT_DUMP", default_dump, 1);
+
+    /* Every field carries markup an attacker could use to forge the
+     * body; all of them must arrive as entities. */
+    NotifyHashChange req;
+    memset(&req, 0, sizeof(req));
+    req.rule_pattern = "/opt/<tool>&co";
+    req.exe = "/usr/bin/<exe>&runner";
+    req.old_hash = PIN_SHA_A;
+    req.new_hash = PIN_SHA_B;
+    req.path = "/home/u/<secret>&file";
+    req.cmdline = "run --x <y> & z";
+    req.pid = getpid();
+    req.user_uid = getuid();
+
+    notify_test_set_kdialog_path(script);
+
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "deny", 1) == 0, "deny mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_DENY,
+           "an emitted deny tag denies (old pin kept)");
+
+    char dump[8192];
+    ASSERT(dlg_read_dump("hashchange-body.txt", dump, sizeof(dump)) > 0,
+           "hash-change body dump written (argv shape matched)");
+    ASSERT(strstr(dump, "/opt/&lt;tool&gt;&amp;co") != NULL,
+           "rule pattern is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/usr/bin/&lt;exe&gt;&amp;runner") != NULL,
+           "binary path is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/home/u/&lt;secret&gt;&amp;file") != NULL,
+           "target path is HTML-escaped in the body");
+    ASSERT(strstr(dump, "run --x &lt;y&gt; &amp; z") != NULL,
+           "command line is HTML-escaped in the body");
+    ASSERT(strstr(dump, "/opt/<tool>") == NULL &&
+               strstr(dump, "<exe>") == NULL &&
+               strstr(dump, "<secret>") == NULL &&
+               strstr(dump, "<y>") == NULL,
+           "no raw interpolated markup anywhere in the body");
+
+    char defdump[64];
+    ASSERT(dlg_read_dump("hashchange-default.txt", defdump,
+                         sizeof(defdump)) > 0,
+           "hash-change default dump written");
+    ASSERT(strcmp(defdump, "--default|Deny") == 0,
+           "--default preselects the deny row (Enter emits the deny tag)");
+
+    /* Approve mode: the script echoes the allow tag and exits 0. */
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "approve", 1) == 0,
+           "approve mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_ALLOW_ALWAYS,
+           "explicit update tag grants the update");
+
+    /* Exit 0 with no tag at all must deny (no positive channel). */
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "empty", 1) == 0,
+           "empty-output mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_DENY,
+           "empty stdout denies (no usable token)");
+
+    notify_test_set_kdialog_path(NULL);
 }
 
 /*
@@ -2158,6 +2535,149 @@ static void test_respond_failure_retry(void) {
 }
 
 /*
+ * Part 1d: the retry queue must never abandon a decision when it reaches
+ * the old fixed capacity (UNANSWERED_MAX = 64); it doubles instead.  A
+ * full non-blocking pipe makes every write fail with EAGAIN, so the
+ * queue is the only storage; after draining the pipe, drain_and_deny()
+ * must deliver one exact fanotify_response (FAN_DENY, target fd) per
+ * retained decision and close every event fd.  On the pre-fix code call
+ * 65 returned -2 and the decision was dropped.
+ */
+static void test_unanswered_queue_grows(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create grow-response pipe");
+    int fl = fcntl(group[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the grow pipe write end non-blocking");
+    fl = fcntl(group[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the grow pipe read end non-blocking");
+
+    enum { DECISIONS = 100 }; /* well beyond the old fixed capacity of 64 */
+    static int event_fds[DECISIONS];
+
+    char filler[4096];
+    memset(filler, 0, sizeof(filler));
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    ASSERT(errno == EAGAIN, "grow pipe is full");
+
+    for (int i = 0; i < DECISIONS; i++) {
+        event_fds[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(event_fds[i] >= 0, "open grow event fd");
+        if (event_fds[i] < 0)
+            break;
+
+        struct fanotify_event_metadata ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.event_len = sizeof(ev);
+        ev.vers = FANOTIFY_METADATA_VERSION;
+        ev.mask = FAN_OPEN_PERM;
+        ev.fd = event_fds[i];
+        ev.pid = (int)getpid();
+
+        ASSERT(fanotify_test_respond(group[1], &ev, FAN_DENY) == -1,
+               "failed write returns -1 (caller keeps the event fd)");
+        ASSERT(fcntl(event_fds[i], F_GETFD) != -1,
+               "grow event fd stays open while its response is queued");
+    }
+    ASSERT(fanotify_test_unanswered_count() == DECISIONS,
+           "queue doubled past its old fixed capacity, retaining every "
+           "decision");
+
+    /* Free the pipe, then drain: every retained decision must arrive. */
+    char drain_buf[4096];
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    fanotify_drain_and_deny(group[1]);
+
+    struct fanotify_response resp;
+    for (int i = 0; i < DECISIONS; i++) {
+        ssize_t got = read(group[0], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == event_fds[i] &&
+                   resp.response == FAN_DENY,
+               "retained decision delivered as the queued FAN_DENY");
+        ASSERT(fcntl(event_fds[i], F_GETFD) == -1 && errno == EBADF,
+               "grow event fd closed once its response was delivered");
+    }
+    ASSERT(fanotify_test_unanswered_count() == 0,
+           "drain emptied the retry queue");
+
+    close(group[0]);
+    close(group[1]);
+}
+
+/*
+ * Part 1e: when the retry queue cannot take a response (allocation
+ * failure), the event fd must be parked in the bounded stranded list and
+ * force-denied as FAN_DENY by the shutdown drain -- never closed
+ * unanswered, which would auto-ALLOW it at group close.  The failure is
+ * injected through the seam so the fallback is deterministic.
+ */
+static void test_unanswered_stranded_fallback(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create stranded-response pipe");
+    int fl = fcntl(group[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the stranded pipe write end non-blocking");
+    fl = fcntl(group[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the stranded pipe read end non-blocking");
+
+    char filler[4096];
+    memset(filler, 0, sizeof(filler));
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    ASSERT(errno == EAGAIN, "stranded pipe is full");
+
+    int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd >= 0, "open stranded event fd");
+
+    struct fanotify_event_metadata ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = efd;
+    ev.pid = (int)getpid();
+
+    fanotify_test_force_unanswered_alloc_fail(1);
+    ASSERT(fanotify_test_respond(group[1], &ev, FAN_ALLOW) == -1,
+           "unqueueable response still returns -1 (keep the event fd)");
+    fanotify_test_force_unanswered_alloc_fail(0);
+
+    ASSERT(fanotify_test_unanswered_count() == 0,
+           "queue did not grow under the injected allocation failure");
+    ASSERT(fanotify_test_stranded_count() == 1,
+           "the event fd is parked in the stranded list");
+    ASSERT(fcntl(efd, F_GETFD) != -1, "stranded event fd stays open");
+
+    /* Free the pipe, then drain: the stranded fd gets a forced FAN_DENY
+     * (the fail-closed direction, whatever the original decision). */
+    char drain_buf[4096];
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    fanotify_drain_and_deny(group[1]);
+
+    struct fanotify_response resp;
+    ssize_t got = read(group[0], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd &&
+               resp.response == FAN_DENY,
+           "stranded event fd force-denied before group close");
+    ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+           "stranded event fd closed after the forced DENY");
+    ASSERT(fanotify_test_stranded_count() == 0,
+           "drain emptied the stranded list");
+
+    close(group[0]);
+    close(group[1]);
+}
+
+/*
  * Part 0c: batch_abandon claims the records stranded when an event walk
  * exits early (fatal response failure or metadata-version mismatch).
  * read(2) duplicates an fd for EVERY record in the batch, so every
@@ -2302,6 +2822,265 @@ static void test_pump_dialog_group_allow(void) {
 }
 
 /*
+ * Part 0c-ter: fanotify_pump() is bounded per call.  A sustained event
+ * stream must not hold the single-threaded daemon (or its SIGTERM/SIGHUP
+ * handling) inside one pump call: after a bounded number of read(2)
+ * batches the pump returns to its caller's poll loop, leaving the rest
+ * of the stream in the group fd.  A SOCK_SEQPACKET socketpair makes the
+ * bound deterministic — one record per read(2) — where a SOCK_STREAM
+ * peer could coalesce every write into the first read and hide it.
+ * Every event must still be answered exactly once, in order, and have
+ * its event fd claimed across the caller's re-entries.
+ */
+static void test_pump_bounded_and_lossless(void) {
+    enum { N_EVENTS = 40 };
+    int sv[2] = { -1, -1 };
+    int efd[N_EVENTS];
+    static char rec[sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)rec;
+    int total = 0;
+    int calls = 0;
+    int i;
+
+    log_msg(LOG_DEBUG, "warm up syslog before bounded-pump socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    memset(rec, 0, sizeof(rec));
+    md->event_len = sizeof(*md);
+    md->metadata_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->mask = FAN_OPEN_PERM;
+    md->pid = (int)getpid();
+    for (i = 0; i < N_EVENTS; i++)
+        efd[i] = -1;
+
+    for (i = 0; i < N_EVENTS; i++) {
+        ssize_t w;
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open event fd");
+        if (efd[i] < 0)
+            break;
+        md->fd = efd[i];
+        w = write(sv[1], rec, sizeof(*md));
+        ASSERT(w == (ssize_t)sizeof(*md), "feed one event packet");
+        if (w != (ssize_t)sizeof(*md))
+            break;
+    }
+    if (i < N_EVENTS) {
+        for (int j = 0; j < N_EVENTS; j++)
+            if (efd[j] >= 0)
+                close(efd[j]);
+        close(sv[0]);
+        close(sv[1]);
+        return; /* the ASSERTs above recorded the failure */
+    }
+
+    /* Re-enter the pump exactly as notify.c's poll loop does until the
+     * stream is drained. */
+    while (total < N_EVENTS && calls < N_EVENTS + 2) {
+        int r = fanotify_pump(sv[0], getpid());
+        ASSERT(r >= 0, "pump returns a non-negative count");
+        ASSERT(fanotify_test_active_dialog_pid() == 0,
+               "dialog pid restored after each bounded pump return");
+        total += r;
+        calls++;
+        if (r == 0)
+            break;
+    }
+
+    ASSERT(calls >= 2,
+           "one bounded pump call did not drain the whole stream");
+    ASSERT(total == N_EVENTS,
+           "every queued event is responded to across re-entries");
+
+    /* Responses arrive in event order, one per event. */
+    for (i = 0; i < N_EVENTS; i++) {
+        struct fanotify_response resp;
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[i] &&
+                   resp.response == FAN_ALLOW,
+               "each event answered FAN_ALLOW once, in order");
+    }
+    for (i = 0; i < N_EVENTS; i++)
+        ASSERT(fcntl(efd[i], F_GETFD) == -1 && errno == EBADF,
+               "event fd closed after the response");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
+ * Part 0c-quater: a lifecycle flag stops the pump at the next record
+ * boundary, and the records already read into the current buffer are
+ * claimed exactly like the fatal path before returning: read(2)
+ * duplicated an fd for every record, so a later record left unhandled
+ * would leak its fd and auto-ALLOW at group close.  g_need_reload is
+ * used because it is not fatal (the group stays usable), and one
+ * SEQPACKET write delivers a whole three-record buffer to a single
+ * read(2), so the in-flight records are deterministic.
+ */
+static void test_pump_flag_claims_inflight_buffer(void) {
+    int sv[2] = { -1, -1 };
+    int efd[3];
+    static char batch[3 * sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)batch;
+    struct fanotify_response resp;
+
+    log_msg(LOG_DEBUG, "warm up syslog before pump-flag socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    memset(batch, 0, sizeof(batch));
+    for (int i = 0; i < 3; i++) {
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open in-flight event fd");
+        md[i].event_len = sizeof(*md);
+        md[i].metadata_len = sizeof(*md);
+        md[i].vers = FANOTIFY_METADATA_VERSION;
+        md[i].mask = FAN_OPEN_PERM;
+        md[i].pid = (int)getpid();
+        md[i].fd = efd[i];
+    }
+
+    ASSERT(write(sv[1], batch, sizeof(batch)) == (ssize_t)sizeof(batch),
+           "feed one three-record buffer to the pump");
+
+    g_need_reload = 1;
+    int responded = fanotify_pump(sv[0], getpid());
+    g_need_reload = 0;
+
+    ASSERT(responded == 1,
+           "the pump stopped at the first record boundary after the flag");
+    ASSERT(fanotify_test_active_dialog_pid() == 0,
+           "dialog pid restored on the flag exit path");
+    ASSERT(fcntl(efd[0], F_GETFD) == -1 && errno == EBADF,
+           "the handled record's event fd was closed");
+    ASSERT(fcntl(efd[1], F_GETFD) == -1 && errno == EBADF,
+           "the record behind the flag was claimed (denied + closed)");
+    ASSERT(fcntl(efd[2], F_GETFD) == -1 && errno == EBADF,
+           "the rest of the in-flight buffer was claimed");
+
+    ssize_t got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[0] &&
+               resp.response == FAN_ALLOW,
+           "the handled record was answered FAN_ALLOW");
+    got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[1] &&
+               resp.response == FAN_DENY,
+           "the first claimed record was answered FAN_DENY");
+    got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[2] &&
+               resp.response == FAN_DENY,
+           "the second claimed record was answered FAN_DENY");
+
+    /* With nothing left in the group, a re-entry returns promptly. */
+    ASSERT(fanotify_pump(sv[0], getpid()) == 0,
+           "a drained group makes the pump return without reading");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
+ * Part 0c-quinquies: queue saturation while a dialog is open must deny
+ * every deferred event (the pump's FAN_Q_OVERFLOW handler).  A regression
+ * that drops the flush would leave the suspended opens to auto-ALLOW at
+ * group close -- the fail-open the handler exists to close.
+ */
+static void test_pump_overflow_flushes_deferred(void) {
+    int sv[2] = { -1, -1 };
+    int efd[2] = { -1, -1 };
+    static char rec[sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)rec;
+
+    log_msg(LOG_DEBUG, "warm up syslog before overflow pump socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    for (int i = 0; i < 2; i++) {
+        struct fanotify_event_metadata ev;
+
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open deferred event fd");
+        if (efd[i] < 0)
+            break;
+        memset(&ev, 0, sizeof(ev));
+        ev.event_len = sizeof(ev);
+        ev.vers = FANOTIFY_METADATA_VERSION;
+        ev.mask = FAN_OPEN_PERM;
+        ev.fd = efd[i];
+        ev.pid = (int)getpid();
+        ASSERT(fanotify_defer_event(&ev) == 0,
+               "defer an event before the overflow record");
+    }
+
+    memset(rec, 0, sizeof(rec));
+    md->event_len = sizeof(*md);
+    md->metadata_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->mask = FAN_Q_OVERFLOW;
+    md->fd = FAN_NOFD;
+    md->pid = (int)getpid();
+    ASSERT(write(sv[1], rec, sizeof(*md)) == (ssize_t)sizeof(*md),
+           "feed the FAN_Q_OVERFLOW record");
+
+    int r = fanotify_pump(sv[0], getpid());
+    ASSERT(r >= 0, "pump handles the overflow record");
+    ASSERT(fanotify_test_active_dialog_pid() == 0,
+           "dialog pid restored after the overflow pump");
+
+    struct fanotify_response resp;
+    for (int i = 0; i < 2; i++) {
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[i] &&
+                   resp.response == FAN_DENY,
+               "deferred event denied on queue overflow (fail closed)");
+        ASSERT(fcntl(efd[i], F_GETFD) == -1 && errno == EBADF,
+               "deferred event fd closed after the overflow denial");
+    }
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
  * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
  * retried on the next clear) instead of being forgotten, which would
  * leave an untracked kernel mark behind.  A negative fd means no group
@@ -2344,6 +3123,11 @@ static void test_cmdline_fingerprint_overflow(void) {
 
     pid_t pid = fork();
     ASSERT(pid >= 0, "fork long-argv child");
+    if (pid < 0) {
+        /* Never let a failed fork turn kill(pid) into kill(-1). */
+        free(arg);
+        return;
+    }
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0)
@@ -2476,7 +3260,26 @@ static void test_kernel_bounded_queue_overflow(void) {
         }
     }
 
+    /*
+     * Bound the drain to the kernel queue limit: fs.fanotify
+     * max_queued_events (the kernel default is 16384).  The previous
+     * `events_drained < SAT_FILES` was satisfied even by an unbounded
+     * queue that drained all 20000, hiding the drop this test proves.
+     * One extra slot tolerates the FAN_Q_OVERFLOW pseudo-event the kernel
+     * may deliver alongside the bounded queue.
+     */
+    long queue_max = 16384; /* fanotify(7) kernel default */
+    FILE *qf = fopen("/proc/sys/fs/fanotify/max_queued_events", "r");
+    if (qf)
+    {
+        long v = 0;
+        if (fscanf(qf, "%ld", &v) == 1 && v > 0)
+            queue_max = v;
+        fclose(qf);
+    }
     ASSERT(overflow_seen, "FAN_Q_OVERFLOW reported after saturation");
+    ASSERT(events_drained <= queue_max + 1,
+           "the bounded queue held at most max_queued_events");
     ASSERT(events_drained < SAT_FILES,
            "bounded queue dropped events instead of growing unbounded");
 
@@ -2597,6 +3400,58 @@ static void test_scope_guard(void) {
 
     unlink(fallback_conf);
     unlink(fallback_target);
+
+    g_config = saved;
+}
+
+/*
+ * Part 0f: an existing protected path must resolve to the mount it is
+ * actually marked on, not the mount of its parent.  mark_target_mount_id()
+ * called nearest_existing_ancestor() unconditionally, so a mount point
+ * like /dev compared equal to the root mount: a root-anchored config path
+ * (or a state directory on the root mount) was falsely flagged as sharing
+ * a mount with the protected path.  Pre-fix this fails wherever
+ * statx(STATX_MNT_ID) is available; without it the check SKIPs.
+ */
+static void test_scope_guard_existing_path_mount(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    unsigned long long id_dev = fanotify_test_mount_id("/dev");
+    unsigned long long id_tmp = fanotify_test_mount_id("/tmp");
+    unsigned long long id_root = fanotify_test_mount_id("/");
+    char config_path[80];
+
+    if (id_dev == 0 || id_tmp == 0) {
+        printf("SKIP: statx mount IDs unavailable; existing-path mount resolution check skipped\n");
+        return;
+    }
+    if (id_dev == id_tmp || id_dev == id_root) {
+        printf("SKIP: /dev is not a separate mount; existing-path mount resolution check skipped\n");
+        return;
+    }
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "/dev");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+
+    /*
+     * A root-anchored path that does not exist resolves to the root mount
+     * both before and after the fix (stat fails and the ancestor walk
+     * lands on "/"), so a refusal here can only come from /dev resolving
+     * to its parent (root) instead of its own mount.  This makes the pin
+     * host-independent: it holds wherever /dev is its own mount.
+     */
+    snprintf(config_path, sizeof(config_path),
+             "/fileshield-scope-guard-%d.conf", (int)getpid());
+    ASSERT(fanotify_scope_guard(config_path) == 0,
+           "existing protected path is compared by its own mount, not its parent's");
+
+    /* The realistic shape: a config path on another mount is accepted. */
+    snprintf(config_path, sizeof(config_path),
+             "/tmp/scope-guard-conflict-%d.conf", (int)getpid());
+    ASSERT(fanotify_scope_guard(config_path) == 0,
+           "scope guard accepts an existing path on a separate mount");
 
     g_config = saved;
 }
@@ -2860,11 +3715,77 @@ static void test_verdict_stage_order(void) {
     /* A recorded session deny beats the unsafe grant. */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
-    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 0) == 1,
+    session_deny_add(sid, start, "/bin/tool", PIN_SHA_A, "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", PIN_SHA_A, "/home/u/secret", sid, 0,
+                         0) == 1,
            "session deny wins over an unsafe grant");
 
     session_clear();
+    g_config = saved;
+}
+
+/*
+ * Part 0h1: Session-Allow with no binary digest.  The seam runs the real
+ * record_allow_decision() over a synthetic context: an unverifiable
+ * decision must degrade to the cached Allow Once (exactly like Allow
+ * Always) and must never store a digest-less session entry -- such an
+ * entry would cover a different binary at the target for the session's
+ * lifetime (and the matcher now refuses it).  The synthetic event pid is
+ * this process, so the degraded grant is observable through
+ * cache_lookup().
+ */
+/*
+ * A Session-Allow chosen for a binary whose digest is unavailable is
+ * stored as a session entry with an empty digest and matches later opens.
+ * This is deliberate — AppImages and other unhashable tools are the key
+ * use case — and a past review degraded it to Allow Once and broke that
+ * case, so this test pins the intended behavior.
+ */
+static void test_session_allow_without_digest_stored(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+    const char *bin = "/bin/session-digest-test";
+    const char *target = "/home/u/.ssh/id_rsa";
+    SessionRecord recs[4];
+    int total = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.user_ttl_seconds = 60;
+    cfg.session_ttl_seconds = 60;
+    g_config = &cfg;
+    session_clear();
+    cache_clear();
+
+    ASSERT(session_id_of(getpid(), &sid, &start) == 0, "resolve own session");
+
+    /* No digest: the session entry is stored and matches, no cache fallback. */
+    ASSERT(fanotify_test_record_allow_decision(bin, "", target, sid, start,
+                                               NOTIFY_ALLOW_SESSION)
+               == FAN_ALLOW,
+           "digest-less Session-Allow allows this attempt");
+    ASSERT(cache_lookup(getpid(), bin, target) == 0,
+           "no one-time cache fallback for a digest-less Session-Allow");
+    ASSERT(session_snapshot(0, recs, 4, &total) == 1 && total == 1,
+           "the digest-less session entry is stored");
+    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 1,
+           "the digest-less session grant matches a later open");
+
+    /* Control: with a digest the session entry is stored as before. */
+    session_clear();
+    cache_clear();
+    ASSERT(fanotify_test_record_allow_decision(bin, PIN_SHA_A, target, sid,
+                                               start, NOTIFY_ALLOW_SESSION)
+               == FAN_ALLOW,
+           "digest-bearing Session-Allow allows this attempt");
+    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 1,
+           "a digest-bearing Session-Allow is stored");
+    ASSERT(cache_lookup(getpid(), bin, target) == 0,
+           "a stored session entry needs no one-time cache grant");
+
+    session_clear();
+    cache_clear();
     g_config = saved;
 }
 
@@ -2905,8 +3826,9 @@ static void test_pump_defer_contract(void) {
     /* Recorded session deny: decided mid-dialog (deny wins early). */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
-    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 1) == 1,
+    session_deny_add(sid, start, "/bin/tool", PIN_SHA_A, "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", PIN_SHA_A, "/home/u/secret", sid, 0,
+                         1) == 1,
            "defer mode: a session deny decides instead of queueing");
 
     session_clear();
@@ -3054,16 +3976,21 @@ int main(void) {
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
     test_scope_guard();
+    test_scope_guard_existing_path_mount();
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_merge_proc_environ();
-    test_kdialog_status_mapping();
     test_menu_choice_mapping();
     test_menu_end_to_end();
+    test_hash_change_prompt_escapes();
     test_html_escape();
     test_verdict_stage_order();
+    test_session_allow_without_digest_stored();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
+    test_pump_bounded_and_lossless();
+    test_pump_flag_claims_inflight_buffer();
+    test_pump_overflow_flushes_deferred();
     test_pin_change_defers_in_pump();
     test_unsafe_allowlist_wins_over_pinned();
     test_dialog_rate_limiter();
@@ -3082,6 +4009,7 @@ int main(void) {
     test_unsafe_hit_once_per_process();
     test_glob_deny_and_allow_matchers();
     test_deleted_suffix_stripped();
+    test_resolve_path_truncation_rejected();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
     test_dyn_created_at_preserved();
@@ -3095,11 +4023,14 @@ int main(void) {
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_respond_failure_retry();
+    test_unanswered_queue_grows();
+    test_unanswered_stranded_fallback();
     test_batch_abandon_claims_stranded();
     test_clear_marks_retains_failures();
     test_cmdline_fingerprint_overflow();
     test_drain_and_deny();
     test_kernel_bounded_queue_overflow();
+    dlg_fixture_cleanup();
     dyn_fixture_cleanup();
     pin_fixture_cleanup();
     if (failures) {

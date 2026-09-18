@@ -851,70 +851,94 @@ static void test_glob_protected_paths(void)
 
 /*
  * Root-based globs: a wildcard in the first segment gives a static base
- * of "/" (the documented whole-subtree rule target).  The stored
- * pattern must keep its leading '/' so the base slice, the mark target
- * and the protected-prefix check stay valid.
+ * of "/" (the documented whole-subtree rule target).  Installing such a
+ * pattern would mark the root filesystem (the 2026-09-16 freeze class),
+ * so config_load() must refuse the WHOLE configuration with a log - not
+ * silently skip the entry.  A normal glob still loads with its stored
+ * pattern and wildcard-free base intact.
  */
 static void test_glob_root_based(void)
 {
-    char conf[1024];
-    char pat_first[128];
-    snprintf(pat_first, sizeof(pat_first), "/tmp_fileshield_globfirst_%d*",
-             (int)getpid());
+    char conf[2048];
+    char pat_ok_star[320];
+    char pat_ok_globstar[320];
+    char base[256];
+    static const char *const refused[] = {
+        "[protected_paths]\n/**\n",
+        "[protected_paths]\n/**/secret\n",
+        "[protected_paths]\n/*.conf\n",
+        "[protected_paths]\n/*\n",
+        /* A wildcard anywhere in the first segment makes the static base
+         * "/" too, even when the segment has more text than the star. */
+        "[protected_paths]\n/tmp_fileshield_globfirst*/x\n",
+        "[protected_paths]\n/tmp/fileshield_rootglob_ok\n"
+        "[denylist]\n/usr/bin/curl = /**\n",
+    };
+    size_t i;
+    Config cfg; /* one copy: Config is several MB */
+
+    for (i = 0; i < sizeof(refused) / sizeof(refused[0]); i++)
+    {
+        char msg[96];
+        char *path;
+
+        snprintf(conf, sizeof(conf), "%s", refused[i]);
+        path = write_temp(conf);
+        ASSERT(path != NULL, "write temp config for a root-based glob");
+        if (!path)
+            continue;
+
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(msg, sizeof(msg), "root-based glob case %zu refuses the config",
+                 i);
+        ASSERT(config_load(path, &cfg) == -1, msg);
+        config_reset(&cfg);
+        unlink(path);
+        free(path);
+    }
+
+    /*
+     * Control: a wildcard in a later segment keeps a non-"/" static base
+     * (the base is everything before that segment), so the config loads
+     * with its pattern and base recorded.
+     */
+    snprintf(base, sizeof(base), "/tmp/fileshield_glob_ok_%d", (int)getpid());
+    snprintf(pat_ok_star, sizeof(pat_ok_star), "%s/*.json", base);
+    snprintf(pat_ok_globstar, sizeof(pat_ok_globstar), "%s/**/x.json", base);
     snprintf(conf, sizeof(conf),
-             "[protected_paths]\n"
-             "/**\n"
-             "/**/secret\n"
-             "/*.conf\n"
-             "%s\n" /* wildcard in the first segment: base is "/" */
-             "\n"
-             "[denylist]\n"
-             "/usr/bin/curl = /**\n"
-             "/tmp/glob_root_rej_%d/**/\n", /* trailing slash: malformed */
-             pat_first, (int)getpid());
-
-    char *path = write_temp(conf);
-    ASSERT(path != NULL, "write temp config for root-based globs");
-
-    Config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-
-    int r = config_load(path, &cfg);
-    ASSERT(r == 0, "config_load survives the malformed trailing slash");
-    ASSERT(cfg.protected_count == 4, "4 root-based protected entries parsed");
-    ASSERT(cfg.denylist_count == 1, "1 valid denylist rule parsed");
-
-    ASSERT(cfg.protected[0].is_glob == 1, "'/**' is a glob");
-    ASSERT(strcmp(cfg.protected[0].path, "/**") == 0, "'/**' pattern preserved");
-    ASSERT(cfg.protected[0].base_len == 1, "'/**' static base is '/'");
-
-    ASSERT(cfg.protected[1].is_glob == 1, "'/**/secret' is a glob");
-    ASSERT(strcmp(cfg.protected[1].path, "/**/secret") == 0,
-           "'/**/secret' pattern preserved");
-    ASSERT(cfg.protected[1].base_len == 1, "'/**/secret' static base is '/'");
-
-    ASSERT(cfg.protected[2].is_glob == 1, "'/*.conf' is a glob");
-    ASSERT(strcmp(cfg.protected[2].path, "/*.conf") == 0,
-           "'/*.conf' pattern preserved");
-    ASSERT(cfg.protected[2].base_len == 1, "'/*.conf' static base is '/'");
-
-    ASSERT(cfg.protected[3].is_glob == 1,
-           "a wildcard in the first segment is a glob");
-    ASSERT(strcmp(cfg.protected[3].path, pat_first) == 0,
-           "first-segment partial wildcard preserved");
-    ASSERT(cfg.protected[3].base_len == 1,
-           "first-segment glob static base is '/'");
-
-    ASSERT(cfg.denylist[0].target_is_glob == 1,
-           "denylist '/**' target is a glob");
-    ASSERT(strcmp(cfg.denylist[0].target_path, "/**") == 0,
-           "denylist '/**' target pattern preserved");
-    ASSERT(cfg.denylist[0].target_base_len == 1,
-           "denylist '/**' target static base is '/'");
-
-    config_reset(&cfg);
-    unlink(path);
-    free(path);
+             "[protected_paths]\n%s\n%s\n"
+             "[denylist]\n/usr/bin/curl = %s/**\n",
+             pat_ok_star, pat_ok_globstar, base);
+    {
+        char *path = write_temp(conf);
+        ASSERT(path != NULL, "write temp config for non-root globs");
+        if (path)
+        {
+            memset(&cfg, 0, sizeof(cfg));
+            ASSERT(config_load(path, &cfg) == 0,
+                   "non-root-based glob config loads");
+            ASSERT(cfg.protected_count == 2, "both normal globs parsed");
+            ASSERT(cfg.protected[0].is_glob == 1,
+                   "normal star glob stays a glob");
+            ASSERT(strcmp(cfg.protected[0].path, pat_ok_star) == 0,
+                   "normal star glob pattern preserved");
+            ASSERT(cfg.protected[0].base_len == (int)strlen(base),
+                   "normal star glob base length");
+            ASSERT(cfg.protected[1].is_glob == 1,
+                   "normal globstar stays a glob");
+            ASSERT(strcmp(cfg.protected[1].path, pat_ok_globstar) == 0,
+                   "normal globstar pattern preserved");
+            ASSERT(cfg.protected[1].base_len == (int)strlen(base),
+                   "normal globstar base length");
+            ASSERT(cfg.denylist_count == 1 && cfg.denylist[0].target_is_glob == 1,
+                   "normal rule glob target parsed");
+            ASSERT(cfg.denylist[0].target_base_len == (int)strlen(base),
+                   "normal rule glob target base length");
+            config_reset(&cfg);
+            unlink(path);
+            free(path);
+        }
+    }
 }
 
 /*
@@ -1500,6 +1524,12 @@ static void test_denylist_glob_parse(void)
  * The two reported user cases must parse: a glob binary scoped to a
  * home-directory target, and an exact binary scoped to a parent folder
  * (the trailing slash is stripped by canonicalization).
+ *
+ * A '~/' side expands once per real user (the same getpwent() filter
+ * utils.c applies: uid in [1000, 65534) with a non-empty home), so the
+ * expected entry count is derived here instead of hardcoded and each
+ * rule is located by its binary rather than a fixed index - on a
+ * multi-user host the expansions interleave.
  */
 static void test_reported_user_cases(void)
 {
@@ -1508,38 +1538,94 @@ static void test_reported_user_cases(void)
         "/tmp/.mount_*/openchamber = ~/.local/share/opencode/\n"
         "/usr/bin/opencode = ~/.local/\n";
 
+    int users = 0;
+    const struct passwd *pw;
+    setpwent();
+    while ((pw = getpwent()) != NULL)
+    {
+        if (pw->pw_uid < 1000 || pw->pw_uid >= 65534)
+            continue;
+        if (!pw->pw_dir || pw->pw_dir[0] == '\0')
+            continue;
+        users++;
+    }
+    endpwent();
+
     char *path = write_temp(conf);
     ASSERT(path != NULL, "write temp config for reported user cases");
+    if (!path)
+        return;
+
+    if (users > 0 && users * 2 > MAX_RULES)
+    {
+        printf("SKIP: %d real users exceed the %d-rule cap for this test\n",
+               users, MAX_RULES);
+        unlink(path);
+        free(path);
+        return;
+    }
 
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
 
     int r = config_load(path, &cfg);
     ASSERT(r == 0, "config_load reported user cases success");
-    ASSERT(cfg.allowlist_count == 2, "both reported user cases parsed");
 
-    ASSERT(cfg.allowlist[0].binary_is_glob == 1, "AppImage mount path is a glob");
-    ASSERT(strcmp(cfg.allowlist[0].binary, "/tmp/.mount_*/openchamber") == 0,
-           "AppImage mount glob preserved");
-    ASSERT(cfg.allowlist[0].binary_base_len == (int)strlen("/tmp"),
-           "AppImage mount glob base");
-    ASSERT(cfg.allowlist[0].target_is_glob == 0, "opencode data dir stays exact");
-    ASSERT(strstr(cfg.allowlist[0].target_path, "/.local/share/opencode") != NULL,
-           "opencode data dir target canonicalized");
-    size_t len0 = strlen(cfg.allowlist[0].target_path);
-    ASSERT(len0 > 0 && cfg.allowlist[0].target_path[len0 - 1] != '/',
-           "trailing slash stripped from data dir target");
-    ASSERT(cfg.allowlist[0].target_base_len == (int)len0,
-           "exact data dir target base_len");
+    if (users == 0)
+    {
+        /* Nothing to expand '~' against: the side stays relative and is
+         * rejected, so no rule is admitted (fail closed). */
+        ASSERT(cfg.allowlist_count == 0,
+               "no real users: '~' rules load as nothing");
+    }
+    else
+    {
+        ASSERT(cfg.allowlist_count == users * 2,
+               "one entry per real user for each reported rule");
 
-    ASSERT(strcmp(cfg.allowlist[1].binary, "/usr/bin/opencode") == 0,
-           "exact opencode binary kept");
-    ASSERT(cfg.allowlist[1].binary_is_glob == 0, "exact binary is not a glob");
-    ASSERT(strstr(cfg.allowlist[1].target_path, "/.local") != NULL,
-           "parent folder target canonicalized");
-    size_t len1 = strlen(cfg.allowlist[1].target_path);
-    ASSERT(len1 > 0 && cfg.allowlist[1].target_path[len1 - 1] != '/',
-           "trailing slash stripped from parent folder target");
+        int glob_rule = 0;
+        int exact_rule = 0;
+        for (int i = 0; i < cfg.allowlist_count; i++)
+        {
+            const RuleEntry *e = &cfg.allowlist[i];
+
+            if (strcmp(e->binary, "/tmp/.mount_*/openchamber") == 0)
+            {
+                glob_rule++;
+                ASSERT(e->binary_is_glob == 1,
+                       "AppImage mount path is a glob");
+                ASSERT(e->binary_base_len == (int)strlen("/tmp"),
+                       "AppImage mount glob base");
+                ASSERT(e->target_is_glob == 0,
+                       "opencode data dir stays exact");
+                ASSERT(strstr(e->target_path,
+                              "/.local/share/opencode") != NULL,
+                       "opencode data dir target canonicalized");
+                size_t len = strlen(e->target_path);
+                ASSERT(len > 0 && e->target_path[len - 1] != '/',
+                       "trailing slash stripped from data dir target");
+                ASSERT(e->target_base_len == (int)len,
+                       "exact data dir target base_len");
+            }
+            else
+            {
+                ASSERT(strcmp(e->binary, "/usr/bin/opencode") == 0,
+                       "only the two reported binaries are present");
+                exact_rule++;
+                ASSERT(e->binary_is_glob == 0,
+                       "exact binary is not a glob");
+                ASSERT(strstr(e->target_path, "/.local") != NULL,
+                       "parent folder target canonicalized");
+                size_t len = strlen(e->target_path);
+                ASSERT(len > 0 && e->target_path[len - 1] != '/',
+                       "trailing slash stripped from parent folder target");
+            }
+        }
+        ASSERT(glob_rule == users,
+               "the glob rule expanded once per real user");
+        ASSERT(exact_rule == users,
+               "the exact rule expanded once per real user");
+    }
 
     config_reset(&cfg);
     unlink(path);
@@ -1780,13 +1866,15 @@ static void test_unknown_setting(void)
 }
 
 /*
- * [settings] debug is staged: a config that is later refused must not
- * toggle the global logging state, while an accepted config applies it.
+ * [settings] debug is staged in the Config, never applied by
+ * config_load() itself: the caller (main.c) applies it only after the
+ * config is fully accepted, so a parse-valid but later-rejected config
+ * cannot toggle the global logging state and a rejected reload keeps the
+ * previous value.  The global state must be unchanged by every
+ * config_load() call here.
  */
 static void test_debug_staging(void)
 {
-    log_set_debug(0);
-
     char conf[8192];
     size_t off = 0;
     off += (size_t)snprintf(conf + off, sizeof(conf) - off,
@@ -1795,26 +1883,70 @@ static void test_debug_staging(void)
         off += (size_t)snprintf(conf + off, sizeof(conf) - off,
                                 "/usr/bin/x%d = /tmp/t\n", i);
 
-    char *path = write_temp(conf);
-    ASSERT(path != NULL, "write over-cap config");
+    struct
+    {
+        int global_before;
+        const char *body;
+        int load_rc;
+        int want_set;
+        int want_debug;
+    } cases[3];
+    char *paths[3] = {0};
+    int i;
 
-    Config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    ASSERT(config_load(path, &cfg) == -1, "over-cap config is refused");
-    ASSERT(log_debug_enabled() == 0,
-           "refused config did not toggle the global debug flag");
-    config_reset(&cfg);
-    unlink(path);
-    free(path);
+    cases[0].global_before = 0;
+    cases[0].body = conf; /* refused: over-cap allowlist */
+    cases[0].load_rc = -1;
+    cases[0].want_set = -1; /* not inspected: config was refused */
+    cases[0].want_debug = -1;
 
-    path = write_temp("[settings]\ndebug = yes\n");
-    ASSERT(path != NULL, "write debug config");
-    memset(&cfg, 0, sizeof(cfg));
-    ASSERT(config_load(path, &cfg) == 0, "debug config loads");
-    ASSERT(log_debug_enabled() == 1, "accepted config applies debug");
-    config_reset(&cfg);
-    unlink(path);
-    free(path);
+    cases[1].global_before = 0;
+    cases[1].body = "[settings]\ndebug = yes\n";
+    cases[1].load_rc = 0;
+    cases[1].want_set = 1;
+    cases[1].want_debug = 1;
+
+    cases[2].global_before = 1;
+    cases[2].body = "[settings]\ndebug = no\n";
+    cases[2].load_rc = 0;
+    cases[2].want_set = 1;
+    cases[2].want_debug = 0;
+
+    for (i = 0; i < 3; i++)
+    {
+        Config cfg;
+        char *path;
+
+        log_set_debug(cases[i].global_before);
+        path = write_temp(cases[i].body);
+        ASSERT(path != NULL, "write debug-staging config");
+        if (!path)
+            continue;
+        paths[i] = path;
+
+        memset(&cfg, 0, sizeof(cfg));
+        ASSERT(config_load(path, &cfg) == cases[i].load_rc,
+               "debug-staging config load result");
+        ASSERT(log_debug_enabled() == cases[i].global_before,
+               "config_load never touches the global debug flag");
+        if (cases[i].want_set >= 0)
+        {
+            ASSERT(cfg.debug_set == cases[i].want_set,
+                   "debug_set is staged from [settings] debug");
+            ASSERT(cfg.debug == cases[i].want_debug,
+                   "staged debug value matches [settings] debug");
+        }
+        config_reset(&cfg);
+    }
+
+    for (i = 0; i < 3; i++)
+    {
+        if (paths[i])
+        {
+            unlink(paths[i]);
+            free(paths[i]);
+        }
+    }
 
     log_set_debug(0);
 }

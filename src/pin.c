@@ -11,7 +11,6 @@
  * directly; the daemon's pin_load()/pin_store() are built on them.
  */
 
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -73,7 +72,10 @@ static PinRecord g_stage[PIN_MAX];
  */
 static PinEntry g_snapshot[PIN_MAX];
 
-/* Exactly 128 hex characters: sha512sum's canonical output form. */
+/* Exactly 128 lowercase hex characters: sha512sum's canonical output
+ * form and the form pin_check() compares byte-for-byte, so an uppercase
+ * value is rejected instead of deriving the same ID but never
+ * matching. */
 static int is_valid_sha512(const char *s)
 {
     size_t i;
@@ -82,7 +84,8 @@ static int is_valid_sha512(const char *s)
         return 0;
     for (i = 0; i < 128; i++)
     {
-        if (!isxdigit((unsigned char)s[i]))
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f')))
             return 0;
     }
     return 1;
@@ -176,6 +179,25 @@ static int apply_string_field(PinDraft *d, const char *key, const char *value)
 }
 
 /*
+ * 1 when 'pattern' already appears in out[0..count-1].  Duplicate
+ * patterns derive the same pin ID for two rows, so fileshield-cli could
+ * never address them unambiguously; pin_read_entries() treats the file
+ * as damaged instead of silently keeping one of the duplicates.
+ */
+static int has_duplicate_pattern(const PinRecord *out, int count,
+                                 const char *pattern)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+    {
+        if (strcmp(out[i].pattern, pattern) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
  * Parse an open pin file into out[0..max-1].  The reader accepts exactly
  * the shape pin_serialize_records() writes, scanned line by line:
  *
@@ -194,10 +216,18 @@ static int apply_string_field(PinDraft *d, const char *key, const char *value)
  * -> (} with all three fields) S_IN_PINS -> (]) S_OUTSIDE -> (}) S_DONE.
  * An entry reaches 'out' only when it is complete, and the caller zeroes
  * 'out' on failure, so a damaged file never yields a partial table.
+ *
+ * Staging model: this function writes only into the caller's 'out'
+ * array.  pin_load_file() zeroes that array on -1, and pin_load()
+ * parses into g_stage and copies into g_pins only after a count came
+ * back, so a damaged file can neither publish a partial table nor
+ * silently drop one bad row from the live table.
+ *
  * Blank lines, comments (#) and unknown keys are tolerated; a second
  * "pins" array, junk after an entry close, an incomplete entry, a
- * missing closer or more entries than max marks the whole file damaged
- * (fail closed).  Returns the entry count, or -1 on any anomaly.
+ * duplicate pattern, a missing closer or more entries than max marks
+ * the whole file damaged (fail closed).  Returns the entry count, or
+ * -1 on any anomaly.
  */
 static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
                             int max)
@@ -379,6 +409,21 @@ static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
                              * never dropped or tolerated silently */
                     break;
                 }
+                if (has_duplicate_pattern(out, count, cur->pin.pattern))
+                {
+                    /* Two rows with one derived ID can never be managed
+                     * unambiguously through the CLI.  Damage the whole
+                     * file (prompt/TOFU semantics) rather than silently
+                     * keeping one of the duplicates. */
+                    log_msg(LOG_ERR,
+                            "pin_load_file: %s: duplicate pattern \"%s\"; "
+                            "ignoring the pin file (fail closed)",
+                            path, cur->pin.pattern);
+                    ok = 0;
+                    break;
+                }
+                /* Complete, unique entry: the only point a draft is
+                 * allowed to reach 'out'. */
                 out[count] = cur->pin;
                 count++;
                 cur = NULL;
@@ -430,6 +475,9 @@ static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
     if (ferror(fp))
         ok = 0;
 
+    /* Every closer must have been seen and no entry may still be open:
+     * a file cut off at any point fails here instead of loading the
+     * prefix that was parsed so far. */
     if (!ok || !saw_pins || !closed_array || !closed_object ||
         state == S_IN_ENTRY)
     {
@@ -781,6 +829,8 @@ int pin_store(const char *pattern, const char *sha512)
     unsigned long snap_seq = g_pin_seq;
     memcpy(g_snapshot, g_pins, sizeof(g_pins));
 
+    /* One row per pattern: an existing pattern is refreshed in place,
+     * a new one takes the next slot while the table has room. */
     for (i = 0; i < g_pin_count; i++)
     {
         if (strcmp(g_pins[i].pattern, pattern) == 0)
@@ -896,6 +946,8 @@ int pin_remove_by_id(const char *id)
         return 0; /* well-formed prefix, but no pin matches it */
     }
 
+    /* Stage the removal like pin_store(): memory commits only after the
+     * rewritten file lands, and the compaction keeps table order. */
     snap_count = g_pin_count;
     snap_seq = g_pin_seq;
     memcpy(g_snapshot, g_pins, sizeof(g_pins));

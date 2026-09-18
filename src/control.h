@@ -17,9 +17,10 @@
  * The daemon creates the socket 0600 (owned by its effective uid -- root
  * in production), accepts at most a handful of connections per poll
  * wake, and checks SO_PEERCRED: a peer whose uid differs from geteuid()
- * is closed without a response.  A request is one bounded, non-blocking
- * read; a slow client is never waited for.  See control_client.h for the
- * request/response wire format.
+ * is closed without a response.  A request is accumulated with at most
+ * CONTROL_READ_MAX bounded, non-blocking reads (EAGAIN is retried only
+ * after a read made progress); a slow client is never waited for.  See
+ * control_client.h for the request/response wire format.
  */
 
 /*
@@ -64,6 +65,8 @@ typedef struct
 /*
  * Create the control socket at CONTROL_SOCKET_PATH and return the
  * non-blocking listening fd, or -1 (already logged) on failure:
+ *   - the parent directory is created 0700 when missing (systemd's
+ *     RuntimeDirectory normally provides it);
  *   - a path that exists but is not a socket owned by geteuid() is
  *     refused and never unlinked (a regular file or symlink at the path
  *     is an administrator's or an attacker's object, not ours);
@@ -83,9 +86,11 @@ int control_setup_at(const char *path);
 
 /*
  * Close 'fd' and unlink the path the last successful setup bound
- * (g_bound_path).  Errors are ignored: teardown runs on shutdown paths
- * where there is nothing left to report to.  A never-bound process
- * unlinks nothing.
+ * (g_bound_path), but only after lstat() confirms the path is still the
+ * same socket (dev/ino recorded at setup): a concurrently restarted
+ * daemon that already bound a fresh listener keeps it.  Errors are
+ * ignored: teardown runs on shutdown paths where there is nothing left
+ * to report to.  A never-bound process unlinks nothing.
  */
 void control_teardown(int fd);
 
@@ -101,9 +106,10 @@ void control_handle(int listen_fd);
  * Serve one accepted connection and close it.
  *
  * The fd is made non-blocking immediately, the peer uid is verified
- * against geteuid() (mismatch: LOG_WARNING, close, no response), and
- * exactly ONE bounded read is attempted.  A request without a newline, a
- * partial or oversized one, an EAGAIN, or a NUL byte in the line closes
+ * against geteuid() (mismatch: LOG_WARNING, close, no response), and at
+ * most CONTROL_READ_MAX non-blocking reads are attempted; EAGAIN is
+ * retried only after a read made progress.  A request without a newline,
+ * an oversized one, a first-read EAGAIN, or a NUL byte in the line closes
  * the connection without a response -- a slow or stuck client can never
  * block the single-threaded daemon.  A parsed request is dispatched and
  * the response written; a write that would block (EAGAIN) abandons the

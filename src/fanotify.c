@@ -55,11 +55,13 @@
  *      process_open_perm(), which walks the stages in fanotify.h order.
  *   2. A decided event is answered through respond_event(): the response
  *      is written and - on success - the event fd is closed.
- *   3. If the write fails, the response is queued (g_unanswered) and the
- *      event fd is kept open: closing it would strand the caller's open()
- *      until group close, where the kernel auto-ALLOWS it.  The main loop
- *      and the pump retry the queue; fanotify_drain_and_deny() forces a
- *      final DENY before close(fan_fd) on shutdown.
+ *   3. If the write fails, the response is queued (g_unanswered, which
+ *      grows on demand) and the event fd is kept open: closing it would
+ *      strand the caller's open() until group close, where the kernel
+ *      auto-ALLOWS it.  When the queue cannot grow (allocation failure)
+ *      the event fd is parked in the bounded stranded list, which
+ *      fanotify_drain_and_deny() force-denies at shutdown.  The main
+ *      loop and the pump retry the queue.
  *   4. Events that need the user are deferred with their fds open and
  *      replayed by the main loop after the dialog (fanotify_process_pending).
  */
@@ -72,9 +74,9 @@ static const ProtectedPath *exclusion_match(const char *path);
 
 /* Defined later; the decision stages respond through this.  Return
  * contract (see fanotify_respond): 0 = delivered or already answered, so
- * the caller may close the event fd; -1 = write failed, the response was
- * queued for retry, so the caller must keep the fd open; -2 = queue full,
- * the caller closes the fd and the daemon restarts. */
+ * the caller may close the event fd; -1 = NOT delivered, the response is
+ * queued or stranded and the caller MUST keep the fd open.  There is no
+ * third outcome: a decided response is never abandoned. */
 static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
                             unsigned int response);
 
@@ -99,7 +101,9 @@ static int batch_abandon(int fan_fd,
  * Resolve the path of a fanotify event fd into out (outsz bytes).
  * ev->fd is an open fd in the DAEMON's fd table (not the target process's),
  * so we read /proc/self/fd/<fd_num>.
- * Returns 0 on success, -1 when the link cannot be read.  The caller
+ * Returns 0 on success, -1 when the link cannot be read or its result
+ * does not fit the buffer (a truncated result is unverifiable, so a
+ * partial path is never treated as a match).  The caller
  * supplies the buffer: this runs once per event, so no malloc per event
  * (bench_hotpath: 1.960 us with a heap buffer vs 1.915 us with the
  * caller's, and one allocation-failure path fewer).  The kernel appends
@@ -113,7 +117,10 @@ static int resolve_fd_path(int fd_num, char *out, size_t outsz)
 
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd_num);
     len = readlink(link, out, outsz - 1);
-    if (len < 0)
+    /* A result that exactly fills the buffer is either a path that did
+     * not fit or one that exactly did; unverifiable either way, so fail
+     * closed exactly like proc_exe_path(). */
+    if (len < 0 || (size_t)len >= outsz - 1)
         return -1;
     out[len] = '\0';
 
@@ -315,6 +322,9 @@ static const RuleEntry *denylist_match(const char *binary, const char *target)
  * the pipeline, so every fail-closed decision is unchanged.
  */
 #define HASH_CACHE_MAX 64
+/* Negative windows are measured on the monotonic clock (mono_seconds):
+ * a wall-clock step must not extend a fail-closed retry, and the fields
+ * are memory-only, so no persisted timestamp changes meaning. */
 #define HASH_FAIL_RETRY_S 60
 
 typedef struct
@@ -440,7 +450,10 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
 
     if (stat(proc_path, &st) != 0)
     {
-        /* No metadata to key the main cache on: use (pid, start). */
+        /* No metadata to key the main cache on: use (pid, start).
+         * The start time is mandatory for the key -- without it PID
+         * reuse could inherit the failure -- so a missing start means
+         * no lookup and no store (the hash is retried every event). */
         unsigned long long start = 0;
         int have_start = proc_stat_session(pid, NULL, &start) == 0;
 
@@ -451,7 +464,7 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
                 const HashPidFailEntry *e = &g_hash_pid_fails[i];
                 if (e->pid == pid && e->start == start)
                 {
-                    if (!force_retry && time(NULL) < e->retry_after)
+                    if (!force_retry && mono_seconds() < e->retry_after)
                     {
                         snprintf(g_hash_failure_reason,
                                  sizeof(g_hash_failure_reason), "%s",
@@ -480,12 +493,15 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
                  sha512_last_failure()[0] ? sha512_last_failure()
                                           : "hashing failed");
         if (have_start)
-            hash_pid_fail_store(pid, start, time(NULL),
+            hash_pid_fail_store(pid, start, mono_seconds(),
                                 g_hash_failure_reason);
         return -1;
     }
 
-    time_t now = time(NULL);
+    /* exe stat()able: the metadata-keyed identity cache.  A live digest
+     * answers without forking; a failure inside its window answers -1
+     * for the same cost. */
+    time_t now = mono_seconds();
 
     for (int i = 0; i < g_hash_cache_count; i++)
     {
@@ -519,6 +535,9 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
 
     r = sha512_proc_exe(pid, hex);
 
+    /* A matching failed slot is reused: the retry updates its identity
+     * in place, and a success there cannot be shadowed by a stale
+     * negative entry for the same metadata. */
     int slot;
     if (reuse >= 0)
         slot = reuse;
@@ -526,6 +545,8 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
         slot = g_hash_cache_count++;
     else
     {
+        /* Full: evict round-robin; evicting a live digest only costs a
+         * future re-hash, so no correctness depends on the choice. */
         slot = g_hash_cache_next;
         g_hash_cache_next = (g_hash_cache_next + 1) % HASH_CACHE_MAX;
     }
@@ -688,11 +709,15 @@ static time_t g_dialog_global_blocked_until = 0;
 /* Returns 1 when the dialog should be skipped (deny) to bound flooding. */
 static int dialog_rate_limited(const char *binary)
 {
-    time_t now = time(NULL);
+    time_t now = mono_seconds();
     DialogRateEntry *e = NULL;
 
+    /* Global state gates everything first: a flood rotating through
+     * fresh binary paths never trips the per-binary budget below. */
     if (now < g_dialog_global_blocked_until)
         return 1;
+    /* Start (or roll) the global window when the old one is over; the
+     * initial 0 window start also lands here on the first prompt. */
     if (now - g_dialog_global_window > DIALOG_RATE_WINDOW_S)
     {
         g_dialog_global_window = now;
@@ -710,6 +735,7 @@ static int dialog_rate_limited(const char *binary)
 
     if (!e)
     {
+        /* New binary: take a free slot or evict one. */
         int slot;
 
         if (g_dialog_rate_count < DIALOG_RATE_MAX)
@@ -746,15 +772,19 @@ static int dialog_rate_limited(const char *binary)
         e->window_start = now;
     }
 
+    /* An entry found for this binary may already be in cooldown. */
     if (now < e->blocked_until)
         return 1;
 
+    /* Same window roll as the global counter. */
     if (now - e->window_start > DIALOG_RATE_WINDOW_S)
     {
         e->window_start = now;
         e->prompts = 0;
     }
 
+    /* Over this binary's budget: block it.  The prompt is not shown, so
+     * it must not consume global budget below either. */
     if (++e->prompts > DIALOG_RATE_PROMPTS)
     {
         e->blocked_until = now + DIALOG_RATE_COOLDOWN_S;
@@ -771,6 +801,7 @@ static int dialog_rate_limited(const char *binary)
         return 1;
     }
 
+    /* Only prompts the per-binary budget admitted are counted here. */
     if (++g_dialog_global_prompts > DIALOG_RATE_GLOBAL_PROMPTS)
     {
         /* Rotation through many distinct binaries: the per-binary bound
@@ -1185,6 +1216,8 @@ static int dyn_match(const DynEntry *list, int count,
                      CmdlineProviderFn cmdline_fn, void *cmdline_ctx,
                      int require_binary_sha)
 {
+    /* File-scoped matching: an event with no resolved target can never
+     * match a persisted entry (admission always requires a target). */
     if (!target || target[0] == '\0')
         return 0;
 
@@ -1218,6 +1251,9 @@ static int dyn_match(const DynEntry *list, int count,
          * matches no entry never pays for ancestor hashing.  The
          * provider memoizes, so the chain is built at most once. */
         const ProcChain *chain = chain_fn(chain_ctx);
+        /* Depth must match exactly: a different ancestor count means a
+         * different invocation context, so the recorded chain must not
+         * prefix- or subset-match a deeper or shallower current chain. */
         if (e->chain_depth != chain->depth)
             continue;
 
@@ -1714,13 +1750,21 @@ static int nearest_existing_ancestor(const char *path, char *out,
     return 0;
 }
 
-/* Init-namespace mount that would be marked for `path` (the nearest
- * existing ancestor when it does not exist yet).  0 when unknown. */
+/* Init-namespace mount that would be marked for `path`: the mount of the
+ * path itself when it exists, else the nearest existing ancestor (the
+ * path a mount mark would actually be attached to).  0 when unknown.
+ *
+ * stat() must come first: nearest_existing_ancestor() presumes the path
+ * is missing and starts by stripping the last component, so walking an
+ * existing path would compare its parent's mount instead of the mount
+ * that will actually be marked. */
 static unsigned long long mark_target_mount_id(const char *path)
 {
     char ancestor[PATH_MAX];
     struct stat st;
 
+    if (stat(path, &st) == 0)
+        return mount_id_of(path);
     if (!nearest_existing_ancestor(path, ancestor, sizeof(ancestor), &st))
         return 0;
     return mount_id_of(ancestor);
@@ -1771,6 +1815,9 @@ static int scope_guard_mount_collision(const char *config_path)
         return 0;
     }
 
+    /* Mount IDs the daemon's own paths would be reached through; 0 =
+     * unavailable (kernel without statx or a statx failure), in which
+     * case the device fallback below takes over. */
     unsigned long long state_id = mark_target_mount_id(PERSIST_STATE_DIR);
     unsigned long long config_id =
         (config_path && config_path[0]) ? mark_target_mount_id(config_path) : 0;
@@ -1787,6 +1834,8 @@ static int scope_guard_mount_collision(const char *config_path)
     dev_t config_dev = 0;
     struct stat dst;
 
+    /* Only the sides without a mount ID need a device value: a
+     * mount-ID comparison is strictly stronger. */
     if (state_id == 0 && stat(PERSIST_STATE_DIR, &dst) == 0)
         state_dev = dst.st_dev;
     if (config_id == 0 && config_path && config_path[0] &&
@@ -1805,8 +1854,12 @@ static int scope_guard_mount_collision(const char *config_path)
         const char *target = pp->path;
         unsigned long long id;
 
+        /* Exclusions install no mark (fanotify_add_protected returns
+         * early), so they cannot collide with the daemon's own opens. */
         if (pp->is_exclude)
             continue;
+        /* A glob entry's mark is its wildcard-free base, so that is the
+         * path a collision must be tested against. */
         if (pp->is_glob)
         {
             if (pp->base_len <= 0 || pp->base_len >= (int)sizeof(base))
@@ -2491,6 +2544,8 @@ static int recent_cache_lookup(pid_t pid, unsigned long long start,
             e->ino != ino || strcmp(e->binary, binary) != 0 ||
             strcmp(e->target, target) != 0)
             continue;
+        /* Monotonic age in milliseconds: a wall-clock step cannot make
+         * a decision expire early or live on. */
         long age_ms = (now.tv_sec - e->ts.tv_sec) * 1000L + (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
         if (age_ms > RECENT_CACHE_TTL_MS)
             continue; /* expired: a newer entry for this key may follow */
@@ -2618,6 +2673,8 @@ static int process_in_dialog_group(pid_t pid, pid_t dialog_pid)
     if (!p)
         return 0;
     p++;
+    /* After the ')' come state (char), ppid (int), pgrp (int); parse
+     * past the first two to read the process group. */
     long pgrp = 0;
     if (sscanf(p, " %*c %*d %ld", &pgrp) != 1)
         return 0;
@@ -2765,8 +2822,11 @@ static int g_unsafe_seen_next = 0;
 static int unsafe_first_hit(pid_t pid)
 {
     unsigned long long start = 0;
-    (void)proc_stat_session(pid, NULL, &start);
+    (void)proc_stat_session(pid, NULL, &start); /* failure leaves 0 */
 
+    /* A failed /proc read leaves start 0, so the key is then (pid, 0):
+     * it still de-duplicates this process while its stat stays
+     * unreadable, and a different instance gets a different start. */
     for (int i = 0; i < g_unsafe_seen_count; i++)
     {
         if (g_unsafe_seen[i].pid == pid && g_unsafe_seen[i].start == start)
@@ -3462,7 +3522,8 @@ static int event_runtime_allowed(EventCtx *c)
 /*
  * Record an allow decision the user made in the dialog.  Returns the
  * fanotify response (always FAN_ALLOW; session decisions degrade to a
- * one-time cache grant when the session is unknown).
+ * one-time cache grant when the session is unknown or the binary digest
+ * is unavailable).
  */
 static unsigned int record_allow_decision(EventCtx *c, int decision)
 {
@@ -3475,6 +3536,16 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
     }
     else if (decision == NOTIFY_ALLOW_SESSION)
     {
+        /* DELIBERATE: a session grant is recorded even when the binary
+         * digest is unavailable (c->bin_sha512[0] == '\0').  AppImages
+         * under /tmp/.mount_* and other self-updating tools cannot be
+         * hashed, and "Allow Session" is exactly the scope for them;
+         * degrading this to Allow Once earns one cached open and then
+         * re-prompts, which breaks the primary use case.  The matcher
+         * (session.c) treats an empty stored digest as a match, bounded
+         * by the session leader, the binary path and the target.  Do NOT
+         * turn this back into a fail-closed degradation: see the
+         * session.h contract and the AGENTS.md limitations note. */
         if (c->have_sid)
         {
             session_allow_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
@@ -3535,6 +3606,9 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
 
         if (c->have_sid)
         {
+            /* A missing digest is stored here too (see the allow path).
+             * The empty-digest match is conservative on this side: it
+             * denies any binary at the same path for the session. */
             session_deny_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
                              c->target, session_ttl);
         }
@@ -3765,6 +3839,47 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
 }
 
 /*
+ * Test seam (fanotify.h): run the real allow-decision recorder over a
+ * synthetic dialog decision and return the fanotify response (FAN_ALLOW).
+ * sid > 0 marks the context as a member of that session with the given
+ * leader start time; bin_sha512 may be NULL or "" to mirror an
+ * unavailable digest.  The event pid is the caller's, so a degraded grant
+ * is cached under it.
+ */
+unsigned int fanotify_test_record_allow_decision(const char *binary,
+                                                 const char *bin_sha512,
+                                                 const char *target,
+                                                 pid_t sid,
+                                                 unsigned long long sid_start,
+                                                 int decision)
+{
+    struct fanotify_event_metadata ev;
+    EventCtx c;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = FAN_NOFD;
+    ev.pid = (int)getpid();
+
+    memset(&c, 0, sizeof(c));
+    c.ev = &ev;
+    c.binary = (char *)binary; /* owned by the caller; not freed here */
+    snprintf(c.target, sizeof(c.target), "%s", target ? target : "");
+    snprintf(c.bin_sha512, sizeof(c.bin_sha512), "%s",
+             bin_sha512 ? bin_sha512 : "");
+    if (sid > 0)
+    {
+        c.sid = sid;
+        c.sid_start = sid_start;
+        c.have_sid = 1;
+    }
+
+    return record_allow_decision(&c, decision);
+}
+
+/*
  * Advance to the next event in one read(2) batch.  Encapsulates the
  * offset arithmetic and the malformed-length guard: a zero or oversized
  * event_len must end the walk instead of looping or stepping outside the
@@ -3777,6 +3892,8 @@ event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
     if (ev->event_len == 0 || (ssize_t)ev->event_len > *remaining)
         return NULL;
     *remaining -= (ssize_t)ev->event_len;
+    /* Less than one header left: no full record (and therefore no
+     * duplicated event fd) can hide in the tail, so the walk ends. */
     if (*remaining < (ssize_t)sizeof(struct fanotify_event_metadata))
         return NULL;
     return (const struct fanotify_event_metadata *)((const char *)ev +
@@ -3808,6 +3925,8 @@ event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
  * Returns 1 when the event was responded to (the caller counts it) and 0
  * when it was deferred to the main loop with its event fd left open.
  * Fail closed: a full pending queue denies rather than hanging the caller.
+ * A response queued for retry also returns 1: the retry/stranded queue
+ * now owns the event fd, and the caller must not close it.
  */
 
 /* Re-entrancy guard: set while a defer-mode pipeline decision is running
@@ -3815,6 +3934,17 @@ event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
  * and a nested pump must not recurse into the pipeline — it falls back to
  * the cheap fast-path allow and defers the rest. */
 static int g_pump_in_pipeline = 0;
+
+/*
+ * Per-call work bound for fanotify_pump().  The pump runs from notify.c's
+ * dialog wait loops and from sha512.c's hash-helper wait hook; draining a
+ * sustained event stream in one call would starve the caller's dialog
+ * deadline and signal handling.  Stop after this many read(2) batches
+ * (each at most BUF_SIZE bytes) and return to the caller; every record
+ * already read is processed or claimed before the return, and the group
+ * fd stays readable so the next poll/entry continues.
+ */
+#define PUMP_MAX_BATCHES 16
 
 static int pump_decide_permission(int fan_fd,
                                   const struct fanotify_event_metadata *ev,
@@ -3906,6 +4036,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
     int responded = 0;
+    int batches = 0;
 
     /* Publish the dialog for the duration of this call so the hash-helper
      * wait hook (hash_wait_pump) stays dialog-aware; save/restore keeps a
@@ -3921,12 +4052,22 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
     while (1)
     {
+        /* Per-call budget: a sustained stream must not hold the
+         * single-threaded daemon (or SIGTERM/SIGHUP) inside one pump.
+         * Stop between read(2) batches — after the current buffer was
+         * fully processed or claimed — and return to the caller's poll
+         * loop; the group fd stays readable, so the next poll/entry
+         * continues where this one stopped. */
+        if (batches >= PUMP_MAX_BATCHES)
+            break;
+
         /* The group fd is permanently non-blocking (FAN_NONBLOCK at init):
          * a read here can never stall the dialog child, and notify.c
          * re-enters the pump whenever poll(2) reports the fd readable. */
         ssize_t n = read(fan_fd, buf, sizeof(buf));
         if (n <= 0)
             break;
+        batches++;
 
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
@@ -3992,23 +4133,32 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 close((int)ev->fd);
             }
 
-            if (g_fatal)
+            /* Lifecycle boundary: shutdown, reload and fatal conditions
+             * stop the walk at the record boundary.  read(2) duplicated
+             * an fd for every later record, so they are claimed by
+             * batch_abandon() below; nothing is left open or unanswered. */
+            if (g_fatal || !g_running || g_need_reload)
                 break;
             ev = event_next(ev, &remaining);
             if (!ev)
                 break;
         }
-        if (g_fatal)
+        if (g_fatal || !g_running || g_need_reload)
         {
             /* Claim the records this walk exited in front of before
-             * abandoning the group: their fds are already duplicated
-             * into this process and their permission events would
-             * otherwise auto-ALLOW at close(fan_fd). */
-            batch_abandon(fan_fd, ev, remaining);
+             * returning: their fds are already duplicated into this
+             * process and their permission events would otherwise
+             * auto-ALLOW at close(fan_fd).  ev is NULL only when the
+             * batch was already walked to its end, so there is nothing
+             * left to claim. */
+            if (ev)
+                batch_abandon(fan_fd, ev, remaining);
             break;
         }
     }
 
+    /* Single exit: nothing returns after publishing, so this restore
+     * covers every way out of the loop (budget, EAGAIN, lifecycle). */
     g_active_dialog_pid = saved_dialog;
     return responded;
 }
@@ -4045,6 +4195,8 @@ void fanotify_clear_marks(int fd)
                     g_marks[i].path, strerror(errno));
             if (kept != i)
             {
+                /* The strdup'd path moves with the entry; clear the
+                 * source slot so the dead tail does not alias it. */
                 g_marks[kept] = g_marks[i];
                 g_marks[i].path = NULL;
             }
@@ -4098,11 +4250,15 @@ void fanotify_clear_marks(int fd)
 /*
  * Responses whose kernel write failed are queued with their event fd
  * still open: closing the fd does not answer a permission event, and
- * close(fan_fd) would auto-ALLOW it.  The main loop and the pump retry
- * the queue; fanotify_drain_and_deny() forces a final DENY before
- * close(fan_fd) on shutdown.
+ * close(fan_fd) would auto-ALLOW it.  The queue starts at UNANSWERED_MAX
+ * entries and doubles on demand; if it cannot grow (allocation failure),
+ * the event fd is parked in the bounded stranded list instead, so a
+ * decided response is never abandoned.  The main loop and the pump retry
+ * the queue; fanotify_drain_and_deny() forces a final DENY for the queue
+ * and the stranded list before close(fan_fd) on shutdown.
  */
-#define UNANSWERED_MAX 64
+#define UNANSWERED_MAX 64          /* initial queue capacity            */
+#define UNANSWERED_STRANDED_MAX 32 /* allocation-failure fallback bound */
 
 typedef struct
 {
@@ -4111,8 +4267,23 @@ typedef struct
     unsigned int response;             /* decision still to deliver    */
 } UnansweredEvent;
 
-static UnansweredEvent g_unanswered[UNANSWERED_MAX];
+static UnansweredEvent *g_unanswered = NULL;
 static int g_unanswered_count = 0;
+static int g_unanswered_cap = 0;
+
+/*
+ * Bounded fallback for a response whose queue slot could not even be
+ * allocated: only the event fd is kept (the shutdown drain force-DENYs
+ * it), so the fail-closed direction survives a double allocation
+ * failure.  Full list: fanotify_respond() keeps the fd open and logs.
+ */
+static int g_stranded[UNANSWERED_STRANDED_MAX];
+static int g_stranded_count = 0;
+
+/* Test seam (fanotify_test_force_unanswered_alloc_fail): makes the next
+ * retry-queue admission fail, as if its allocation failed, so the
+ * stranded fallback is reachable without inducing real memory pressure. */
+static int g_test_unanswered_alloc_fail = 0;
 
 /* Raw response write: 0 delivered, 1 already answered, -1 failed. */
 static int write_response(int fan_fd, int event_fd, unsigned int response)
@@ -4153,20 +4324,83 @@ static void unanswered_drop(int idx)
 }
 
 /* Queue one failed response; the caller keeps the event fd open.
- * Returns 0 when queued, -1 when the queue is full. */
+ * Doubles the queue from UNANSWERED_MAX when full.  Returns 0 when
+ * queued, -1 when the queue could not grow (the caller falls back to the
+ * stranded list). */
 static int unanswered_add(int event_fd,
                           const struct fanotify_event_metadata *ev,
                           unsigned int response)
 {
     UnansweredEvent *u;
 
-    if (g_unanswered_count >= UNANSWERED_MAX)
-        return -1;
+    if (g_test_unanswered_alloc_fail)
+        return -1; /* test seam: simulate the allocation failing */
+    if (g_unanswered_count >= g_unanswered_cap)
+    {
+        int new_cap;
+        UnansweredEvent *grown;
+
+        if (g_unanswered_cap == 0)
+            new_cap = UNANSWERED_MAX;
+        else
+        {
+            /* Refuse a capacity that cannot be represented or whose
+             * allocation size would overflow; the caller strands the
+             * event fd instead of risking a wrapped allocation. */
+            if (g_unanswered_cap > INT_MAX / 2 ||
+                (size_t)g_unanswered_cap * 2 >
+                    ((size_t)-1) / sizeof(UnansweredEvent))
+                return -1;
+            new_cap = g_unanswered_cap * 2;
+        }
+        grown = realloc(g_unanswered, (size_t)new_cap * sizeof(*grown));
+        if (!grown)
+            return -1;
+        g_unanswered = grown;
+        g_unanswered_cap = new_cap;
+    }
     u = &g_unanswered[g_unanswered_count++];
     u->fd = event_fd;
     u->ev = *ev;
     u->response = response;
     return 0;
+}
+
+/* Park an event fd whose response could not be queued.  Returns 0 when
+ * parked, -1 when the bounded list is full. */
+static int stranded_add(int event_fd)
+{
+    if (g_stranded_count >= UNANSWERED_STRANDED_MAX)
+        return -1;
+    g_stranded[g_stranded_count++] = event_fd;
+    return 0;
+}
+
+/* Shutdown: force-DENY and close every stranded event fd.  Runs before
+ * close(fan_fd), after which the kernel would auto-ALLOW them. */
+static void stranded_flush(int fan_fd)
+{
+    int denied = 0;
+
+    for (int i = 0; i < g_stranded_count; i++)
+    {
+        int fd = g_stranded[i];
+        int rc = write_response(fan_fd, fd, FAN_DENY);
+
+        if (rc < 0)
+            log_msg(LOG_ERR,
+                    "fanotify stranded response could not be delivered for "
+                    "fd %d; the kernel will allow it when the group closes",
+                    fd);
+        else
+            denied++;
+        close(fd);
+    }
+    if (denied > 0)
+        log_msg(LOG_WARNING,
+                "denied %d stranded permission event(s) before shutdown",
+                denied);
+    g_stranded_count = 0;
 }
 
 /*
@@ -4223,10 +4457,12 @@ static void unanswered_flush(int fan_fd)
 /*
  * Respond to one event through the group fd.
  * Returns 0 when the response was delivered (or already delivered), so
- * the caller may close the event fd; -1 when the write failed and the
- * response was queued for retry, so the caller must keep the event fd
- * open; -2 when it could not even be queued (the caller closes the fd;
- * the group is marked fatal and the supervisor restarts the daemon).
+ * the caller may close the event fd; -1 whenever it was NOT delivered,
+ * so the caller MUST keep the event fd open.  On -1 the response is
+ * queued in the growing retry queue, or -- when that cannot be allocated
+ * -- parked in the bounded stranded list; the retry loop or the shutdown
+ * drain answers it before close(fan_fd).  There is no third outcome: a
+ * decided response is never abandoned.
  */
 static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev,
                             unsigned int response)
@@ -4245,22 +4481,33 @@ static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev
     }
 
     int err = errno;
+    if (err != EAGAIN)
+        g_fatal = 1; /* the group cannot deliver decisions; restart */
+
     if (unanswered_add((int)ev->fd, ev, response) == 0)
     {
         log_msg(LOG_WARNING,
                 "fanotify write response: %s; response queued for retry",
                 strerror(err));
-        if (err != EAGAIN)
-            g_fatal = 1; /* the group cannot deliver decisions; restart */
+        return -1;
+    }
+
+    if (stranded_add((int)ev->fd) == 0)
+    {
+        log_msg(LOG_WARNING,
+                "fanotify write response: %s and the retry queue could not "
+                "grow; fd %d held open for a shutdown FAN_DENY",
+                strerror(err), (int)ev->fd);
         return -1;
     }
 
     log_msg(LOG_ERR,
-            "fanotify write response: %s and the retry queue is full; the "
-            "event cannot be answered (the kernel auto-allows it on group "
-            "close)", strerror(err));
+            "fanotify write response: %s and both the retry queue and the "
+            "stranded list are full; keeping event fd %d open (never "
+            "silently dropped)",
+            strerror(err), (int)ev->fd);
     g_fatal = 1;
-    return -2;
+    return -1;
 }
 
 /*
@@ -4376,10 +4623,14 @@ void fanotify_drain_and_deny(int fan_fd)
     int denied = 0;
 
     /* First deliver anything the retry queue is still holding, forcing
-     * DENY when the original response cannot be written: after
-     * close(fan_fd) the kernel would allow those events. */
+     * DENY when the original response cannot be written, then force-DENY
+     * every stranded fd: after close(fan_fd) the kernel would allow all
+     * of them. */
     unanswered_flush(fan_fd);
+    stranded_flush(fan_fd);
 
+    /* Then the kernel queue itself: from here each response is the last
+     * chance before close(fan_fd) auto-ALLOWs whatever is left. */
     while (1)
     {
         struct pollfd pfd;
@@ -4444,6 +4695,14 @@ void fanotify_drain_and_deny(int fan_fd)
 }
 
 /*
+ * Retry cadence while responses sit in the retry queue: poll() cannot
+ * report "ready to write" for fanotify responses, so the loop wakes on
+ * this timer -- short enough to deliver a queued response promptly,
+ * long enough not to spin an idle daemon.
+ */
+#define UNANSWERED_RETRY_POLL_MS 250
+
+/*
  * Main event loop.  Blocks in poll() on {group fd, wake pipe, control
  * listener}; wake_fd is the read end of a non-blocking pipe that the
  * signal handlers write a byte to (pass -1 when there is no wake pipe)
@@ -4463,6 +4722,16 @@ void fanotify_drain_and_deny(int fan_fd)
  * from the poll set (the local copy is set to -1) instead of failing the
  * daemon: protection must outlive a CLI transport failure, and main.c
  * owns the fd's lifetime and teardown.
+ *
+ * Per-iteration order:
+ *   1. retry queued responses, replay deferred events;
+ *   2. poll, drain the wake pipe, serve one bounded control batch;
+ *   3. on group-fd POLLIN walk one read(2) batch, dispatching each
+ *      record by kind: metadata version, FAN_OPEN_PERM, create/moved-to
+ *      notification, FAN_Q_OVERFLOW, other;
+ *   4. exit on g_fatal/g_running/g_need_reload -- a g_fatal exit
+ *      abandons (denies and closes) the records behind the fatal one;
+ *   5. expire the file cache after a clean batch (100 events or 10 s).
  */
 void fanotify_loop(int fd, int wake_fd, int control_fd)
 {
@@ -4517,7 +4786,7 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
 
         /* A queued response needs periodic retries even on an otherwise
          * idle filesystem; the fanotify poll() does not report POLLOUT. */
-        int poll_timeout = (g_unanswered_count > 0) ? 250 : -1;
+        int poll_timeout = (g_unanswered_count > 0) ? UNANSWERED_RETRY_POLL_MS : -1;
         int pr = poll(pfds, nfds, poll_timeout);
         if (pr < 0 && errno == EINTR)
         {
@@ -4533,7 +4802,7 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
             continue;
         }
         if (pr <= 0)
-            continue;
+            continue; /* retry tick (pr == 0) or transient poll error */
 
         /* Drain the wake pipe so a backlog of signal bytes cannot spin. */
         if (wake_idx >= 0 &&
@@ -4547,8 +4816,9 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
         /*
          * Serve at most one bounded batch of control clients per wake.
          * control_handle() is non-blocking by contract (bounded accepts,
-         * one bounded read per connection), so no retry or wait belongs
-         * here and a client can never hold the loop.  A broken listener
+         * bounded non-blocking reads per connection), so no retry or
+         * wait belongs here and a client can never hold the loop.  A
+         * broken listener
          * is dropped from this loop's poll set (the local copy is set to
          * -1) rather than closing it or failing the daemon: a CLI
          * transport failure must not stop protection, and main.c owns
@@ -4661,7 +4931,11 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
                     /* Claim the records this walk exited in front of:
                      * their fds are already duplicated into this process
                      * and their permission events would otherwise
-                     * auto-ALLOW at close(fan_fd) during shutdown. */
+                     * auto-ALLOW at close(fan_fd) during shutdown.
+                     * Only g_fatal exits the walk early: a pending
+                     * shutdown/reload lets this batch finish in place
+                     * (the group fd can still deliver decisions), while
+                     * a fatal group failure cannot answer the rest. */
                     batch_abandon(fd, ev, remaining);
                     break;
                 }
@@ -4778,7 +5052,10 @@ int fanotify_remove_dyn_entry(int deny, const char *id)
     /* Resolve through the CLI's matcher: an unambiguous 8..16-character
      * lower-case hex prefix (full ID allowed).  Entries with an empty ID
      * do not participate; a malformed non-empty ID means the live list
-     * cannot be trusted, so the removal fails closed. */
+     * cannot be trusted, so the removal fails closed.
+     *
+     * ruleid_find() runs over the compact id_ptrs[]; idx_map[] maps the
+     * index it returns back to the live list. */
     for (int i = 0; i < *count; i++)
     {
         if (list[i].rule_id[0] == '\0')
@@ -4824,6 +5101,8 @@ int fanotify_remove_dyn_entry(int deny, const char *id)
         return -1;
     }
 
+    /* The live list no longer holds the removed entry: log its fields
+     * from the pre-removal snapshot. */
     log_msg(LOG_INFO, "removed %s rule %s (%s)", name,
             g_dyn_snapshot[idx].rule_id, g_dyn_snapshot[idx].binary);
     return 1;
@@ -4866,8 +5145,10 @@ int fanotify_prune_dyn_list(int deny, int *removed_out)
     int rc = -1;
 
     if (removed_out)
-        *removed_out = 0;
+        *removed_out = 0; /* never leave a stale count on the failure exits */
 
+    /* Only groups of >= 2 members are reported, so the group table
+     * needs at most n/2 + 1 slots; removals can cover every entry. */
     rows = calloc(DYN_MAX, sizeof(PersistEntry));
     groups = calloc(DYN_MAX / 2 + 1, sizeof(PruneGroup));
     removals = calloc(DYN_MAX, sizeof(int));
@@ -4906,6 +5187,8 @@ int fanotify_prune_dyn_list(int deny, int *removed_out)
         goto out;
     }
 
+    /* removals[] indexes the pre-prune snapshot: the live list is
+     * already compacted behind it. */
     for (int i = 0; i < removal_count; i++)
         log_msg(LOG_INFO, "pruned %s rule %s (%s)", name,
                 g_dyn_snapshot[removals[i]].rule_id,
@@ -4990,6 +5273,38 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining)
 {
     return batch_abandon(group_fd, ev, remaining);
+}
+
+/*
+ * Test seams (fanotify.h): the failed-response retry queue.
+ * fanotify_test_respond() runs the real fanotify_respond() so the
+ * queue-growth, stranded-fallback and return contract can be driven with
+ * a pipe stand-in for the group fd (a full non-blocking pipe makes every
+ * write fail with EAGAIN, deterministically and without root).  The
+ * count seams expose the queue/stranded depth; the force seam makes the
+ * next queue admission fail, as if its allocation failed, so the bounded
+ * stranded fallback is reachable without real memory pressure.
+ */
+int fanotify_test_respond(int group_fd,
+                          const struct fanotify_event_metadata *ev,
+                          unsigned int response)
+{
+    return fanotify_respond(group_fd, ev, response);
+}
+
+int fanotify_test_unanswered_count(void)
+{
+    return g_unanswered_count;
+}
+
+int fanotify_test_stranded_count(void)
+{
+    return g_stranded_count;
+}
+
+void fanotify_test_force_unanswered_alloc_fail(int on)
+{
+    g_test_unanswered_alloc_fail = on;
 }
 
 /* Test seam (fanotify.h): the pump stack's published dialog pid. */
