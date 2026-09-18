@@ -86,6 +86,12 @@ void fanotify_clear_marks(int fd);
  * event.  A nested pump (re-entered from inside a defer-mode decision,
  * e.g. by a hashing helper wait) falls back to the cheap fast-path allow
  * and defers the rest instead of recursing into the pipeline.
+ * Bounded per call: after a small number of read(2) batches, or at the
+ * first record boundary once g_running, g_need_reload or g_fatal is set,
+ * it returns to the caller's poll loop with the rest of the stream left
+ * in the group fd (readable, so the next poll/entry continues).  Every
+ * record already read is responded to or claimed (batch_abandon) before
+ * the return; no record is ever leaked or silently abandoned.
  * Called by notify.c while waiting for the dialog child to finish.
  * Returns the number of events responded to immediately.
  */

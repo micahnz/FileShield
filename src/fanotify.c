@@ -101,7 +101,9 @@ static int batch_abandon(int fan_fd,
  * Resolve the path of a fanotify event fd into out (outsz bytes).
  * ev->fd is an open fd in the DAEMON's fd table (not the target process's),
  * so we read /proc/self/fd/<fd_num>.
- * Returns 0 on success, -1 when the link cannot be read.  The caller
+ * Returns 0 on success, -1 when the link cannot be read or its result
+ * does not fit the buffer (a truncated result is unverifiable, so a
+ * partial path is never treated as a match).  The caller
  * supplies the buffer: this runs once per event, so no malloc per event
  * (bench_hotpath: 1.960 us with a heap buffer vs 1.915 us with the
  * caller's, and one allocation-failure path fewer).  The kernel appends
@@ -115,7 +117,10 @@ static int resolve_fd_path(int fd_num, char *out, size_t outsz)
 
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd_num);
     len = readlink(link, out, outsz - 1);
-    if (len < 0)
+    /* A result that exactly fills the buffer is either a path that did
+     * not fit or one that exactly did; unverifiable either way, so fail
+     * closed exactly like proc_exe_path(). */
+    if (len < 0 || (size_t)len >= outsz - 1)
         return -1;
     out[len] = '\0';
 
@@ -317,6 +322,9 @@ static const RuleEntry *denylist_match(const char *binary, const char *target)
  * the pipeline, so every fail-closed decision is unchanged.
  */
 #define HASH_CACHE_MAX 64
+/* Negative windows are measured on the monotonic clock (mono_seconds):
+ * a wall-clock step must not extend a fail-closed retry, and the fields
+ * are memory-only, so no persisted timestamp changes meaning. */
 #define HASH_FAIL_RETRY_S 60
 
 typedef struct
@@ -453,7 +461,7 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
                 const HashPidFailEntry *e = &g_hash_pid_fails[i];
                 if (e->pid == pid && e->start == start)
                 {
-                    if (!force_retry && time(NULL) < e->retry_after)
+                    if (!force_retry && mono_seconds() < e->retry_after)
                     {
                         snprintf(g_hash_failure_reason,
                                  sizeof(g_hash_failure_reason), "%s",
@@ -482,12 +490,12 @@ static int cached_sha512_proc_exe(pid_t pid, char hex_out[129], int force_retry)
                  sha512_last_failure()[0] ? sha512_last_failure()
                                           : "hashing failed");
         if (have_start)
-            hash_pid_fail_store(pid, start, time(NULL),
+            hash_pid_fail_store(pid, start, mono_seconds(),
                                 g_hash_failure_reason);
         return -1;
     }
 
-    time_t now = time(NULL);
+    time_t now = mono_seconds();
 
     for (int i = 0; i < g_hash_cache_count; i++)
     {
@@ -690,7 +698,7 @@ static time_t g_dialog_global_blocked_until = 0;
 /* Returns 1 when the dialog should be skipped (deny) to bound flooding. */
 static int dialog_rate_limited(const char *binary)
 {
-    time_t now = time(NULL);
+    time_t now = mono_seconds();
     DialogRateEntry *e = NULL;
 
     if (now < g_dialog_global_blocked_until)
@@ -3826,6 +3834,17 @@ event_next(const struct fanotify_event_metadata *ev, ssize_t *remaining)
  * the cheap fast-path allow and defers the rest. */
 static int g_pump_in_pipeline = 0;
 
+/*
+ * Per-call work bound for fanotify_pump().  The pump runs from notify.c's
+ * dialog wait loops and from sha512.c's hash-helper wait hook; draining a
+ * sustained event stream in one call would starve the caller's dialog
+ * deadline and signal handling.  Stop after this many read(2) batches
+ * (each at most BUF_SIZE bytes) and return to the caller; every record
+ * already read is processed or claimed before the return, and the group
+ * fd stays readable so the next poll/entry continues.
+ */
+#define PUMP_MAX_BATCHES 16
+
 static int pump_decide_permission(int fan_fd,
                                   const struct fanotify_event_metadata *ev,
                                   pid_t dialog_child_pid)
@@ -3916,6 +3935,7 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
         __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
 
     int responded = 0;
+    int batches = 0;
 
     /* Publish the dialog for the duration of this call so the hash-helper
      * wait hook (hash_wait_pump) stays dialog-aware; save/restore keeps a
@@ -3931,12 +3951,22 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
 
     while (1)
     {
+        /* Per-call budget: a sustained stream must not hold the
+         * single-threaded daemon (or SIGTERM/SIGHUP) inside one pump.
+         * Stop between read(2) batches — after the current buffer was
+         * fully processed or claimed — and return to the caller's poll
+         * loop; the group fd stays readable, so the next poll/entry
+         * continues where this one stopped. */
+        if (batches >= PUMP_MAX_BATCHES)
+            break;
+
         /* The group fd is permanently non-blocking (FAN_NONBLOCK at init):
          * a read here can never stall the dialog child, and notify.c
          * re-enters the pump whenever poll(2) reports the fd readable. */
         ssize_t n = read(fan_fd, buf, sizeof(buf));
         if (n <= 0)
             break;
+        batches++;
 
         const struct fanotify_event_metadata *ev =
             (const struct fanotify_event_metadata *)buf;
@@ -4002,19 +4032,26 @@ int fanotify_pump(int fan_fd, pid_t dialog_child_pid)
                 close((int)ev->fd);
             }
 
-            if (g_fatal)
+            /* Lifecycle boundary: shutdown, reload and fatal conditions
+             * stop the walk at the record boundary.  read(2) duplicated
+             * an fd for every later record, so they are claimed by
+             * batch_abandon() below; nothing is left open or unanswered. */
+            if (g_fatal || !g_running || g_need_reload)
                 break;
             ev = event_next(ev, &remaining);
             if (!ev)
                 break;
         }
-        if (g_fatal)
+        if (g_fatal || !g_running || g_need_reload)
         {
             /* Claim the records this walk exited in front of before
-             * abandoning the group: their fds are already duplicated
-             * into this process and their permission events would
-             * otherwise auto-ALLOW at close(fan_fd). */
-            batch_abandon(fan_fd, ev, remaining);
+             * returning: their fds are already duplicated into this
+             * process and their permission events would otherwise
+             * auto-ALLOW at close(fan_fd).  ev is NULL only when the
+             * batch was already walked to its end, so there is nothing
+             * left to claim. */
+            if (ev)
+                batch_abandon(fan_fd, ev, remaining);
             break;
         }
     }

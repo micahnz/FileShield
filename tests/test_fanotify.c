@@ -247,6 +247,39 @@ static void test_deleted_suffix_stripped(void) {
 }
 
 /*
+ * Part 0e2: resolve_fd_path() rejects a truncated readlink() result.  The
+ * kernel fills the buffer without a NUL terminator and readlink(2)
+ * returns the number of bytes it would have written; a return of outsz-1
+ * is either a path that did not fit or one that exactly filled the
+ * buffer.  Both are unverifiable, so the resolver must fail — a partial
+ * path must never be treated as a match — exactly like proc_exe_path().
+ */
+static void test_resolve_path_truncation_rejected(void) {
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(fd >= 0, "open /dev/null for resolve-truncation test");
+    if (fd < 0)
+        return;
+
+    /* "/dev/null" is 9 bytes: an 11-byte buffer accepts it with one spare
+     * byte; a 10-byte buffer receives exactly outsz-1 bytes and is
+     * rejected as unverifiable. */
+    char roomy[11];
+    char exact[10];
+    char tiny[4];
+
+    ASSERT(fanotify_test_resolve_path(fd, roomy, sizeof(roomy)) == 0,
+           "a path that fits with room to spare resolves");
+    ASSERT(strcmp(roomy, "/dev/null") == 0, "the resolved path is exact");
+
+    ASSERT(fanotify_test_resolve_path(fd, exact, sizeof(exact)) == -1,
+           "a readlink result exactly filling the buffer is rejected");
+    ASSERT(fanotify_test_resolve_path(fd, tiny, sizeof(tiny)) == -1,
+           "a clearly truncated readlink result is rejected");
+
+    close(fd);
+}
+
+/*
  * Part 0f: '!' exclusions are deny-wins and order-independent.  The
  * exclusion is listed before the positive to prove that config order
  * does not matter.
@@ -2445,6 +2478,191 @@ static void test_pump_dialog_group_allow(void) {
 }
 
 /*
+ * Part 0c-ter: fanotify_pump() is bounded per call.  A sustained event
+ * stream must not hold the single-threaded daemon (or its SIGTERM/SIGHUP
+ * handling) inside one pump call: after a bounded number of read(2)
+ * batches the pump returns to its caller's poll loop, leaving the rest
+ * of the stream in the group fd.  A SOCK_SEQPACKET socketpair makes the
+ * bound deterministic — one record per read(2) — where a SOCK_STREAM
+ * peer could coalesce every write into the first read and hide it.
+ * Every event must still be answered exactly once, in order, and have
+ * its event fd claimed across the caller's re-entries.
+ */
+static void test_pump_bounded_and_lossless(void) {
+    enum { N_EVENTS = 40 };
+    int sv[2] = { -1, -1 };
+    int efd[N_EVENTS];
+    static char rec[sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)rec;
+    int total = 0;
+    int calls = 0;
+    int i;
+
+    log_msg(LOG_DEBUG, "warm up syslog before bounded-pump socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    memset(rec, 0, sizeof(rec));
+    md->event_len = sizeof(*md);
+    md->metadata_len = sizeof(*md);
+    md->vers = FANOTIFY_METADATA_VERSION;
+    md->mask = FAN_OPEN_PERM;
+    md->pid = (int)getpid();
+    for (i = 0; i < N_EVENTS; i++)
+        efd[i] = -1;
+
+    for (i = 0; i < N_EVENTS; i++) {
+        ssize_t w;
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open event fd");
+        if (efd[i] < 0)
+            break;
+        md->fd = efd[i];
+        w = write(sv[1], rec, sizeof(*md));
+        ASSERT(w == (ssize_t)sizeof(*md), "feed one event packet");
+        if (w != (ssize_t)sizeof(*md))
+            break;
+    }
+    if (i < N_EVENTS) {
+        for (int j = 0; j < N_EVENTS; j++)
+            if (efd[j] >= 0)
+                close(efd[j]);
+        close(sv[0]);
+        close(sv[1]);
+        return; /* the ASSERTs above recorded the failure */
+    }
+
+    /* Re-enter the pump exactly as notify.c's poll loop does until the
+     * stream is drained. */
+    while (total < N_EVENTS && calls < N_EVENTS + 2) {
+        int r = fanotify_pump(sv[0], getpid());
+        ASSERT(r >= 0, "pump returns a non-negative count");
+        ASSERT(fanotify_test_active_dialog_pid() == 0,
+               "dialog pid restored after each bounded pump return");
+        total += r;
+        calls++;
+        if (r == 0)
+            break;
+    }
+
+    ASSERT(calls >= 2,
+           "one bounded pump call did not drain the whole stream");
+    ASSERT(total == N_EVENTS,
+           "every queued event is responded to across re-entries");
+
+    /* Responses arrive in event order, one per event. */
+    for (i = 0; i < N_EVENTS; i++) {
+        struct fanotify_response resp;
+        ssize_t got = read(sv[1], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[i] &&
+                   resp.response == FAN_ALLOW,
+               "each event answered FAN_ALLOW once, in order");
+    }
+    for (i = 0; i < N_EVENTS; i++)
+        ASSERT(fcntl(efd[i], F_GETFD) == -1 && errno == EBADF,
+               "event fd closed after the response");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
+ * Part 0c-quater: a lifecycle flag stops the pump at the next record
+ * boundary, and the records already read into the current buffer are
+ * claimed exactly like the fatal path before returning: read(2)
+ * duplicated an fd for every record, so a later record left unhandled
+ * would leak its fd and auto-ALLOW at group close.  g_need_reload is
+ * used because it is not fatal (the group stays usable), and one
+ * SEQPACKET write delivers a whole three-record buffer to a single
+ * read(2), so the in-flight records are deterministic.
+ */
+static void test_pump_flag_claims_inflight_buffer(void) {
+    int sv[2] = { -1, -1 };
+    int efd[3];
+    static char batch[3 * sizeof(struct fanotify_event_metadata)]
+        __attribute__((aligned(__alignof__(struct fanotify_event_metadata))));
+    struct fanotify_event_metadata *md =
+        (struct fanotify_event_metadata *)batch;
+    struct fanotify_response resp;
+
+    log_msg(LOG_DEBUG, "warm up syslog before pump-flag socketpair");
+
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0,
+           "SEQPACKET socketpair as fake fanotify group");
+    if (sv[0] < 0)
+        return;
+
+    int fl = fcntl(sv[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the fake group non-blocking like FAN_NONBLOCK");
+    fl = fcntl(sv[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(sv[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "non-blocking response side: a missing answer must not hang");
+
+    memset(batch, 0, sizeof(batch));
+    for (int i = 0; i < 3; i++) {
+        efd[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(efd[i] >= 0, "open in-flight event fd");
+        md[i].event_len = sizeof(*md);
+        md[i].metadata_len = sizeof(*md);
+        md[i].vers = FANOTIFY_METADATA_VERSION;
+        md[i].mask = FAN_OPEN_PERM;
+        md[i].pid = (int)getpid();
+        md[i].fd = efd[i];
+    }
+
+    ASSERT(write(sv[1], batch, sizeof(batch)) == (ssize_t)sizeof(batch),
+           "feed one three-record buffer to the pump");
+
+    g_need_reload = 1;
+    int responded = fanotify_pump(sv[0], getpid());
+    g_need_reload = 0;
+
+    ASSERT(responded == 1,
+           "the pump stopped at the first record boundary after the flag");
+    ASSERT(fanotify_test_active_dialog_pid() == 0,
+           "dialog pid restored on the flag exit path");
+    ASSERT(fcntl(efd[0], F_GETFD) == -1 && errno == EBADF,
+           "the handled record's event fd was closed");
+    ASSERT(fcntl(efd[1], F_GETFD) == -1 && errno == EBADF,
+           "the record behind the flag was claimed (denied + closed)");
+    ASSERT(fcntl(efd[2], F_GETFD) == -1 && errno == EBADF,
+           "the rest of the in-flight buffer was claimed");
+
+    ssize_t got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[0] &&
+               resp.response == FAN_ALLOW,
+           "the handled record was answered FAN_ALLOW");
+    got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[1] &&
+               resp.response == FAN_DENY,
+           "the first claimed record was answered FAN_DENY");
+    got = read(sv[1], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd[2] &&
+               resp.response == FAN_DENY,
+           "the second claimed record was answered FAN_DENY");
+
+    /* With nothing left in the group, a re-entry returns promptly. */
+    ASSERT(fanotify_pump(sv[0], getpid()) == 0,
+           "a drained group makes the pump return without reading");
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/*
  * Part 0c2: a mark whose kernel removal fails must stay tracked (and be
  * retried on the next clear) instead of being forgotten, which would
  * leave an untracked kernel mark behind.  A negative fd means no group
@@ -3260,6 +3478,8 @@ int main(void) {
     test_verdict_stage_order();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
+    test_pump_bounded_and_lossless();
+    test_pump_flag_claims_inflight_buffer();
     test_pin_change_defers_in_pump();
     test_unsafe_allowlist_wins_over_pinned();
     test_dialog_rate_limiter();
@@ -3278,6 +3498,7 @@ int main(void) {
     test_unsafe_hit_once_per_process();
     test_glob_deny_and_allow_matchers();
     test_deleted_suffix_stripped();
+    test_resolve_path_truncation_rejected();
     test_incomplete_entries_grant_nothing();
     test_cmdline_scoping();
     test_dyn_created_at_preserved();
