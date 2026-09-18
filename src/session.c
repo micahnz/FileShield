@@ -98,10 +98,17 @@ static int entry_expired(const SessionEntry *e, time_t now)
     return e->expiry != 0 && e->expiry < now;
 }
 
+/*
+ * Both sides are fail closed: a missing digest on either side means the
+ * approved binary cannot be verified, so the entry must not match.  A
+ * stored entry without a digest grants nothing (recorders must never
+ * create one); fanotify's Session-Allow path degrades to a cached Allow
+ * Once when the requester's hash is unavailable.
+ */
 static int hash_matches(const SessionEntry *e, const char *bin_sha512)
 {
     if (e->binary_sha512[0] == '\0')
-        return 1;
+        return 0; /* no recorded digest: nothing to verify against */
     if (!bin_sha512 || bin_sha512[0] == '\0')
         return 0; /* cannot verify the approved binary: fail closed */
     return strcmp(e->binary_sha512, bin_sha512) == 0;

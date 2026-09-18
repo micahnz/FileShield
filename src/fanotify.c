@@ -3480,7 +3480,8 @@ static int event_runtime_allowed(EventCtx *c)
 /*
  * Record an allow decision the user made in the dialog.  Returns the
  * fanotify response (always FAN_ALLOW; session decisions degrade to a
- * one-time cache grant when the session is unknown).
+ * one-time cache grant when the session is unknown or the binary digest
+ * is unavailable).
  */
 static unsigned int record_allow_decision(EventCtx *c, int decision)
 {
@@ -3493,7 +3494,12 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
     }
     else if (decision == NOTIFY_ALLOW_SESSION)
     {
-        if (c->have_sid)
+        /* A session entry without a digest cannot be verified against a
+         * later binary at the target, and the matcher refuses it; storing
+         * one would also hand the user a grant the next open ignores.
+         * Degrade to the cached one-time grant, exactly like the Allow
+         * Always path below. */
+        if (c->have_sid && c->bin_sha512[0] != '\0')
         {
             session_allow_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
                               c->target, session_ttl);
@@ -3501,9 +3507,11 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
         else
         {
             log_msg(LOG_WARNING,
-                    "session unavailable; degrading Allow Session to "
-                    "Allow Once for %s",
-                    c->binary);
+                    "cannot store Allow Session for %s (%s); "
+                    "degrading to Allow Once",
+                    c->binary,
+                    !c->have_sid ? "session unavailable"
+                                 : "binary SHA-512 unavailable");
             cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         }
     }
@@ -3780,6 +3788,47 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
     close(pipefd[0]);
     close(pipefd[1]);
     return verdict;
+}
+
+/*
+ * Test seam (fanotify.h): run the real allow-decision recorder over a
+ * synthetic dialog decision and return the fanotify response (FAN_ALLOW).
+ * sid > 0 marks the context as a member of that session with the given
+ * leader start time; bin_sha512 may be NULL or "" to mirror an
+ * unavailable digest.  The event pid is the caller's, so a degraded grant
+ * is cached under it.
+ */
+unsigned int fanotify_test_record_allow_decision(const char *binary,
+                                                 const char *bin_sha512,
+                                                 const char *target,
+                                                 pid_t sid,
+                                                 unsigned long long sid_start,
+                                                 int decision)
+{
+    struct fanotify_event_metadata ev;
+    EventCtx c;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = FAN_NOFD;
+    ev.pid = (int)getpid();
+
+    memset(&c, 0, sizeof(c));
+    c.ev = &ev;
+    c.binary = (char *)binary; /* owned by the caller; not freed here */
+    snprintf(c.target, sizeof(c.target), "%s", target ? target : "");
+    snprintf(c.bin_sha512, sizeof(c.bin_sha512), "%s",
+             bin_sha512 ? bin_sha512 : "");
+    if (sid > 0)
+    {
+        c.sid = sid;
+        c.sid_start = sid_start;
+        c.have_sid = 1;
+    }
+
+    return record_allow_decision(&c, decision);
 }
 
 /*

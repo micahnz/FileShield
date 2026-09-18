@@ -37,6 +37,7 @@
 
 #include "../src/fanotify.h"
 #include "../src/config.h"
+#include "../src/cache.h"
 #include "../src/inode.h"
 #include "../src/notify.h"
 #include "../src/pin.h"
@@ -3273,11 +3274,70 @@ static void test_verdict_stage_order(void) {
     /* A recorded session deny beats the unsafe grant. */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
-    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 0) == 1,
+    session_deny_add(sid, start, "/bin/tool", PIN_SHA_A, "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", PIN_SHA_A, "/home/u/secret", sid, 0,
+                         0) == 1,
            "session deny wins over an unsafe grant");
 
     session_clear();
+    g_config = saved;
+}
+
+/*
+ * Part 0h1: Session-Allow with no binary digest.  The seam runs the real
+ * record_allow_decision() over a synthetic context: an unverifiable
+ * decision must degrade to the cached Allow Once (exactly like Allow
+ * Always) and must never store a digest-less session entry -- such an
+ * entry would cover a different binary at the target for the session's
+ * lifetime (and the matcher now refuses it).  The synthetic event pid is
+ * this process, so the degraded grant is observable through
+ * cache_lookup().
+ */
+static void test_session_allow_requires_digest(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    pid_t sid = 0;
+    unsigned long long start = 0;
+    const char *bin = "/bin/session-digest-test";
+    const char *target = "/home/u/.ssh/id_rsa";
+    SessionRecord recs[4];
+    int total = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.user_ttl_seconds = 60;
+    cfg.session_ttl_seconds = 60;
+    g_config = &cfg;
+    session_clear();
+    cache_clear();
+
+    ASSERT(session_id_of(getpid(), &sid, &start) == 0, "resolve own session");
+
+    /* No digest: cache the one-time grant, never store a session entry. */
+    ASSERT(fanotify_test_record_allow_decision(bin, "", target, sid, start,
+                                               NOTIFY_ALLOW_SESSION)
+               == FAN_ALLOW,
+           "empty-digest Session-Allow allows this attempt");
+    ASSERT(cache_lookup(getpid(), bin, target) > 0,
+           "empty-digest Session-Allow degrades to a cached Allow Once");
+    ASSERT(session_snapshot(0, recs, 4, &total) == 0 && total == 0,
+           "no digest-less session entry is stored");
+    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 0,
+           "no session entry matches any digest");
+
+    /* Control: with a digest the session entry is stored as before. */
+    session_clear();
+    cache_clear();
+    ASSERT(fanotify_test_record_allow_decision(bin, PIN_SHA_A, target, sid,
+                                               start, NOTIFY_ALLOW_SESSION)
+               == FAN_ALLOW,
+           "digest-bearing Session-Allow allows this attempt");
+    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 1,
+           "a digest-bearing Session-Allow is stored");
+    ASSERT(cache_lookup(getpid(), bin, target) == 0,
+           "a stored session entry needs no one-time cache grant");
+
+    session_clear();
+    cache_clear();
     g_config = saved;
 }
 
@@ -3318,8 +3378,9 @@ static void test_pump_defer_contract(void) {
     /* Recorded session deny: decided mid-dialog (deny wins early). */
     ASSERT(session_id_of(getpid(), &sid, &start) == 0,
            "resolve own session");
-    session_deny_add(sid, start, "/bin/tool", "", "/home/u/secret", 60);
-    ASSERT(child_verdict("/bin/tool", "", "/home/u/secret", sid, 0, 1) == 1,
+    session_deny_add(sid, start, "/bin/tool", PIN_SHA_A, "/home/u/secret", 60);
+    ASSERT(child_verdict("/bin/tool", PIN_SHA_A, "/home/u/secret", sid, 0,
+                         1) == 1,
            "defer mode: a session deny decides instead of queueing");
 
     session_clear();
@@ -3476,6 +3537,7 @@ int main(void) {
     test_menu_end_to_end();
     test_html_escape();
     test_verdict_stage_order();
+    test_session_allow_requires_digest();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
     test_pump_bounded_and_lossless();

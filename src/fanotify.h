@@ -378,6 +378,20 @@ int fanotify_test_verdict_stage(const char *binary, const char *bin_sha512,
                                 const char *target, const char *cmdline_fp,
                                 pid_t sid, int hardlink, int defer);
 
+/*
+ * Test seam: run the real allow-decision recorder over a synthetic dialog
+ * decision and return the fanotify response (FAN_ALLOW).  sid > 0 marks
+ * the context as a member of that session with the given leader start
+ * time; bin_sha512 may be NULL or "" to mirror an unavailable digest.
+ * The event pid is the caller's, so a degraded grant is cached under it.
+ */
+unsigned int fanotify_test_record_allow_decision(const char *binary,
+                                                 const char *bin_sha512,
+                                                 const char *target,
+                                                 pid_t sid,
+                                                 unsigned long long sid_start,
+                                                 int decision);
+
 /* Test seam: the per-binary dialog rate limiter. */
 int fanotify_test_dialog_rate_limited(const char *binary);
 
