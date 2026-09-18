@@ -2158,6 +2158,149 @@ static void test_respond_failure_retry(void) {
 }
 
 /*
+ * Part 1d: the retry queue must never abandon a decision when it reaches
+ * the old fixed capacity (UNANSWERED_MAX = 64); it doubles instead.  A
+ * full non-blocking pipe makes every write fail with EAGAIN, so the
+ * queue is the only storage; after draining the pipe, drain_and_deny()
+ * must deliver one exact fanotify_response (FAN_DENY, target fd) per
+ * retained decision and close every event fd.  On the pre-fix code call
+ * 65 returned -2 and the decision was dropped.
+ */
+static void test_unanswered_queue_grows(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create grow-response pipe");
+    int fl = fcntl(group[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the grow pipe write end non-blocking");
+    fl = fcntl(group[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the grow pipe read end non-blocking");
+
+    enum { DECISIONS = 100 }; /* well beyond the old fixed capacity of 64 */
+    static int event_fds[DECISIONS];
+
+    char filler[4096];
+    memset(filler, 0, sizeof(filler));
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    ASSERT(errno == EAGAIN, "grow pipe is full");
+
+    for (int i = 0; i < DECISIONS; i++) {
+        event_fds[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ASSERT(event_fds[i] >= 0, "open grow event fd");
+        if (event_fds[i] < 0)
+            break;
+
+        struct fanotify_event_metadata ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.event_len = sizeof(ev);
+        ev.vers = FANOTIFY_METADATA_VERSION;
+        ev.mask = FAN_OPEN_PERM;
+        ev.fd = event_fds[i];
+        ev.pid = (int)getpid();
+
+        ASSERT(fanotify_test_respond(group[1], &ev, FAN_DENY) == -1,
+               "failed write returns -1 (caller keeps the event fd)");
+        ASSERT(fcntl(event_fds[i], F_GETFD) != -1,
+               "grow event fd stays open while its response is queued");
+    }
+    ASSERT(fanotify_test_unanswered_count() == DECISIONS,
+           "queue doubled past its old fixed capacity, retaining every "
+           "decision");
+
+    /* Free the pipe, then drain: every retained decision must arrive. */
+    char drain_buf[4096];
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    fanotify_drain_and_deny(group[1]);
+
+    struct fanotify_response resp;
+    for (int i = 0; i < DECISIONS; i++) {
+        ssize_t got = read(group[0], &resp, sizeof(resp));
+        ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == event_fds[i] &&
+                   resp.response == FAN_DENY,
+               "retained decision delivered as the queued FAN_DENY");
+        ASSERT(fcntl(event_fds[i], F_GETFD) == -1 && errno == EBADF,
+               "grow event fd closed once its response was delivered");
+    }
+    ASSERT(fanotify_test_unanswered_count() == 0,
+           "drain emptied the retry queue");
+
+    close(group[0]);
+    close(group[1]);
+}
+
+/*
+ * Part 1e: when the retry queue cannot take a response (allocation
+ * failure), the event fd must be parked in the bounded stranded list and
+ * force-denied as FAN_DENY by the shutdown drain -- never closed
+ * unanswered, which would auto-ALLOW it at group close.  The failure is
+ * injected through the seam so the fallback is deterministic.
+ */
+static void test_unanswered_stranded_fallback(void) {
+    log_msg(LOG_DEBUG, "warm up syslog socket");
+
+    int group[2];
+    ASSERT(pipe(group) == 0, "create stranded-response pipe");
+    int fl = fcntl(group[1], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[1], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the stranded pipe write end non-blocking");
+    fl = fcntl(group[0], F_GETFL, 0);
+    ASSERT(fl >= 0 && fcntl(group[0], F_SETFL, fl | O_NONBLOCK) == 0,
+           "make the stranded pipe read end non-blocking");
+
+    char filler[4096];
+    memset(filler, 0, sizeof(filler));
+    while (write(group[1], filler, sizeof(filler)) > 0)
+        ;
+    ASSERT(errno == EAGAIN, "stranded pipe is full");
+
+    int efd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT(efd >= 0, "open stranded event fd");
+
+    struct fanotify_event_metadata ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.event_len = sizeof(ev);
+    ev.vers = FANOTIFY_METADATA_VERSION;
+    ev.mask = FAN_OPEN_PERM;
+    ev.fd = efd;
+    ev.pid = (int)getpid();
+
+    fanotify_test_force_unanswered_alloc_fail(1);
+    ASSERT(fanotify_test_respond(group[1], &ev, FAN_ALLOW) == -1,
+           "unqueueable response still returns -1 (keep the event fd)");
+    fanotify_test_force_unanswered_alloc_fail(0);
+
+    ASSERT(fanotify_test_unanswered_count() == 0,
+           "queue did not grow under the injected allocation failure");
+    ASSERT(fanotify_test_stranded_count() == 1,
+           "the event fd is parked in the stranded list");
+    ASSERT(fcntl(efd, F_GETFD) != -1, "stranded event fd stays open");
+
+    /* Free the pipe, then drain: the stranded fd gets a forced FAN_DENY
+     * (the fail-closed direction, whatever the original decision). */
+    char drain_buf[4096];
+    while (read(group[0], drain_buf, sizeof(drain_buf)) > 0)
+        ;
+    fanotify_drain_and_deny(group[1]);
+
+    struct fanotify_response resp;
+    ssize_t got = read(group[0], &resp, sizeof(resp));
+    ASSERT(got == (ssize_t)sizeof(resp) && resp.fd == efd &&
+               resp.response == FAN_DENY,
+           "stranded event fd force-denied before group close");
+    ASSERT(fcntl(efd, F_GETFD) == -1 && errno == EBADF,
+           "stranded event fd closed after the forced DENY");
+    ASSERT(fanotify_test_stranded_count() == 0,
+           "drain emptied the stranded list");
+
+    close(group[0]);
+    close(group[1]);
+}
+
+/*
  * Part 0c: batch_abandon claims the records stranded when an event walk
  * exits early (fatal response failure or metadata-version mismatch).
  * read(2) duplicates an fd for EVERY record in the batch, so every
@@ -3095,6 +3238,8 @@ int main(void) {
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
     test_respond_failure_retry();
+    test_unanswered_queue_grows();
+    test_unanswered_stranded_fallback();
     test_batch_abandon_claims_stranded();
     test_clear_marks_retains_failures();
     test_cmdline_fingerprint_overflow();

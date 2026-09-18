@@ -317,6 +317,26 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining);
 
 /*
+ * Test seams: the failed-response retry queue.  fanotify_test_respond()
+ * runs the real fanotify_respond() against any writable fd (a pipe
+ * stand-in receives the fanotify_response writes) and returns 0 when the
+ * response was delivered -- the caller may close the event fd -- or -1
+ * when the caller MUST keep it open (queued in the growing retry queue,
+ * or parked in the bounded stranded list).  The count seams expose the
+ * current queue/stranded depth; the force seam makes the next queue
+ * admission fail (as if its allocation failed) so the stranded fallback
+ * is reachable without real memory pressure.  Draining through
+ * fanotify_drain_and_deny() on a fresh pipe delivers one exact
+ * fanotify_response (stranded fds as FAN_DENY) and closes every event fd.
+ */
+int fanotify_test_respond(int group_fd,
+                          const struct fanotify_event_metadata *ev,
+                          unsigned int response);
+int fanotify_test_unanswered_count(void);
+int fanotify_test_stranded_count(void);
+void fanotify_test_force_unanswered_alloc_fail(int on);
+
+/*
  * Test seam: the dialog pid the current pump stack publishes for the
  * hash-helper wait hook (g_active_dialog_pid).  0 when no dialog pump is
  * on the stack; nonzero only DURING a fanotify_pump() call made with a

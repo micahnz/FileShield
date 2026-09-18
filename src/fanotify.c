@@ -55,11 +55,13 @@
  *      process_open_perm(), which walks the stages in fanotify.h order.
  *   2. A decided event is answered through respond_event(): the response
  *      is written and - on success - the event fd is closed.
- *   3. If the write fails, the response is queued (g_unanswered) and the
- *      event fd is kept open: closing it would strand the caller's open()
- *      until group close, where the kernel auto-ALLOWS it.  The main loop
- *      and the pump retry the queue; fanotify_drain_and_deny() forces a
- *      final DENY before close(fan_fd) on shutdown.
+ *   3. If the write fails, the response is queued (g_unanswered, which
+ *      grows on demand) and the event fd is kept open: closing it would
+ *      strand the caller's open() until group close, where the kernel
+ *      auto-ALLOWS it.  When the queue cannot grow (allocation failure)
+ *      the event fd is parked in the bounded stranded list, which
+ *      fanotify_drain_and_deny() force-denies at shutdown.  The main
+ *      loop and the pump retry the queue.
  *   4. Events that need the user are deferred with their fds open and
  *      replayed by the main loop after the dialog (fanotify_process_pending).
  */
@@ -72,9 +74,9 @@ static const ProtectedPath *exclusion_match(const char *path);
 
 /* Defined later; the decision stages respond through this.  Return
  * contract (see fanotify_respond): 0 = delivered or already answered, so
- * the caller may close the event fd; -1 = write failed, the response was
- * queued for retry, so the caller must keep the fd open; -2 = queue full,
- * the caller closes the fd and the daemon restarts. */
+ * the caller may close the event fd; -1 = NOT delivered, the response is
+ * queued or stranded and the caller MUST keep the fd open.  There is no
+ * third outcome: a decided response is never abandoned. */
 static int fanotify_respond(int fd, const struct fanotify_event_metadata *ev,
                             unsigned int response);
 
@@ -4098,11 +4100,15 @@ void fanotify_clear_marks(int fd)
 /*
  * Responses whose kernel write failed are queued with their event fd
  * still open: closing the fd does not answer a permission event, and
- * close(fan_fd) would auto-ALLOW it.  The main loop and the pump retry
- * the queue; fanotify_drain_and_deny() forces a final DENY before
- * close(fan_fd) on shutdown.
+ * close(fan_fd) would auto-ALLOW it.  The queue starts at UNANSWERED_MAX
+ * entries and doubles on demand; if it cannot grow (allocation failure),
+ * the event fd is parked in the bounded stranded list instead, so a
+ * decided response is never abandoned.  The main loop and the pump retry
+ * the queue; fanotify_drain_and_deny() forces a final DENY for the queue
+ * and the stranded list before close(fan_fd) on shutdown.
  */
-#define UNANSWERED_MAX 64
+#define UNANSWERED_MAX 64          /* initial queue capacity            */
+#define UNANSWERED_STRANDED_MAX 32 /* allocation-failure fallback bound */
 
 typedef struct
 {
@@ -4111,8 +4117,23 @@ typedef struct
     unsigned int response;             /* decision still to deliver    */
 } UnansweredEvent;
 
-static UnansweredEvent g_unanswered[UNANSWERED_MAX];
+static UnansweredEvent *g_unanswered = NULL;
 static int g_unanswered_count = 0;
+static int g_unanswered_cap = 0;
+
+/*
+ * Bounded fallback for a response whose queue slot could not even be
+ * allocated: only the event fd is kept (the shutdown drain force-DENYs
+ * it), so the fail-closed direction survives a double allocation
+ * failure.  Full list: fanotify_respond() keeps the fd open and logs.
+ */
+static int g_stranded[UNANSWERED_STRANDED_MAX];
+static int g_stranded_count = 0;
+
+/* Test seam (fanotify_test_force_unanswered_alloc_fail): makes the next
+ * retry-queue admission fail, as if its allocation failed, so the
+ * stranded fallback is reachable without inducing real memory pressure. */
+static int g_test_unanswered_alloc_fail = 0;
 
 /* Raw response write: 0 delivered, 1 already answered, -1 failed. */
 static int write_response(int fan_fd, int event_fd, unsigned int response)
@@ -4153,20 +4174,83 @@ static void unanswered_drop(int idx)
 }
 
 /* Queue one failed response; the caller keeps the event fd open.
- * Returns 0 when queued, -1 when the queue is full. */
+ * Doubles the queue from UNANSWERED_MAX when full.  Returns 0 when
+ * queued, -1 when the queue could not grow (the caller falls back to the
+ * stranded list). */
 static int unanswered_add(int event_fd,
                           const struct fanotify_event_metadata *ev,
                           unsigned int response)
 {
     UnansweredEvent *u;
 
-    if (g_unanswered_count >= UNANSWERED_MAX)
-        return -1;
+    if (g_test_unanswered_alloc_fail)
+        return -1; /* test seam: simulate the allocation failing */
+    if (g_unanswered_count >= g_unanswered_cap)
+    {
+        int new_cap;
+        UnansweredEvent *grown;
+
+        if (g_unanswered_cap == 0)
+            new_cap = UNANSWERED_MAX;
+        else
+        {
+            /* Refuse a capacity that cannot be represented or whose
+             * allocation size would overflow; the caller strands the
+             * event fd instead of risking a wrapped allocation. */
+            if (g_unanswered_cap > INT_MAX / 2 ||
+                (size_t)g_unanswered_cap * 2 >
+                    ((size_t)-1) / sizeof(UnansweredEvent))
+                return -1;
+            new_cap = g_unanswered_cap * 2;
+        }
+        grown = realloc(g_unanswered, (size_t)new_cap * sizeof(*grown));
+        if (!grown)
+            return -1;
+        g_unanswered = grown;
+        g_unanswered_cap = new_cap;
+    }
     u = &g_unanswered[g_unanswered_count++];
     u->fd = event_fd;
     u->ev = *ev;
     u->response = response;
     return 0;
+}
+
+/* Park an event fd whose response could not be queued.  Returns 0 when
+ * parked, -1 when the bounded list is full. */
+static int stranded_add(int event_fd)
+{
+    if (g_stranded_count >= UNANSWERED_STRANDED_MAX)
+        return -1;
+    g_stranded[g_stranded_count++] = event_fd;
+    return 0;
+}
+
+/* Shutdown: force-DENY and close every stranded event fd.  Runs before
+ * close(fan_fd), after which the kernel would auto-ALLOW them. */
+static void stranded_flush(int fan_fd)
+{
+    int denied = 0;
+
+    for (int i = 0; i < g_stranded_count; i++)
+    {
+        int fd = g_stranded[i];
+        int rc = write_response(fan_fd, fd, FAN_DENY);
+
+        if (rc < 0)
+            log_msg(LOG_ERR,
+                    "fanotify stranded response could not be delivered for "
+                    "fd %d; the kernel will allow it when the group closes",
+                    fd);
+        else
+            denied++;
+        close(fd);
+    }
+    if (denied > 0)
+        log_msg(LOG_WARNING,
+                "denied %d stranded permission event(s) before shutdown",
+                denied);
+    g_stranded_count = 0;
 }
 
 /*
@@ -4223,10 +4307,12 @@ static void unanswered_flush(int fan_fd)
 /*
  * Respond to one event through the group fd.
  * Returns 0 when the response was delivered (or already delivered), so
- * the caller may close the event fd; -1 when the write failed and the
- * response was queued for retry, so the caller must keep the event fd
- * open; -2 when it could not even be queued (the caller closes the fd;
- * the group is marked fatal and the supervisor restarts the daemon).
+ * the caller may close the event fd; -1 whenever it was NOT delivered,
+ * so the caller MUST keep the event fd open.  On -1 the response is
+ * queued in the growing retry queue, or -- when that cannot be allocated
+ * -- parked in the bounded stranded list; the retry loop or the shutdown
+ * drain answers it before close(fan_fd).  There is no third outcome: a
+ * decided response is never abandoned.
  */
 static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev,
                             unsigned int response)
@@ -4245,22 +4331,33 @@ static int fanotify_respond(int fan_fd, const struct fanotify_event_metadata *ev
     }
 
     int err = errno;
+    if (err != EAGAIN)
+        g_fatal = 1; /* the group cannot deliver decisions; restart */
+
     if (unanswered_add((int)ev->fd, ev, response) == 0)
     {
         log_msg(LOG_WARNING,
                 "fanotify write response: %s; response queued for retry",
                 strerror(err));
-        if (err != EAGAIN)
-            g_fatal = 1; /* the group cannot deliver decisions; restart */
+        return -1;
+    }
+
+    if (stranded_add((int)ev->fd) == 0)
+    {
+        log_msg(LOG_WARNING,
+                "fanotify write response: %s and the retry queue could not "
+                "grow; fd %d held open for a shutdown FAN_DENY",
+                strerror(err), (int)ev->fd);
         return -1;
     }
 
     log_msg(LOG_ERR,
-            "fanotify write response: %s and the retry queue is full; the "
-            "event cannot be answered (the kernel auto-allows it on group "
-            "close)", strerror(err));
+            "fanotify write response: %s and both the retry queue and the "
+            "stranded list are full; keeping event fd %d open (never "
+            "silently dropped)",
+            strerror(err), (int)ev->fd);
     g_fatal = 1;
-    return -2;
+    return -1;
 }
 
 /*
@@ -4376,9 +4473,11 @@ void fanotify_drain_and_deny(int fan_fd)
     int denied = 0;
 
     /* First deliver anything the retry queue is still holding, forcing
-     * DENY when the original response cannot be written: after
-     * close(fan_fd) the kernel would allow those events. */
+     * DENY when the original response cannot be written, then force-DENY
+     * every stranded fd: after close(fan_fd) the kernel would allow all
+     * of them. */
     unanswered_flush(fan_fd);
+    stranded_flush(fan_fd);
 
     while (1)
     {
@@ -4990,6 +5089,38 @@ int fanotify_test_batch_abandon(int group_fd,
                                 ssize_t remaining)
 {
     return batch_abandon(group_fd, ev, remaining);
+}
+
+/*
+ * Test seams (fanotify.h): the failed-response retry queue.
+ * fanotify_test_respond() runs the real fanotify_respond() so the
+ * queue-growth, stranded-fallback and return contract can be driven with
+ * a pipe stand-in for the group fd (a full non-blocking pipe makes every
+ * write fail with EAGAIN, deterministically and without root).  The
+ * count seams expose the queue/stranded depth; the force seam makes the
+ * next queue admission fail, as if its allocation failed, so the bounded
+ * stranded fallback is reachable without real memory pressure.
+ */
+int fanotify_test_respond(int group_fd,
+                          const struct fanotify_event_metadata *ev,
+                          unsigned int response)
+{
+    return fanotify_respond(group_fd, ev, response);
+}
+
+int fanotify_test_unanswered_count(void)
+{
+    return g_unanswered_count;
+}
+
+int fanotify_test_stranded_count(void)
+{
+    return g_stranded_count;
+}
+
+void fanotify_test_force_unanswered_alloc_fail(int on)
+{
+    g_test_unanswered_alloc_fail = on;
 }
 
 /* Test seam (fanotify.h): the pump stack's published dialog pid. */
