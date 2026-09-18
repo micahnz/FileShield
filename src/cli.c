@@ -120,6 +120,30 @@ static void print_ambiguous(const char *kind, const char *input)
             input, kind, RULEID_HEX_LEN);
 }
 
+/*
+ * Translate a resolve_*() result into the user-facing error.  Returns 0
+ * when the ID resolved to exactly one record, -1 otherwise, so callers
+ * can `if (report_resolve(kind, input, rc) < 0) ...`.
+ */
+static int report_resolve(const char *kind, const char *input, int rc)
+{
+    switch (rc)
+    {
+    case 1:
+        return 0;
+    case 0:
+        fprintf(stderr, "error: no %s matches %s\n", kind, input);
+        break;
+    case -2:
+        print_ambiguous(kind, input);
+        break;
+    default:
+        fprintf(stderr, "error: invalid %s ID: %s\n", kind, input);
+        break;
+    }
+    return -1;
+}
+
 static const char *rule_path(int deny)
 {
     return deny ? PERSIST_DENY_STATE_FILE : PERSIST_STATE_FILE;
@@ -267,12 +291,19 @@ static int resolve_rule(const PersistEntry *entries, int count,
     return 1;
 }
 
+/*
+ * Prefix-resolve against pattern-derived pin IDs.  full_id (optional)
+ * receives the matched entry's ID for later socket requests; callers
+ * that only need the index pass NULL.
+ */
 static int resolve_pin(const PinRecord *rows, int count, const char *input,
                        int *idx_out, char full_id[RULEID_HEX_LEN + 1])
 {
     int found = -1;
     int matches = 0;
 
+    /* Probe with a known-valid ID so an invalid prefix is reported even
+     * against an empty table (same trick as resolve_rule). */
     if (ruleid_prefix_match("0000000000000000", input) < 0)
         return -1;
 
@@ -281,12 +312,13 @@ static int resolve_pin(const PinRecord *rows, int count, const char *input,
         char id[RULEID_HEX_LEN + 1];
 
         if (ruleid_pin(rows[i].pattern, id) < 0)
-            continue;
+            continue; /* unhashable pattern: never a candidate */
         if (ruleid_prefix_match(id, input) == 1)
         {
             found = i;
             matches++;
-            memcpy(full_id, id, sizeof(id));
+            if (full_id)
+                memcpy(full_id, id, sizeof(id));
         }
     }
     if (matches == 0)
@@ -297,7 +329,11 @@ static int resolve_pin(const PinRecord *rows, int count, const char *input,
     return 1;
 }
 
-/* Resolve into a heap array of full 16-char IDs for later socket use. */
+/*
+ * Resolve every ID argument before any action is taken, storing the
+ * entry index and its full stored ID for the socket request.  Returns 0
+ * only when all inputs resolved to exactly one record.
+ */
 static int resolve_rule_set(const PersistEntry *entries, int count,
                             char *const *inputs, int n, int *indices,
                             char (*full)[RULEID_HEX_LEN + 1])
@@ -306,23 +342,9 @@ static int resolve_rule_set(const PersistEntry *entries, int count,
     {
         int rc = resolve_rule(entries, count, inputs[i], &indices[i]);
 
-        if (rc == -1)
-        {
-            fprintf(stderr, "error: invalid rule ID: %s\n", inputs[i]);
+        if (report_resolve("rule", inputs[i], rc) < 0)
             return -1;
-        }
-        if (rc == 0)
-        {
-            fprintf(stderr, "error: no rule matches %s\n", inputs[i]);
-            return -1;
-        }
-        if (rc == -2)
-        {
-            print_ambiguous("rule", inputs[i]);
-            return -1;
-        }
-        memcpy(full[i], entries[indices[i]].rule_id,
-               RULEID_HEX_LEN + 1);
+        memcpy(full[i], entries[indices[i]].rule_id, RULEID_HEX_LEN + 1);
     }
     return 0;
 }
@@ -335,21 +357,8 @@ static int resolve_pin_set(const PinRecord *rows, int count,
     {
         int rc = resolve_pin(rows, count, inputs[i], &indices[i], full[i]);
 
-        if (rc == -1)
-        {
-            fprintf(stderr, "error: invalid pin ID: %s\n", inputs[i]);
+        if (report_resolve("pin", inputs[i], rc) < 0)
             return -1;
-        }
-        if (rc == 0)
-        {
-            fprintf(stderr, "error: no pin matches %s\n", inputs[i]);
-            return -1;
-        }
-        if (rc == -2)
-        {
-            print_ambiguous("pin", inputs[i]);
-            return -1;
-        }
     }
     return 0;
 }
@@ -495,6 +504,8 @@ static int cmd_list(const char *filter)
         }
     }
 
+    /* Load only the requested sections; a damaged or unreadable state
+     * file aborts the whole listing (fail closed, never "empty"). */
     PersistEntry *allow = NULL, *deny = NULL;
     PinRecord *pins = NULL;
     int na = 0, nd = 0, np = 0;
@@ -518,6 +529,8 @@ static int cmd_list(const char *filter)
                (want_deny ? CLI_UI_SECTION_DENY : 0u) |
                (want_pins ? CLI_UI_SECTION_PINS : 0u);
 
+    /* Display rows borrow the loaded records; build_*_rows also applies
+     * the documented ordering (rules by created_at, pins by updated_at). */
     CliRuleRow *rule_rows = NULL;
     CliPinRow *pin_rows = NULL;
     int n_rules = 0, n_pins = 0;
@@ -554,6 +567,8 @@ static int cmd_list(const char *filter)
     {
         int rules_shown = want_allow || want_deny;
 
+        /* Human output: rules table, blank line, pins table, totals. */
+
         if (rules_shown)
             cli_ui_render_rules(stdout, rule_rows, n_rules,
                                 cli_ui_terminal_width(stdout), g_wide);
@@ -577,86 +592,68 @@ static int cmd_list(const char *filter)
 /*  describe                                                           */
 /* ------------------------------------------------------------------ */
 
-static int cmd_describe(const char *kind, const char *input)
+/* `describe pin [ID]`: one record, or every pin when input is NULL. */
+static int describe_pins(const char *input)
 {
-    if (strcmp(kind, "pin") == 0)
+    PinRecord *pins = NULL;
+    int np = 0;
+
+    if (load_pins(&pins, &np) < 0)
+        return 1;
+
+    if (!input)
     {
-        PinRecord *pins = NULL;
-        int np = 0;
+        /* Same oldest-updated-first order as `list pins`. */
+        CliPinRow *rows = calloc((size_t)np + 1, sizeof(*rows));
+        int nr = 0;
 
-        if (load_pins(&pins, &np) < 0)
-            return 1;
-
-        if (!input)
+        if (!rows)
         {
-            /* `describe pin` with no ID describes every pin, in the same
-             * oldest-updated-first order list uses. */
-            CliPinRow *rows = calloc((size_t)np + 1, sizeof(*rows));
-            int nr = 0;
-
-            if (!rows)
-            {
-                fprintf(stderr, "error: out of memory\n");
-                free(pins);
-                return 1;
-            }
-            build_pin_rows(pins, np, rows, &nr);
-            if (g_json)
-                cli_ui_render_list_json(stdout, CLI_UI_SECTION_PINS, NULL, 0,
-                                        rows, nr, NULL, 0, time(NULL));
-            else
-            {
-                for (int i = 0; i < nr; i++)
-                {
-                    if (i > 0)
-                        putchar('\n');
-                    cli_ui_render_pin_describe(stdout, &rows[i]);
-                }
-            }
-            free(rows);
-            free(pins);
-            return 0;
-        }
-
-        int idx = -1;
-        int rc = resolve_pin(pins, np, input, &idx,
-                             (char[RULEID_HEX_LEN + 1]){0});
-
-        if (rc == 0)
-            fprintf(stderr, "error: no pin matches %s\n", input);
-        else if (rc == -2)
-            print_ambiguous("pin", input);
-        else if (rc == -1)
-            fprintf(stderr, "error: invalid pin ID: %s\n", input);
-        if (rc != 1)
-        {
+            fprintf(stderr, "error: out of memory\n");
             free(pins);
             return 1;
         }
-
-        CliPinRow row;
-        if (ruleid_pin(pins[idx].pattern, row.id) < 0)
-            snprintf(row.id, sizeof(row.id), "%s", "(none)");
-        row.pattern = pins[idx].pattern;
-        row.sha512 = pins[idx].sha512;
-        row.updated_at = pins[idx].updated_at;
+        build_pin_rows(pins, np, rows, &nr);
         if (g_json)
-            cli_ui_render_pin_describe_json(stdout, &row);
+            cli_ui_render_list_json(stdout, CLI_UI_SECTION_PINS, NULL, 0,
+                                    rows, nr, NULL, 0, time(NULL));
         else
-            cli_ui_render_pin_describe(stdout, &row);
+            for (int i = 0; i < nr; i++)
+            {
+                if (i > 0)
+                    putchar('\n');
+                cli_ui_render_pin_describe(stdout, &rows[i]);
+            }
+        free(rows);
         free(pins);
         return 0;
     }
 
-    int deny = parse_list(kind);
-    if (deny < 0)
+    int idx = -1;
+    if (report_resolve("pin", input, resolve_pin(pins, np, input, &idx,
+                                                 NULL)) < 0)
     {
-        fprintf(stderr, "error: unknown describe type: %s "
-                        "(expected allow|deny|pin)\n", kind);
-        usage_hint("describe allow|deny|pin [ID]");
-        return 2;
+        free(pins);
+        return 1;
     }
 
+    CliPinRow row;
+    if (ruleid_pin(pins[idx].pattern, row.id) < 0)
+        snprintf(row.id, sizeof(row.id), "%s", "(none)");
+    row.pattern = pins[idx].pattern;
+    row.sha512 = pins[idx].sha512;
+    row.updated_at = pins[idx].updated_at;
+    if (g_json)
+        cli_ui_render_pin_describe_json(stdout, &row);
+    else
+        cli_ui_render_pin_describe(stdout, &row);
+    free(pins);
+    return 0;
+}
+
+/* `describe allow|deny [ID]`: one rule, or every rule of that list. */
+static int describe_rules(int deny, const char *input)
+{
     PersistEntry *entries = NULL;
     int count = 0;
 
@@ -665,8 +662,7 @@ static int cmd_describe(const char *kind, const char *input)
 
     if (!input)
     {
-        /* `describe allow|deny` with no ID describes every rule of that
-         * list, oldest creation first, separated for readability. */
+        /* Same oldest-created-first order as `list`, one block per rule. */
         CliRuleRow *rows = calloc((size_t)count + 1, sizeof(*rows));
         int nr = 0;
 
@@ -686,30 +682,20 @@ static int cmd_describe(const char *kind, const char *input)
                                          : CLI_UI_SECTION_ALLOW,
                                     rows, nr, NULL, 0, NULL, 0, time(NULL));
         else
-        {
             for (int i = 0; i < nr; i++)
             {
                 if (i > 0)
                     putchar('\n');
                 cli_ui_render_rule_describe(stdout, &rows[i]);
             }
-        }
         free(rows);
         free(entries);
         return 0;
     }
 
     int idx = -1;
-    int rc = resolve_rule(entries, count, input, &idx);
-
-    if (rc == 0)
-        fprintf(stderr, "error: no %s rule matches %s\n", rule_label(deny),
-                input);
-    else if (rc == -2)
-        print_ambiguous("rule", input);
-    else if (rc == -1)
-        fprintf(stderr, "error: invalid rule ID: %s\n", input);
-    if (rc != 1)
+    if (report_resolve("rule", input, resolve_rule(entries, count, input,
+                                                   &idx)) < 0)
     {
         free(entries);
         return 1;
@@ -726,6 +712,22 @@ static int cmd_describe(const char *kind, const char *input)
         cli_ui_render_rule_describe(stdout, &row);
     free(entries);
     return 0;
+}
+
+static int cmd_describe(const char *kind, const char *input)
+{
+    if (strcmp(kind, "pin") == 0)
+        return describe_pins(input);
+
+    int deny = parse_list(kind);
+    if (deny < 0)
+    {
+        fprintf(stderr, "error: unknown describe type: %s "
+                        "(expected allow|deny|pin)\n", kind);
+        usage_hint("describe allow|deny|pin [ID]");
+        return 2;
+    }
+    return describe_rules(deny, input);
 }
 
 /* ------------------------------------------------------------------ */
@@ -852,10 +854,66 @@ static int fallback_remove_pins(const char (*full)[RULEID_HEX_LEN + 1], int n)
     return 0;
 }
 
+/*
+ * Send the remove request in chunks of CONTROL_MAX_IDS IDs.  On return:
+ * 0 with *removed_out set when the daemon applied the chunks; 0 with
+ * *no_listener set when no daemon answered (the caller then edits the
+ * file directly); -1 on a transport failure or a malformed reply.
+ */
+static int remove_over_socket(const char *verb, const char *list_arg,
+                              char (*full)[RULEID_HEX_LEN + 1], int n,
+                              int *removed_out, int *no_listener)
+{
+    char request[CONTROL_REQ_MAX];
+    int removed = 0;
+
+    *no_listener = 0;
+    for (int start = 0; start < n; start += CONTROL_MAX_IDS)
+    {
+        ControlResponse resp;
+        int chunk = n - start;
+        int pos;
+
+        if (chunk > CONTROL_MAX_IDS)
+            chunk = CONTROL_MAX_IDS;
+
+        /* "VERB[\tlist]" then one "\t<id>" per chunk member; IDs are 16
+         * hex chars, so the 4 KiB request bound cannot be reached. */
+        pos = snprintf(request, sizeof(request), "%s", verb);
+        if (list_arg)
+            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
+                            "\t%s", list_arg);
+        for (int i = 0; i < chunk; i++)
+            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
+                            "\t%s", full[start + i]);
+
+        int rc = ctl_call(request, &resp);
+
+        if (rc == 1)
+        {
+            *no_listener = 1;
+            break;
+        }
+        if (rc < 0)
+            return -1;
+
+        long got = control_response_scalar(&resp);
+
+        if (got < 0)
+        {
+            fprintf(stderr, "error: malformed daemon response\n");
+            return -1;
+        }
+        removed += (int)got;
+    }
+    *removed_out = removed;
+    return 0;
+}
+
 static int remove_rules(int deny, char *const *inputs, int n)
 {
     PersistEntry *entries = NULL;
-    int count = 0, removed = 0;
+    int count = 0, rc = 0, removed = 0, no_listener = 0;
     int *indices = calloc((size_t)n + 1, sizeof(*indices));
     char (*full)[RULEID_HEX_LEN + 1] =
         calloc((size_t)n + 1, sizeof(*full));
@@ -891,45 +949,17 @@ static int remove_rules(int deny, char *const *inputs, int n)
         return 1;
     }
 
-    int rc = 0;
-    for (int start = 0; start < n && rc == 0; start += CONTROL_MAX_IDS)
+    if (remove_over_socket("RULE_REMOVE", rule_label(deny), full, n, &removed,
+                           &no_listener) < 0)
+        rc = -1;
+    else if (no_listener)
     {
-        int chunk = n - start;
-        char request[CONTROL_REQ_MAX];
-        ControlResponse resp;
-        int pos;
-
-        if (chunk > CONTROL_MAX_IDS)
-            chunk = CONTROL_MAX_IDS;
-        pos = snprintf(request, sizeof(request), "RULE_REMOVE\t%s",
-                       rule_label(deny));
-        for (int i = 0; i < chunk; i++)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", full[start + i]);
-
-        rc = ctl_call(request, &resp);
-        if (rc == 1)
-        {
-            if (fallback_remove_rules(
-                    deny, (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
-                rc = -1;
-            else
-            {
-                removed = n;
-                rc = 0;
-            }
-            break;
-        }
-        if (rc < 0)
-            break;
-        long got = control_response_scalar(&resp);
-        if (got < 0)
-        {
-            fprintf(stderr, "error: malformed daemon response\n");
+        /* No daemon to race: apply the removals to the state file. */
+        if (fallback_remove_rules(
+                deny, (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
             rc = -1;
-            break;
-        }
-        removed += (int)got;
+        else
+            removed = n;
     }
 
     if (rc == 0)
@@ -943,7 +973,7 @@ static int remove_rules(int deny, char *const *inputs, int n)
 static int remove_pins(char *const *inputs, int n)
 {
     PinRecord *rows = NULL;
-    int count = 0, removed = 0;
+    int count = 0, rc = 0, removed = 0, no_listener = 0;
     int *indices = calloc((size_t)n + 1, sizeof(*indices));
     char (*full)[RULEID_HEX_LEN + 1] =
         calloc((size_t)n + 1, sizeof(*full));
@@ -978,44 +1008,16 @@ static int remove_pins(char *const *inputs, int n)
         return 1;
     }
 
-    int rc = 0;
-    for (int start = 0; start < n && rc == 0; start += CONTROL_MAX_IDS)
+    if (remove_over_socket("PIN_REMOVE", NULL, full, n, &removed,
+                           &no_listener) < 0)
+        rc = -1;
+    else if (no_listener)
     {
-        int chunk = n - start;
-        char request[CONTROL_REQ_MAX];
-        ControlResponse resp;
-        int pos;
-
-        if (chunk > CONTROL_MAX_IDS)
-            chunk = CONTROL_MAX_IDS;
-        pos = snprintf(request, sizeof(request), "PIN_REMOVE");
-        for (int i = 0; i < chunk; i++)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", full[start + i]);
-
-        rc = ctl_call(request, &resp);
-        if (rc == 1)
-        {
-            if (fallback_remove_pins(
-                    (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
-                rc = -1;
-            else
-            {
-                removed = n;
-                rc = 0;
-            }
-            break;
-        }
-        if (rc < 0)
-            break;
-        long got = control_response_scalar(&resp);
-        if (got < 0)
-        {
-            fprintf(stderr, "error: malformed daemon response\n");
+        if (fallback_remove_pins(
+                (const char (*)[RULEID_HEX_LEN + 1])full, n) < 0)
             rc = -1;
-            break;
-        }
-        removed += (int)got;
+        else
+            removed = n;
     }
 
     if (rc == 0)
@@ -2003,6 +2005,9 @@ int main(int argc, char *argv[])
     const char *cmd = argv[optind++];
     int rest = argc - optind;
 
+    /* Command dispatch.  Each branch validates its own arity first and
+     * prints the concrete command line on a usage error (exit 2); data
+     * and transport errors are reported by the handlers (exit 1). */
     if (strcmp(cmd, "list") == 0)
     {
         if (rest > 1)

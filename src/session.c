@@ -265,6 +265,83 @@ static void generate_rule_id(SessionEntry *list, int count, SessionEntry *e)
     }
 }
 
+/*
+ * The existing entry covering this exact decision (same session,
+ * leader instance, binary and target), or NULL.  Callers refresh it in
+ * place instead of appending a duplicate.
+ */
+static SessionEntry *list_find_refresh(SessionEntry *list, int count,
+                                       pid_t sid,
+                                       unsigned long long leader_start,
+                                       const char *binary, const char *target)
+{
+    for (int i = 0; i < count; i++)
+    {
+        SessionEntry *c = &list[i];
+
+        if (c->used && c->sid == sid && c->leader_start == leader_start &&
+            strcmp(c->binary, binary) == 0 && strcmp(c->target, target) == 0)
+            return c;
+    }
+    return NULL;
+}
+
+/*
+ * A slot for a new entry.  Holes come first (lazily-dropped dead entries
+ * would otherwise be shifted or evicted past on every insert); when the
+ * table is full, expired and dead-leader entries are swept once per user
+ * decision before the oldest live entry is evicted (matchers deliberately
+ * do not pay a /proc check per event, so those entries linger as used).
+ * Returns an index in [0, SESSION_MAX).
+ */
+static int list_alloc_slot(SessionEntry *list, int *count)
+{
+    int slot = -1;
+
+    if (*count < SESSION_MAX)
+    {
+        for (int i = 0; i < *count; i++)
+        {
+            if (!list[i].used)
+            {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0)
+            slot = (*count)++;
+        return slot;
+    }
+
+    time_t now = mono_seconds();
+
+    for (int i = 0; i < SESSION_MAX; i++)
+    {
+        if (!list[i].used)
+        {
+            slot = i;
+            break;
+        }
+        if (entry_expired(&list[i], now) ||
+            !leader_alive(list[i].sid, list[i].leader_start))
+        {
+            list[i].used = 0;
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+    {
+        log_msg(LOG_INFO,
+                "session table full; dropping the oldest entry "
+                "(sid %d, %s -> %s)",
+                (int)list[0].sid, list[0].binary, list[0].target);
+        memmove(&list[0], &list[1], sizeof(SessionEntry) * (SESSION_MAX - 1));
+        slot = SESSION_MAX - 1;
+    }
+    return slot;
+}
+
 static void list_add(SessionEntry *list, int *count, pid_t sid,
                      unsigned long long leader_start, const char *binary,
                      const char *bin_sha512, const char *target, int ttl_seconds)
@@ -277,84 +354,16 @@ static void list_add(SessionEntry *list, int *count, pid_t sid,
     if (ttl_seconds > FS_MAX_TTL_SECONDS)
         ttl_seconds = FS_MAX_TTL_SECONDS;
 
-    /* Refresh an identical entry instead of appending a duplicate. */
-    SessionEntry *e = NULL;
-    int refresh = 0;
+    SessionEntry *e = list_find_refresh(list, *count, sid, leader_start,
+                                        binary, target);
+    int refresh = e != NULL;
     char kept_id[RULEID_HEX_LEN + 1];
-    memset(kept_id, 0, sizeof(kept_id));
-    for (int i = 0; i < *count; i++)
-    {
-        SessionEntry *c = &list[i];
-        if (c->used && c->sid == sid && c->leader_start == leader_start &&
-            strcmp(c->binary, binary) == 0 && strcmp(c->target, target) == 0)
-        {
-            e = c;
-            refresh = 1;
-            memcpy(kept_id, c->rule_id, sizeof(kept_id));
-            break;
-        }
-    }
 
-    if (!e)
-    {
-        int slot;
-        if (*count < SESSION_MAX)
-        {
-            /* Reclaim a hole first: lazily-dropped dead entries (expired
-             * or dead-leader) would otherwise leave the table full of
-             * unused slots that every insert shifts or evicts past. */
-            slot = -1;
-            for (int i = 0; i < *count; i++)
-            {
-                if (!list[i].used)
-                {
-                    slot = i;
-                    break;
-                }
-            }
-            if (slot < 0)
-                slot = (*count)++;
-        }
-        else
-        {
-            /* Full: reclaim a hole before dropping a live entry.
-             * Matchers drop dead leaders only on the key-match path now
-             * (no /proc storm per event, see entry_covers), so entries
-             * whose leaders died outside their own session linger as
-             * used here: sweep for expired slots cheaply and consult
-             * leader liveness for the rest — once per user decision,
-             * never per protected open.  Only when every slot is provably
-             * live is the oldest (slot 0) evicted, which the log records. */
-            slot = -1;
-            time_t now = mono_seconds();
-            for (int i = 0; i < SESSION_MAX; i++)
-            {
-                if (!list[i].used)
-                {
-                    slot = i;
-                    break;
-                }
-                if (entry_expired(&list[i], now) ||
-                    !leader_alive(list[i].sid, list[i].leader_start))
-                {
-                    list[i].used = 0;
-                    slot = i;
-                    break;
-                }
-            }
-            if (slot < 0)
-            {
-                log_msg(LOG_INFO,
-                        "session table full; dropping the oldest entry "
-                        "(sid %d, %s -> %s)",
-                        (int)list[0].sid, list[0].binary, list[0].target);
-                memmove(&list[0], &list[1],
-                        sizeof(SessionEntry) * (SESSION_MAX - 1));
-                slot = SESSION_MAX - 1;
-            }
-        }
-        e = &list[slot];
-    }
+    memset(kept_id, 0, sizeof(kept_id));
+    if (refresh)
+        memcpy(kept_id, e->rule_id, sizeof(kept_id));
+    else
+        e = &list[list_alloc_slot(list, count)];
 
     memset(e, 0, sizeof(*e));
     e->used = 1;

@@ -219,6 +219,31 @@ void cli_ui_chain_column(const char (*comms)[CLI_UI_COMM_MAX], int depth,
         cli_ui_sanitize("(none)", dst, dst_size);
 }
 
+/*
+ * Equal-share width cap for 'count' flexible columns after 'fixed' bytes
+ * of never-shrinking columns and gaps are subtracted.  Too-narrow
+ * terminals give every flexible column CLI_UI_COL_MIN so the header
+ * still lines up (the line overflows instead).
+ */
+static int flexible_cap(int width, int fixed, int count)
+{
+    int avail = width - fixed;
+
+    if (avail < count * CLI_UI_COL_MIN)
+        avail = count * CLI_UI_COL_MIN;
+    return avail / count;
+}
+
+/* A measured column width, capped and never below its own header. */
+static int clamp_col(int measured, int cap, int header)
+{
+    if (measured > cap)
+        measured = cap;
+    if (measured < header)
+        measured = header;
+    return measured;
+}
+
 int cli_ui_terminal_width(FILE *out)
 {
     int fd = -1;
@@ -316,27 +341,14 @@ void cli_ui_render_rules(FILE *out, const CliRuleRow *rows, int count,
 
     if (!wide)
     {
-        /* Fit the line by capping the three flexible columns at an equal
-         * share of what is left; never below the header widths, so the
-         * header row and the data rows stay aligned. */
-        int avail = width - (id_w + rule_w + chain_w + 5 * CLI_UI_GAP);
-        int cap;
+        /* Binary, ARG and TARGET share the leftover width equally; ID,
+         * Rule and CHAIN never shrink. */
+        int cap = flexible_cap(width, id_w + rule_w + chain_w + 5 * CLI_UI_GAP,
+                               3);
 
-        if (avail < 3 * CLI_UI_COL_MIN)
-            avail = 3 * CLI_UI_COL_MIN;
-        cap = avail / 3;
-        if (bin_w > cap)
-            bin_w = cap;
-        if (arg_w > cap)
-            arg_w = cap;
-        if (tgt_w > cap)
-            tgt_w = cap;
-        if (bin_w < (int)strlen("Binary"))
-            bin_w = (int)strlen("Binary");
-        if (arg_w < (int)strlen("ARG"))
-            arg_w = (int)strlen("ARG");
-        if (tgt_w < (int)strlen("TARGET"))
-            tgt_w = (int)strlen("TARGET");
+        bin_w = clamp_col(bin_w, cap, (int)strlen("Binary"));
+        arg_w = clamp_col(arg_w, cap, (int)strlen("ARG"));
+        tgt_w = clamp_col(tgt_w, cap, (int)strlen("TARGET"));
     }
 
     fprintf(out, "%-*s  %-*s  %-*s  %-*s  %-*s  %s\n",
@@ -396,14 +408,9 @@ void cli_ui_render_pins(FILE *out, const CliPinRow *rows, int count,
 
     if (!wide)
     {
-        int avail = width - (id_w + upd_w + 2 * CLI_UI_GAP);
+        int cap = flexible_cap(width, id_w + upd_w + 2 * CLI_UI_GAP, 1);
 
-        if (avail < CLI_UI_COL_MIN)
-            avail = CLI_UI_COL_MIN;
-        if (bin_w > avail)
-            bin_w = avail;
-        if (bin_w < (int)strlen("Binary"))
-            bin_w = (int)strlen("Binary");
+        bin_w = clamp_col(bin_w, cap, (int)strlen("Binary"));
     }
 
     fprintf(out, "%-*s  %-*s  %s\n", id_w, "ID", bin_w, "Binary",
@@ -462,21 +469,14 @@ void cli_ui_render_sessions(FILE *out, const CliSessionRow *rows, int count,
 
     if (!wide)
     {
-        int avail = width -
-                    (id_w + rule_w + sid_w + exp_w + 5 * CLI_UI_GAP);
-        int cap;
+        /* Binary and Target share the leftover width; SID and Expires
+         * are bounded by their content. */
+        int cap = flexible_cap(width,
+                               id_w + rule_w + sid_w + exp_w + 5 * CLI_UI_GAP,
+                               2);
 
-        if (avail < 2 * CLI_UI_COL_MIN)
-            avail = 2 * CLI_UI_COL_MIN;
-        cap = avail / 2;
-        if (bin_w > cap)
-            bin_w = cap;
-        if (tgt_w > cap)
-            tgt_w = cap;
-        if (bin_w < (int)strlen("Binary"))
-            bin_w = (int)strlen("Binary");
-        if (tgt_w < (int)strlen("Target"))
-            tgt_w = (int)strlen("Target");
+        bin_w = clamp_col(bin_w, cap, (int)strlen("Binary"));
+        tgt_w = clamp_col(tgt_w, cap, (int)strlen("Target"));
     }
 
     fprintf(out, "%-*s  %-*s  %-*s  %-*s  %-*s  %s\n",

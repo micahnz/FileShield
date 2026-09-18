@@ -1003,24 +1003,90 @@ static int dyn_compact(DynEntry *list, int count, const int *removals,
     return kept;
 }
 
+/* Copy one persisted row into a DynEntry; chain entries beyond the
+ * (clamped) depth stay zeroed so a stale tail can never match. */
+static void dyn_from_persist(const PersistEntry *src, DynEntry *dst)
+{
+    int depth = src->chain_depth;
+
+    memset(dst, 0, sizeof(*dst));
+    snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
+    snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s",
+             src->binary_sha512);
+    snprintf(dst->target_path, sizeof(dst->target_path), "%s",
+             src->target_path);
+    snprintf(dst->cmdline, sizeof(dst->cmdline), "%s", src->cmdline);
+    snprintf(dst->cmdline_sha512, sizeof(dst->cmdline_sha512), "%s",
+             src->cmdline_sha512);
+    snprintf(dst->rule_id, sizeof(dst->rule_id), "%s", src->rule_id);
+    dst->created_at = src->created_at;
+    if (depth < 0)
+        depth = 0;
+    if (depth > PERSIST_CHAIN_MAX)
+        depth = PERSIST_CHAIN_MAX;
+    dst->chain_depth = depth;
+    for (int j = 0; j < depth; j++)
+    {
+        snprintf(dst->chain_comm[j], sizeof(dst->chain_comm[j]), "%s",
+                 src->chain_comm[j]);
+        snprintf(dst->chain_sha512[j], sizeof(dst->chain_sha512[j]), "%s",
+                 src->chain_sha512[j]);
+    }
+}
+
 /*
- * Load PersistEntry entries into a DynEntry array.
- * When require_binary_sha512 is set, entries without a binary SHA-512 are
- * dropped (fail closed): a permanent grant that cannot prove which binary
- * was approved must never be trusted as a wildcard.
- * When require_target_path is set, entries without a target path are
- * dropped (fail closed): file-scoped matching cannot honour a wildcard
- * grant from an old or hand-edited state file.
- * When require_cmdline is set, entries without a raw command line or
- * without its matching digest are dropped too: an entry that cannot pin
- * the exact invocation would silently cover every command of that binary,
- * and one that cannot show the invocation is not auditable.
+ * Admission checks for one converted entry; returns 1 to admit, 0 to
+ * drop (logged).  Each requirement guards against a different way an
+ * incomplete state file could grant more than its author intended:
+ *   - require_binary_sha512: a grant must prove which binary was
+ *     approved, or it would act as a wildcard for that path.
+ *   - require_target_path: file-scoped matching cannot honour a
+ *     wildcard grant from an old or hand-edited state file.
+ *   - require_cmdline: an entry that cannot pin the exact invocation
+ *     would cover every command of that binary, and one that cannot
+ *     show the invocation is not auditable.
+ */
+static int dyn_admits(const DynEntry *e, const char *name,
+                      int require_binary_sha512, int require_target_path,
+                      int require_cmdline)
+{
+    if (require_binary_sha512 && e->binary_sha512[0] == '\0')
+    {
+        log_msg(LOG_WARNING,
+                "dropping %s entry \"%s\": no binary SHA-512 recorded "
+                "(fail closed)",
+                name, e->binary);
+        return 0;
+    }
+    if (require_target_path && e->target_path[0] == '\0')
+    {
+        log_msg(LOG_WARNING,
+                "dropping %s entry \"%s\": no target path recorded "
+                "(fail closed)",
+                name, e->binary);
+        return 0;
+    }
+    if (require_cmdline &&
+        (e->cmdline[0] == '\0' || e->cmdline_sha512[0] == '\0'))
+    {
+        log_msg(LOG_WARNING,
+                "dropping %s entry \"%s\": incomplete command-line record "
+                "(fail closed)",
+                name, e->binary);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Load PersistEntry entries into a DynEntry array: convert, apply this
+ * list's admission rules, migrate the rule ID, append.
  *
  * Each admitted entry keeps its stored rule_id and created_at.  A legacy
- * entry without an ID (or with a malformed one) gets an ID generated from
- * its identity, unique against the entries already admitted to this list;
- * the returned count of regenerated IDs lets the caller persist the
- * migration immediately.  An entry whose ID cannot be generated is
+ * entry without an ID (or with a malformed one) gets an ID generated
+ * from its identity, unique against the entries already admitted to this
+ * list; the returned count of regenerated IDs lets the caller persist
+ * the migration immediately.  An entry whose ID cannot be generated is
  * dropped (fail closed): persist_load() drops present-but-empty IDs, so
  * an unmigrated entry would silently vanish at the next load anyway.
  * Returns the number of regenerated IDs (>= 0).
@@ -1031,6 +1097,7 @@ static int load_dyn_list(DynEntry *list, int *list_count,
                          int require_target_path, int require_cmdline)
 {
     int migrated = 0;
+    int n = 0;
 
     /* Always replace the in-memory list so a removed state file or a
      * corrupt/unreadable one cannot leave stale grants or denies active
@@ -1045,76 +1112,35 @@ static int load_dyn_list(DynEntry *list, int *list_count,
     }
     if (count > DYN_MAX)
         count = DYN_MAX;
-    int n = 0;
+
     for (int i = 0; i < count; i++)
     {
-        const PersistEntry *src = &entries[i];
-        DynEntry *dst = &list[n];
-        snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
-        snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
-        snprintf(dst->target_path, sizeof(dst->target_path), "%s", src->target_path);
-        snprintf(dst->cmdline, sizeof(dst->cmdline), "%s", src->cmdline);
-        snprintf(dst->cmdline_sha512, sizeof(dst->cmdline_sha512), "%s", src->cmdline_sha512);
-        snprintf(dst->rule_id, sizeof(dst->rule_id), "%s", src->rule_id);
-        dst->created_at = src->created_at;
-        int depth = src->chain_depth;
-        if (depth < 0)
-            depth = 0;
-        if (depth > PERSIST_CHAIN_MAX)
-            depth = PERSIST_CHAIN_MAX;
-        dst->chain_depth = depth;
-        for (int j = 0; j < depth; j++)
-        {
-            snprintf(dst->chain_comm[j], sizeof(dst->chain_comm[j]), "%s", src->chain_comm[j]);
-            snprintf(dst->chain_sha512[j], sizeof(dst->chain_sha512[j]), "%s", src->chain_sha512[j]);
-        }
-        if (require_binary_sha512 && dst->binary_sha512[0] == '\0')
-        {
-            log_msg(LOG_WARNING,
-                    "dropping %s entry \"%s\": no binary SHA-512 recorded "
-                    "(fail closed)",
-                    name, dst->binary);
+        DynEntry candidate;
+
+        dyn_from_persist(&entries[i], &candidate);
+        if (!dyn_admits(&candidate, name, require_binary_sha512,
+                        require_target_path, require_cmdline))
             continue;
-        }
-        if (require_target_path && dst->target_path[0] == '\0')
+
+        if (candidate.rule_id[0] == '\0' ||
+            !dyn_rule_id_valid(candidate.rule_id))
         {
-            log_msg(LOG_WARNING,
-                    "dropping %s entry \"%s\": no target path recorded "
-                    "(fail closed)",
-                    name, dst->binary);
-            continue;
-        }
-        if (require_cmdline &&
-            (dst->cmdline[0] == '\0' || dst->cmdline_sha512[0] == '\0'))
-        {
-            log_msg(LOG_WARNING,
-                    "dropping %s entry \"%s\": incomplete command-line record "
-                    "(fail closed)",
-                    name, dst->binary);
-            continue;
-        }
-        /* Legacy migration: assign an ID when none was stored (or a
-         * malformed one somehow reached this list).  Unique against the
-         * entries already admitted, so a list of identical legacy
-         * entries still gets distinct IDs. */
-        if (dst->rule_id[0] == '\0' || !dyn_rule_id_valid(dst->rule_id))
-        {
-            if (dst->rule_id[0] != '\0')
+            if (candidate.rule_id[0] != '\0')
                 log_msg(LOG_WARNING,
                         "load %s: entry \"%s\" has a malformed rule ID; "
                         "regenerating it",
-                        name, dst->binary);
-            if (dyn_assign_rule_id(list, n, dst) < 0)
+                        name, candidate.binary);
+            if (dyn_assign_rule_id(list, n, &candidate) < 0)
             {
                 log_msg(LOG_ERR,
                         "dropping %s entry \"%s\": rule ID could not be "
                         "generated (fail closed)",
-                        name, dst->binary);
+                        name, candidate.binary);
                 continue;
             }
             migrated++;
         }
-        n++;
+        list[n++] = candidate;
     }
     *list_count = n;
     log_msg(LOG_INFO, "loaded %d persisted %s entries", n, name);

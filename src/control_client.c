@@ -68,103 +68,123 @@ static int utf8_encode(unsigned int cp, char out[4])
     return 4;
 }
 
+/* Parse exactly four hex digits (the encoder always emits four, so a
+ * short escape is malformed input, not a shorter value). */
+static int decode_hex4(const char *digits, unsigned int *out)
+{
+    unsigned int code = 0;
+
+    for (int k = 0; k < 4; k++)
+    {
+        int d = hex_digit(digits[k]);
+
+        if (d < 0)
+            return -1;
+        code = (code << 4) | (unsigned int)d;
+    }
+    *out = code;
+    return 0;
+}
+
+/*
+ * Decode the escape at *pp (which points at the backslash), write its
+ * UTF-8 bytes to out (at most 4) and advance *pp past the escape.
+ * Returns the byte count, or -1 for an unknown escape, a lone surrogate
+ * or a malformed \uXXXX.
+ */
+static int decode_escape(const char **pp, char out[4])
+{
+    const char *p = *pp + 1; /* skip the backslash */
+    unsigned int code;
+
+    switch (*p)
+    {
+    case '"':
+        out[0] = '"';
+        break;
+    case '\\':
+        out[0] = '\\';
+        break;
+    case '/':
+        out[0] = '/';
+        break;
+    case 'b':
+        out[0] = '\b';
+        break;
+    case 'f':
+        out[0] = '\f';
+        break;
+    case 'n':
+        out[0] = '\n';
+        break;
+    case 'r':
+        out[0] = '\r';
+        break;
+    case 't':
+        out[0] = '\t';
+        break;
+    case 'u':
+        if (decode_hex4(p + 1, &code) < 0)
+            return -1;
+        p += 5; /* past "uXXXX" */
+        if (code == 0)
+            return -1; /* \u0000 cannot live in a C string */
+        if (code >= 0xD800 && code <= 0xDBFF)
+        {
+            /* A high surrogate must be followed by the low half of its
+             * pair; a lone surrogate is not valid UTF-8 and the state
+             * writers never emit one. */
+            unsigned int low;
+
+            if (p[0] != '\\' || p[1] != 'u')
+                return -1;
+            if (decode_hex4(p + 2, &low) < 0 ||
+                low < 0xDC00 || low > 0xDFFF)
+                return -1;
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            p += 6; /* past the low half's "\uXXXX" */
+        }
+        else if (code >= 0xDC00 && code <= 0xDFFF)
+        {
+            return -1; /* lone low surrogate */
+        }
+        *pp = p;
+        return utf8_encode(code, out);
+    default:
+        return -1; /* unknown escape sequence */
+    }
+
+    *pp = p + 1;
+    return 1;
+}
+
 int control_decode_field(const char *src, char *dst, size_t dst_size)
 {
-    const char *p;
+    const char *p = src;
     size_t j = 0;
 
     if (!src || !dst || dst_size == 0)
         return -1;
 
-    for (p = src; *p != '\0'; p++)
+    while (*p != '\0')
     {
         char add[4];
         int add_len;
-        int k;
 
         if (*p != '\\')
         {
-            unsigned char c = (unsigned char)*p;
-            if (c < 0x20)
-                return -1; /* raw control byte inside a JSON string */
-            add[0] = (char)c;
+            /* Raw bytes pass through; a control byte is rejected because
+             * a valid encoding never produces one unescaped. */
+            if ((unsigned char)*p < 0x20)
+                return -1;
+            add[0] = *p++;
             add_len = 1;
         }
         else
         {
-            unsigned int code = 0;
-            int d;
-
-            p++;
-            switch (*p)
-            {
-            case '"':
-            case '\\':
-            case '/':
-                add[0] = *p;
-                add_len = 1;
-                break;
-            case 'b':
-                add[0] = '\b';
-                add_len = 1;
-                break;
-            case 'f':
-                add[0] = '\f';
-                add_len = 1;
-                break;
-            case 'n':
-                add[0] = '\n';
-                add_len = 1;
-                break;
-            case 'r':
-                add[0] = '\r';
-                add_len = 1;
-                break;
-            case 't':
-                add[0] = '\t';
-                add_len = 1;
-                break;
-            case 'u':
-                /* Exactly four hex digits: the encoder always emits four,
-                 * so a short escape is a malformed field, not a value. */
-                for (k = 0; k < 4; k++)
-                {
-                    d = hex_digit(p[1 + k]);
-                    if (d < 0)
-                        return -1;
-                    code = (code << 4) | (unsigned int)d;
-                }
-                p += 4; /* p now points at the last hex digit */
-                if (code == 0)
-                    return -1; /* \u0000 cannot live in a C string */
-                if (code >= 0xD800 && code <= 0xDBFF)
-                {
-                    /* A high surrogate must be followed by the low half
-                     * of its pair; a lone surrogate is invalid UTF-8. */
-                    unsigned int low = 0;
-                    if (p[1] != '\\' || p[2] != 'u')
-                        return -1;
-                    for (k = 0; k < 4; k++)
-                    {
-                        d = hex_digit(p[3 + k]);
-                        if (d < 0)
-                            return -1;
-                        low = (low << 4) | (unsigned int)d;
-                    }
-                    if (low < 0xDC00 || low > 0xDFFF)
-                        return -1;
-                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-                    p += 6; /* past the low half's "\uXXXX" */
-                }
-                else if (code >= 0xDC00 && code <= 0xDFFF)
-                {
-                    return -1; /* lone low surrogate */
-                }
-                add_len = utf8_encode(code, add);
-                break;
-            default:
-                return -1; /* unknown escape sequence */
-            }
+            add_len = decode_escape(&p, add);
+            if (add_len < 0)
+                return -1;
         }
 
         if (j + (size_t)add_len > dst_size - 1)
@@ -311,15 +331,62 @@ static int client_send_line(int fd, const char *request)
     return 0;
 }
 
+/*
+ * Read until EOF into buf, always NUL-terminated.  A response that does
+ * not fit is ENOBUFS, never a silent truncation.  Returns 0, or -1 with
+ * errno set.
+ */
+static int read_response(int fd, char *buf, size_t size, size_t *used_out)
+{
+    size_t used = 0;
+
+    for (;;)
+    {
+        ssize_t got;
+
+        if (used == size - 1)
+        {
+            /* Buffer full: one more byte decides between an exact fit
+             * (EOF) and a response too large for the caller's buffer. */
+            char extra;
+
+            got = recv(fd, &extra, 1, 0);
+            if (got < 0 && errno == EINTR)
+                continue;
+            if (got > 0)
+            {
+                errno = ENOBUFS;
+                return -1;
+            }
+            if (got < 0)
+                return -1;
+            break;
+        }
+
+        got = recv(fd, buf + used, size - 1 - used, 0);
+        if (got < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (got == 0)
+            break;
+        used += (size_t)got;
+    }
+    buf[used] = '\0';
+    *used_out = used;
+    return 0;
+}
+
 int control_client_call(const char *sock_path, const char *request,
                         char *resp_buf, size_t resp_size,
                         ControlResponse *out)
 {
     struct sockaddr_un addr;
     size_t path_len;
-    int fd;
-    int saved_errno = 0;
     size_t used = 0;
+    int fd;
     int rc = -1;
 
     if (!sock_path || sock_path[0] == '\0' || !request || !resp_buf ||
@@ -342,78 +409,34 @@ int control_client_call(const char *sock_path, const char *request,
     memcpy(addr.sun_path, sock_path, path_len + 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
+        goto fail;
 
     if (client_send_line(fd, request) < 0)
-    {
-        saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
+        goto fail;
 
     /* Half-close: the request is complete, so the daemon must not see a
      * slow writer behind it.  Failures are harmless (the daemon reads
      * the newline either way). */
     (void)shutdown(fd, SHUT_WR);
 
-    for (;;)
-    {
-        ssize_t got;
+    if (read_response(fd, resp_buf, resp_size, &used) < 0)
+        goto fail;
 
-        if (used == resp_size - 1)
-        {
-            /* The buffer is full: one more byte decides between an exact
-             * fit (EOF) and a response too large for the caller. */
-            char extra;
-
-            got = recv(fd, &extra, 1, 0);
-            if (got < 0 && errno == EINTR)
-                continue;
-            if (got > 0)
-            {
-                saved_errno = ENOBUFS;
-                goto fail;
-            }
-            if (got < 0)
-            {
-                saved_errno = errno;
-                goto fail;
-            }
-            break;
-        }
-
-        got = recv(fd, resp_buf + used, resp_size - 1 - used, 0);
-        if (got < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            saved_errno = errno;
-            goto fail;
-        }
-        if (got == 0)
-            break;
-        used += (size_t)got;
-    }
-
-    resp_buf[used] = '\0';
     if (control_response_parse(resp_buf, used, out) < 0)
     {
-        saved_errno = EPROTO;
+        errno = EPROTO;
         goto fail;
     }
-
     rc = 0;
-    saved_errno = 0;
 
 fail:
-    close(fd);
-    if (rc < 0 && saved_errno != 0)
+    /* Preserve the failing errno across close(): the CLI uses it to
+     * tell "daemon absent" (ENOENT/ECONNREFUSED) from other failures. */
+    {
+        int saved_errno = errno;
+
+        close(fd);
         errno = saved_errno;
+    }
     return rc;
 }

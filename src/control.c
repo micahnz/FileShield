@@ -548,10 +548,92 @@ static int dispatch(int fd, const ControlRequest *req)
 /* Socket lifecycle                                                   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Make 'path' safe to bind: missing is fine; an existing socket owned by
+ * us is unlinked only when no live listener answers on it; anything else
+ * (regular file, directory, symlink, foreign owner) is refused because
+ * it is not ours to remove.  A live listener is refused rather than
+ * displaced: a second daemon would otherwise serve the CLI while the
+ * first keeps enforcing different in-memory lists.
+ *
+ * 'path' has already been length-checked against sun_path.  Returns 0 to
+ * proceed with bind(), -1 to refuse startup (logged).
+ */
+static int clear_stale_socket(const char *path)
+{
+    struct stat st;
+
+    if (lstat(path, &st) != 0)
+    {
+        if (errno != ENOENT)
+        {
+            log_msg(LOG_ERR, "control: cannot stat %s: %s", path,
+                    strerror(errno));
+            return -1;
+        }
+        return 0; /* nothing there */
+    }
+
+    if (!S_ISSOCK(st.st_mode))
+    {
+        log_msg(LOG_ERR, "control: %s exists and is not a socket; refusing",
+                path);
+        return -1;
+    }
+    if (st.st_uid != geteuid())
+    {
+        log_msg(LOG_ERR,
+                "control: stale socket %s is owned by uid %u, not %u; "
+                "refusing",
+                path, (unsigned)st.st_uid, (unsigned)geteuid());
+        return -1;
+    }
+
+    /* Probe for a live listener with a non-blocking connect: refused or
+     * absent means the owner died and left the path behind; a successful
+     * connect (or any other errno, including a full backlog) means a
+     * daemon is alive, so startup fails closed. */
+    {
+        struct sockaddr_un paddr;
+        int probe;
+        int prc;
+        int saved;
+
+        probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (probe < 0)
+        {
+            log_msg(LOG_ERR, "control: probe socket: %s", strerror(errno));
+            return -1;
+        }
+        memset(&paddr, 0, sizeof(paddr));
+        paddr.sun_family = AF_UNIX;
+        memcpy(paddr.sun_path, path, strlen(path) + 1);
+        prc = connect(probe, (struct sockaddr *)&paddr, sizeof(paddr));
+        saved = errno;
+        close(probe);
+        errno = saved;
+        if (prc == 0 || (errno != ECONNREFUSED && errno != ENOENT))
+        {
+            log_msg(LOG_ERR,
+                    "control: another daemon is already listening on %s; "
+                    "refusing to take over",
+                    path);
+            return -1;
+        }
+    }
+
+    if (unlink(path) < 0)
+    {
+        log_msg(LOG_ERR, "control: cannot remove stale socket %s: %s", path,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int control_setup_at(const char *path)
 {
     struct sockaddr_un addr;
-    struct stat st;
     mode_t old_mask;
     size_t path_len;
     int fd;
@@ -572,74 +654,8 @@ int control_setup_at(const char *path)
         return -1;
     }
 
-    /* Never displace an object that is not our own stale socket: a
-     * regular file, directory or symlink at the path belongs to an
-     * administrator or an attacker, not to a crashed daemon. */
-    if (lstat(path, &st) == 0)
-    {
-        if (!S_ISSOCK(st.st_mode))
-        {
-            log_msg(LOG_ERR,
-                    "control: %s exists and is not a socket; refusing", path);
-            return -1;
-        }
-        if (st.st_uid != geteuid())
-        {
-            log_msg(LOG_ERR,
-                    "control: stale socket %s is owned by uid %u, not %u; "
-                    "refusing",
-                    path, (unsigned)st.st_uid, (unsigned)geteuid());
-            return -1;
-        }
-
-        /* A socket we own may still have a live listener: a second
-         * daemon must not silently take over the path, because the CLI
-         * would then manage a process whose in-memory lists are not the
-         * ones enforcing.  Probe with a non-blocking connect: refused or
-         * absent means stale; a successful connect (or any other errno,
-         * including a full backlog) means a listener and startup fails
-         * closed. */
-        {
-            int probe = socket(AF_UNIX,
-                               SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-            struct sockaddr_un paddr;
-            int prc;
-            int saved;
-
-            if (probe < 0)
-            {
-                log_msg(LOG_ERR, "control: probe socket: %s", strerror(errno));
-                return -1;
-            }
-            memset(&paddr, 0, sizeof(paddr));
-            paddr.sun_family = AF_UNIX;
-            memcpy(paddr.sun_path, path, path_len + 1);
-            prc = connect(probe, (struct sockaddr *)&paddr, sizeof(paddr));
-            saved = errno;
-            close(probe);
-            errno = saved;
-            if (prc == 0 || (errno != ECONNREFUSED && errno != ENOENT))
-            {
-                log_msg(LOG_ERR,
-                        "control: another daemon is already listening on %s; "
-                        "refusing to take over",
-                        path);
-                return -1;
-            }
-        }
-
-        if (unlink(path) < 0)
-        {
-            log_msg(LOG_ERR, "control: cannot remove stale socket %s: %s",
-                    path, strerror(errno));
-            return -1;
-        }
-    }
-    else if (errno != ENOENT)
-    {
-        log_msg(LOG_ERR, "control: cannot stat %s: %s", path, strerror(errno));
+    if (clear_stale_socket(path) < 0)
         return -1;
-    }
 
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0)
