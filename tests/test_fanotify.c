@@ -3734,7 +3734,14 @@ static void test_verdict_stage_order(void) {
  * this process, so the degraded grant is observable through
  * cache_lookup().
  */
-static void test_session_allow_requires_digest(void) {
+/*
+ * A Session-Allow chosen for a binary whose digest is unavailable is
+ * stored as a session entry with an empty digest and matches later opens.
+ * This is deliberate — AppImages and other unhashable tools are the key
+ * use case — and a past review degraded it to Allow Once and broke that
+ * case, so this test pins the intended behavior.
+ */
+static void test_session_allow_without_digest_stored(void) {
     static Config cfg;
     Config *saved = g_config;
     pid_t sid = 0;
@@ -3753,17 +3760,17 @@ static void test_session_allow_requires_digest(void) {
 
     ASSERT(session_id_of(getpid(), &sid, &start) == 0, "resolve own session");
 
-    /* No digest: cache the one-time grant, never store a session entry. */
+    /* No digest: the session entry is stored and matches, no cache fallback. */
     ASSERT(fanotify_test_record_allow_decision(bin, "", target, sid, start,
                                                NOTIFY_ALLOW_SESSION)
                == FAN_ALLOW,
-           "empty-digest Session-Allow allows this attempt");
-    ASSERT(cache_lookup(getpid(), bin, target) > 0,
-           "empty-digest Session-Allow degrades to a cached Allow Once");
-    ASSERT(session_snapshot(0, recs, 4, &total) == 0 && total == 0,
-           "no digest-less session entry is stored");
-    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 0,
-           "no session entry matches any digest");
+           "digest-less Session-Allow allows this attempt");
+    ASSERT(cache_lookup(getpid(), bin, target) == 0,
+           "no one-time cache fallback for a digest-less Session-Allow");
+    ASSERT(session_snapshot(0, recs, 4, &total) == 1 && total == 1,
+           "the digest-less session entry is stored");
+    ASSERT(session_allow_match(sid, bin, PIN_SHA_A, target) == 1,
+           "the digest-less session grant matches a later open");
 
     /* Control: with a digest the session entry is stored as before. */
     session_clear();
@@ -3978,7 +3985,7 @@ int main(void) {
     test_hash_change_prompt_escapes();
     test_html_escape();
     test_verdict_stage_order();
-    test_session_allow_requires_digest();
+    test_session_allow_without_digest_stored();
     test_pump_defer_contract();
     test_pump_dialog_group_allow();
     test_pump_bounded_and_lossless();

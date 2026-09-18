@@ -389,7 +389,7 @@ When an unknown process (e.g., `curl` spawned from `/tmp`) tries to open `/home/
 | Choice        | Matches on                                                    | Lifetime                                                          | Persisted                |
 | ------------- | ------------------------------------------------------------- | ----------------------------------------------------------------- | ------------------------ |
 | Allow Once    | PID + binary + exact file                                     | `user_ttl` seconds                                                | no                       |
-| Allow Session | POSIX session + binary (+ SHA-512) + exact file               | until the shell/session leader exits, capped by `session_ttl`     | no                       |
+| Allow Session | POSIX session + binary (SHA-512 when hashable; optional for unhashable binaries) + exact file | until the shell/session leader exits, capped by `session_ttl` | no |
 | Allow Always  | binary SHA-512 + call chain + exact file + exact command line | until removed                                                     | `runtime-allowlist.json` |
 | Allowlist pin | matched `[allowlist]` rule binary pattern + binary SHA-512    | until a hash change, CLI removal, or eviction at 256 pins         | `allowlist-hashes.json`  |
 | Deny Session  | same key shape as Allow Session                               | same as Allow Session                                             | no                       |

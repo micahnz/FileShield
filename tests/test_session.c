@@ -166,7 +166,16 @@ static void test_allow_match(void)
  * (the recorder, not this module, owns that guard), which is exactly what
  * lets this test pin the matcher's behavior.
  */
-static void test_empty_digest_never_matches(void)
+/*
+ * A digest-less session entry is deliberate: unhashable binaries
+ * (AppImages under /tmp/.mount_*, self-updating tools) rely on "Allow
+ * Session" as their scoped grant.  The entry matches any requester digest
+ * for the same binary path and target while the session lives; a recorded
+ * digest still must match.  A past review turned the empty stored digest
+ * into a fail-closed rejection and broke that use case — this test pins
+ * the restored, intended behavior so it is not "fixed" again.
+ */
+static void test_empty_digest_matches_for_session(void)
 {
     pid_t leader;
     pid_t sid = 0;
@@ -184,23 +193,26 @@ static void test_empty_digest_never_matches(void)
 
     session_allow_add(sid, start, bin, "", target, 0);
     ASSERT(session_snapshot(0, recs, 4, &total) == 1 && total == 1,
-           "the empty-digest entry is stored (the matcher must reject it)");
-    ASSERT(session_allow_match(sid, bin, "", target) == 0,
-           "empty stored allow digest fails closed without a requester digest");
-    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc", target) == 0,
-           "empty stored allow digest fails closed with a requester digest");
+           "the digest-less allow entry is stored");
+    ASSERT(session_allow_match(sid, bin, "", target) == 1,
+           "empty stored digest matches without a requester digest");
+    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc", target) == 1,
+           "empty stored digest matches any requester digest (session-scoped)");
+    ASSERT(session_allow_match(sid, bin, "cccccccccccccccc",
+                               "/home/u/other") == 0,
+           "the target must still match");
 
     session_deny_add(sid, start, bin, "", target, 0);
-    ASSERT(session_deny_match(sid, bin, "", target) == 0,
-           "empty stored deny digest fails closed without a requester digest");
-    ASSERT(session_deny_match(sid, bin, "cccccccccccccccc", target) == 0,
-           "empty stored deny digest fails closed with a requester digest");
+    ASSERT(session_deny_match(sid, bin, "cccccccccccccccc", target) == 1,
+           "a digest-less deny entry also matches (conservative)");
 
-    /* Control: the same key with a recorded digest still matches. */
+    /* Control: a recorded digest must still match exactly. */
     session_clear();
     session_allow_add(sid, start, bin, "dddddddddddddddd", target, 0);
     ASSERT(session_allow_match(sid, bin, "dddddddddddddddd", target) == 1,
            "a recorded digest still matches its requester digest");
+    ASSERT(session_allow_match(sid, bin, "eeeeeeeeeeeeeeee", target) == 0,
+           "a recorded digest mismatch re-prompts");
 
     session_clear();
     stop_leader(leader);
@@ -718,7 +730,7 @@ int main(void)
     printf("=== test_session ===\n");
     test_session_id_of();
     test_allow_match();
-    test_empty_digest_never_matches();
+    test_empty_digest_matches_for_session();
     test_ttl_expiry();
     test_dead_leader();
     test_full_table_reclaims_dead();

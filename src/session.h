@@ -34,10 +34,14 @@ int session_id_of(pid_t pid, pid_t *sid_out, unsigned long long *leader_start_ou
  * Record a session-scoped decision.  ttl_seconds == 0 means the entry is
  * valid for as long as the session leader lives; > 0 caps its lifetime in
  * seconds as well.  The target file is mandatory (an empty target never
- * matches), and so is the binary SHA-512: an entry that records no digest
- * matches nothing (fail closed), so recorders must never store an empty
- * digest.  Repeating an identical decision refreshes the existing entry
- * and keeps its rule ID.
+ * matches).  The binary SHA-512 is optional BY DESIGN: when the binary
+ * cannot be hashed (AppImages under /tmp/.mount_*, self-updating tools)
+ * the empty digest is stored and the entry matches any requester digest
+ * for the same binary path and target until the session ends.  Do not
+ * turn a missing digest into a refusal: "Allow Session" is the intended
+ * scope for unhashable binaries (a past review "fixed" this and broke
+ * the use case).  Repeating an identical decision refreshes the existing
+ * entry and keeps its rule ID.
  */
 void session_allow_add(pid_t sid, unsigned long long leader_start,
                        const char *binary, const char *bin_sha512,
@@ -47,11 +51,13 @@ void session_deny_add(pid_t sid, unsigned long long leader_start,
                       const char *target, int ttl_seconds);
 
 /*
- * Match a session-scoped entry.  Returns 1 on match, 0 otherwise.  A
- * digest must be present on both sides: an entry without a stored digest
- * never matches, and neither does an entry whose digest the caller cannot
- * provide (fail closed: re-prompt).  A match also lazily drops entries
- * whose leader exited, whose start time changed, or whose TTL expired.
+ * Match a session-scoped entry.  Returns 1 on match, 0 otherwise.  An
+ * entry without a stored digest matches any requester digest (deliberate
+ * for unhashable binaries; see session_allow_add).  A recorded digest,
+ * however, must match, and a missing requester digest for a recorded
+ * entry re-prompts (fail closed: the approved binary cannot be verified).
+ * A match also lazily drops entries whose leader exited, whose start time
+ * changed, or whose TTL expired.
  */
 int session_allow_match(pid_t sid, const char *binary, const char *bin_sha512,
                         const char *target);

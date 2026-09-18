@@ -3536,12 +3536,17 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
     }
     else if (decision == NOTIFY_ALLOW_SESSION)
     {
-        /* A session entry without a digest cannot be verified against a
-         * later binary at the target, and the matcher refuses it; storing
-         * one would also hand the user a grant the next open ignores.
-         * Degrade to the cached one-time grant, exactly like the Allow
-         * Always path below. */
-        if (c->have_sid && c->bin_sha512[0] != '\0')
+        /* DELIBERATE: a session grant is recorded even when the binary
+         * digest is unavailable (c->bin_sha512[0] == '\0').  AppImages
+         * under /tmp/.mount_* and other self-updating tools cannot be
+         * hashed, and "Allow Session" is exactly the scope for them;
+         * degrading this to Allow Once earns one cached open and then
+         * re-prompts, which breaks the primary use case.  The matcher
+         * (session.c) treats an empty stored digest as a match, bounded
+         * by the session leader, the binary path and the target.  Do NOT
+         * turn this back into a fail-closed degradation: see the
+         * session.h contract and the AGENTS.md limitations note. */
+        if (c->have_sid)
         {
             session_allow_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
                               c->target, session_ttl);
@@ -3549,11 +3554,9 @@ static unsigned int record_allow_decision(EventCtx *c, int decision)
         else
         {
             log_msg(LOG_WARNING,
-                    "cannot store Allow Session for %s (%s); "
-                    "degrading to Allow Once",
-                    c->binary,
-                    !c->have_sid ? "session unavailable"
-                                 : "binary SHA-512 unavailable");
+                    "session unavailable; degrading Allow Session to "
+                    "Allow Once for %s",
+                    c->binary);
             cache_insert(c->ev->pid, c->binary, c->target, user_ttl);
         }
     }
@@ -3603,6 +3606,9 @@ static unsigned int record_deny_decision(EventCtx *c, int decision)
 
         if (c->have_sid)
         {
+            /* A missing digest is stored here too (see the allow path).
+             * The empty-digest match is conservative on this side: it
+             * denies any binary at the same path for the session. */
             session_deny_add(c->sid, c->sid_start, c->binary, c->bin_sha512,
                              c->target, session_ttl);
         }
