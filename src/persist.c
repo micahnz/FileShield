@@ -39,7 +39,11 @@ static int ensure_state_dir(const char *dirpath)
         if ((st.st_mode & 0777) != 0700)
         {
             if (chmod(dirpath, 0700) < 0)
-                log_msg(LOG_WARNING, "chmod %s: %s", dirpath, strerror(errno));
+            {
+                log_msg(LOG_ERR, "chmod %s 0700: %s (refusing the write)",
+                        dirpath, strerror(errno));
+                return -1;
+            }
         }
         return 0;
     }
@@ -205,19 +209,27 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
             dirpath = dirbuf;
         }
         int dirfd = open(dirpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (dirfd >= 0)
+        if (dirfd < 0)
         {
-            if (fsync_maybe_failing(dirfd) < 0)
-            {
-                log_msg(LOG_ERR,
-                        "%s: fsync dir %s: %s (rename committed but it may "
-                        "not survive a crash)",
-                        what, dirpath, strerror(errno));
-                close(dirfd);
-                return -1;
-            }
-            close(dirfd);
+            /* Same contract as a failing directory fsync below: the
+             * rename is already visible, but the write must not be
+             * reported as durable while the directory flush was skipped. */
+            log_msg(LOG_ERR,
+                    "%s: open dir %s: %s (rename committed but it may "
+                    "not survive a crash)",
+                    what, dirpath, strerror(errno));
+            return -1;
         }
+        if (fsync_maybe_failing(dirfd) < 0)
+        {
+            log_msg(LOG_ERR,
+                    "%s: fsync dir %s: %s (rename committed but it may "
+                    "not survive a crash)",
+                    what, dirpath, strerror(errno));
+            close(dirfd);
+            return -1;
+        }
+        close(dirfd);
     }
     return 0;
 }
@@ -451,12 +463,49 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
 }
 
 /*
+ * Parse one bracketed chain-slot key ("chain_comm[2]" or
+ * "chain_sha512[0]") against 'prefix'.  Returns 1 and sets *idx when the
+ * key matches exactly with an in-range index, 0 otherwise.
+ *
+ * strtol, not sscanf("%d"): an overflowing index is undefined behavior
+ * with scanf conversions, while ERANGE is a defined rejection here.  The
+ * opening bracket, the closing ']' and the end of the key are all
+ * required, so trailing junk never parses — the same discipline
+ * apply_entry_number() and pin.c's parse_numeric_field() follow.
+ */
+static int parse_chain_slot(const char *key, const char *prefix, int *idx)
+{
+    size_t plen = strlen(prefix);
+    const char *rest;
+    char *end;
+    long value;
+
+    if (strncmp(key, prefix, plen) != 0 || key[plen] != '[')
+        return 0;
+
+    rest = key + plen + 1;
+    errno = 0;
+    value = strtol(rest, &end, 10);
+    if (end == rest || errno == ERANGE || *end != ']' || end[1] != '\0')
+        return 0;
+    if (value < 0 || value >= PERSIST_CHAIN_MAX)
+        return 0;
+
+    *idx = (int)value;
+    return 1;
+}
+
+/*
  * Apply one parsed string field to an entry.  Values arrive already
  * unescaped; unknown keys are ignored so hand-edited state files stay
- * loadable.
+ * loadable.  Returns 0 normally, or -1 when a numeric field
+ * (chain_depth / created_at) carries a string value: the caller drops
+ * that entry (mirroring a malformed rule_id), because admitting it
+ * would silently weaken a persisted rule (a zero depth, or an epoch
+ * timestamp).
  */
-static void apply_entry_field(const char *filepath, PersistEntry *e,
-                              const char *key, const char *value)
+static int apply_entry_field(const char *filepath, PersistEntry *e,
+                             const char *key, const char *value)
 {
     int idx;
 
@@ -471,14 +520,23 @@ static void apply_entry_field(const char *filepath, PersistEntry *e,
     else if (strcmp(key, "cmdline_sha512") == 0)
         copy_field(filepath, e->cmdline_sha512, sizeof(e->cmdline_sha512),
                    value);
-    else if (sscanf(key, "chain_comm[%d]", &idx) == 1 &&
-             idx >= 0 && idx < PERSIST_CHAIN_MAX)
+    else if (strcmp(key, "chain_depth") == 0 ||
+             strcmp(key, "created_at") == 0)
+    {
+        log_msg(LOG_WARNING,
+                "persist_load: %s: numeric field \"%s\" has a string value; "
+                "dropping the entry (a stored rule must never silently "
+                "weaken)",
+                filepath, key);
+        return -1;
+    }
+    else if (parse_chain_slot(key, "chain_comm", &idx))
         copy_field(filepath, e->chain_comm[idx], sizeof(e->chain_comm[idx]),
                    value);
-    else if (sscanf(key, "chain_sha512[%d]", &idx) == 1 &&
-             idx >= 0 && idx < PERSIST_CHAIN_MAX)
+    else if (parse_chain_slot(key, "chain_sha512", &idx))
         copy_field(filepath, e->chain_sha512[idx],
                    sizeof(e->chain_sha512[idx]), value);
+    return 0;
 }
 
 /*
@@ -633,6 +691,9 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
      * absent key and a present-but-malformed value are told apart here. */
     int have_rule_id = 0;
     int rule_id_valid = 0;
+    /* Set when a known numeric field carries a string value: the entry
+     * must not be admitted with a weakened (default) value. */
+    int entry_damaged = 0;
 
     /*
      * Minimal line-oriented scanner: just enough JSON structure to find
@@ -699,6 +760,7 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         {
             have_rule_id = 0;
             rule_id_valid = 0;
+            entry_damaged = 0;
             if (count >= max_entries)
             {
                 /* Make truncation at the caller's cap visible: silently
@@ -724,10 +786,11 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         /* Entry end: closing brace.  Sanitise and finalise. */
         if (state == S_IN_ENTRY && *p == '}')
         {
-            /* A present-but-malformed rule_id (logged at the field) drops
-             * this entry only: one damaged line must not fail the rest of
-             * the file. */
-            if (current && (!have_rule_id || rule_id_valid))
+            /* A present-but-malformed rule_id, or a string where a
+             * numeric field belongs (both logged at the field), drops
+             * this entry only: one damaged line must not fail the rest
+             * of the file. */
+            if (current && (!have_rule_id || rule_id_valid) && !entry_damaged)
             {
                 /* Defense in depth: never index arrays with an out-of-range
                  * depth, even if a previous validation step was bypassed. */
@@ -783,8 +846,8 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 have_rule_id = 1;
                 rule_id_valid = apply_rule_id(filepath, current, val_buf);
             }
-            else
-                apply_entry_field(filepath, current, key_buf, val_buf);
+            else if (apply_entry_field(filepath, current, key_buf, val_buf) < 0)
+                entry_damaged = 1;
         }
         else
         {

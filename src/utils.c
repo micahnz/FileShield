@@ -525,8 +525,16 @@ char **expand_home_all_users(const char *path)
 
     const struct passwd *pw;
     setpwent();
-    while ((pw = getpwent()) != NULL)
+    for (;;)
     {
+        /* getpwent() returns NULL both at end-of-list and on error; errno
+         * must be cleared before every call so a failed enumeration can
+         * be told apart from a completed one. */
+        errno = 0;
+        pw = getpwent();
+        if (!pw)
+            break;
+
         /* Skip system/service accounts; only expand for real users. */
         if (pw->pw_uid < 1000 || pw->pw_uid >= 65534)
             continue;
@@ -568,6 +576,22 @@ char **expand_home_all_users(const char *path)
         }
         snprintf(expanded, len, "%s%s", pw->pw_dir, rest);
         result[count++] = expanded;
+    }
+    if (errno != 0)
+    {
+        /* getpwent() failed mid-enumeration: the homes gathered so far
+         * are only a prefix of /etc/passwd.  Returning them would
+         * silently leave the remaining users unprotected while the
+         * config still "loads fine"; fail the expansion hard, exactly
+         * like the OOM paths above.  Terminate the live array first so
+         * free_string_array() never reads past the last entry. */
+        log_msg(LOG_ERR, "expand_home_all_users: getpwent: %s",
+                strerror(errno));
+        if (result)
+            result[count] = NULL;
+        endpwent();
+        free_string_array(result);
+        return NULL;
     }
     endpwent();
 

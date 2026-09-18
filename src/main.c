@@ -154,6 +154,7 @@ static int startup_fail(int fan_fd, Config *cfg)
     }
     config_reset(cfg);
     free(cfg);
+    g_config = NULL; /* the freed config must never be dereferenced */
     closelog();
     return EXIT_FAILURE;
 }
@@ -333,8 +334,9 @@ int main(int argc, char *argv[])
      * setup failure is fatal: a daemon without a listener would push CLI
      * mutations onto the direct-file fallback and reintroduce the
      * lost-update race the socket exists to close.  Setup only creates
-     * /run/fileshield.sock -- it opens no marked path -- and runs after
-     * persisted state and pins were loaded and the marks were installed. */
+     * /run/fileshield/control.sock and its parent directory -- it opens
+     * no marked path -- and runs after persisted state and pins were
+     * loaded and the marks were installed. */
     int control_fd = control_setup();
     if (control_fd < 0)
     {
@@ -344,6 +346,13 @@ int main(int argc, char *argv[])
         return startup_fail(fan_fd, cfg);
     }
 
+    /* [settings] debug is staged by config_load(): apply it only now
+     * that startup has fully accepted the config.  A config refused by
+     * the scope guard, a failed mark install or a failed control-socket
+     * setup must leave the previous logging state (config.h). */
+    if (cfg->debug_set)
+        log_set_debug(cfg->debug);
+
     log_msg(LOG_INFO, "Fileshield started, watching %d paths (%d exclusions)",
             cfg->protected_count - cfg->exclude_count, cfg->exclude_count);
 
@@ -352,8 +361,18 @@ int main(int argc, char *argv[])
         fanotify_loop(fan_fd, g_sigwake[0], control_fd);
         if (g_fatal)
             break;
-        if (g_need_reload && reload_protection(fan_fd, config_path, &cfg) < 0)
-            break;
+        if (g_need_reload)
+        {
+            if (reload_protection(fan_fd, config_path, &cfg) < 0)
+                break;
+            /* reload_protection() republishes 'cfg' only when the new
+             * config was accepted; on a rejected reload it still points
+             * at the old config, whose staged debug value is the one
+             * already in effect.  Applying here keeps a rejected or
+             * rolled-back config from toggling global logging. */
+            if (cfg->debug_set)
+                log_set_debug(cfg->debug);
+        }
     }
 
     log_msg(LOG_INFO, "Fileshield shutting down");

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "cache.h"
@@ -33,11 +34,20 @@ static int cache_initialized = 0;
  */
 static int cache_high = 0;
 
+/*
+ * One warning per filled-table episode: set at the first dropped insert
+ * and cleared when the table is emptied (cache_clear) or when
+ * cache_expire() actually frees a slot, so a drop flood cannot spam the
+ * journal while a later fill is still reported.
+ */
+static int cache_full_warned = 0;
+
 static void cache_init(void)
 {
     memset(cache, 0, sizeof(cache));
     cache_initialized = 1;
     cache_high = 0;
+    cache_full_warned = 0;
 }
 
 /*
@@ -160,7 +170,19 @@ static void cache_insert_starttime(pid_t pid, unsigned long long starttime,
         free_slot = cache_high;
 
     if (free_slot < 0)
-        return; /* table full: no eviction policy, drop the insert */
+    {
+        /* Table full: no eviction policy, drop the insert (fail closed).
+         * Log only on the transition into a full table, not per event. */
+        if (!cache_full_warned)
+        {
+            log_msg(LOG_WARNING,
+                    "cache: table full (%d entries); dropping new allow-once "
+                    "grants until entries expire",
+                    CACHE_MAX_ENTRIES);
+            cache_full_warned = 1;
+        }
+        return;
+    }
 
     if (free_slot >= cache_high)
         cache_high = free_slot + 1;
@@ -204,7 +226,10 @@ void cache_expire(void)
             continue;
         /* Matches cache_lookup: zero remaining TTL is expired. */
         if (cache[i].expiry_time <= now)
+        {
             cache[i].pid = 0;
+            cache_full_warned = 0; /* freeing a slot: no longer full */
+        }
     }
 }
 
@@ -215,6 +240,7 @@ void cache_clear(void)
     else
         memset(cache, 0, sizeof(cache));
     cache_high = 0; /* empty table: restart the scan bound at zero */
+    cache_full_warned = 0;
 }
 
 /* Test seam (cache.h): table capacity, so the full-table drop behavior

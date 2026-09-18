@@ -76,15 +76,21 @@ static int parse_int_setting(const char *val, int *out)
  * non-canonical pattern under a symlinked home — one the canonical
  * event paths never match, silently leaving the file unprotected.
  * Reaching the deepest existing ancestor keeps the pattern canonical.
- * Only a path with no leading '/' at all (rejected by every caller) or
- * a realpath("/") failure can still fall through to the raw string.
+ * Only a path with no leading '/' at all (rejected by every caller) can
+ * still fall through to the raw string.  A failing realpath("/") means
+ * no ancestor resolves at all; reducing the path cannot make progress
+ * past "/", so the function fails instead of retrying "/" forever.
+ *
+ * Returns 0 on success, -1 when nothing (not even "/") resolves, which
+ * callers must treat as a fatal, fail-closed rejection.
  */
-static void canonicalize_path(const char *in, char *out, size_t outsz)
+static int canonicalize_path(const char *in, char *out, size_t outsz)
 {
     char trimmed[PATH_MAX];
     char buf[PATH_MAX];
     size_t len, cut;
     char *resolved = NULL;
+    int failed = 0;
 
     snprintf(trimmed, sizeof(trimmed), "%s", in);
     len = strlen(trimmed);
@@ -103,7 +109,17 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
             break; /* relative junk: only the raw string can represent it */
         cut = (size_t)(slash - buf);
         if (slash == buf)
-            buf[1] = '\0'; /* reduce "/x" to "/" and let "/" resolve */
+        {
+            /* "/x" reduces to "/" and gets one more realpath attempt;
+             * "/" itself cannot shrink, so a failing realpath("/") must
+             * terminate the loop instead of re-testing the same path. */
+            if (buf[1] == '\0')
+            {
+                failed = 1;
+                break;
+            }
+            buf[1] = '\0';
+        }
         else
             *slash = '\0';
     }
@@ -124,18 +140,23 @@ static void canonicalize_path(const char *in, char *out, size_t outsz)
         free(resolved);
         if (need < 0 || (size_t)need >= outsz)
             snprintf(out, outsz, "%s", in); /* never emit half a path */
-        return;
+        return 0;
     }
 
+    if (failed)
+        return -1;
+
     snprintf(out, outsz, "%s", in);
+    return 0;
 }
 
 /*
  * True when a supposedly canonical path still contains a "." or ".."
- * segment.  canonicalize_path() leaves those behind only when no
- * ancestor resolves and the raw string survives the fallback; a
- * /proc/<pid>/fd target is always canonical, so such a pattern can never
- * match.  Rejecting it at load time keeps a typo from silently
+ * segment.  canonicalize_path() keeps the raw string only for input
+ * with no leading '/' (every caller rejects that separately); for
+ * absolute paths it resolves or fails, so this is a defensive check.
+ * A /proc/<pid>/fd target is always canonical, so such a pattern can
+ * never match.  Rejecting it at load time keeps a typo from silently
  * protecting nothing.
  */
 static int has_unresolved_dot_segment(const char *path)
@@ -170,13 +191,16 @@ static int has_unresolved_dot_segment(const char *path)
  * wildcard-free base is canonicalized (so symlinked homes still match
  * the canonical /proc/self/fd target paths); the suffix is matched
  * verbatim by glob_match_path().  A wildcard in the first segment
- * gives a static base of "/" (the whole-subtree and root-child glob
- * forms) and is accepted.
+ * gives a static base of "/" and is refused: such a glob would make
+ * the installer mark the root filesystem (fail closed).
  * A malformed pattern — relative, no static base, '..', an empty
  * segment ("//" or a trailing slash) — is rejected.  Fail closed: a
  * typo'd pattern must never silently match nothing.
  *
- * Returns 0 on success, -1 when the pattern is rejected.
+ * Returns 0 on success, -1 when the pattern is rejected (the entry is
+ * skipped with a log), or -2 when the rejection must refuse the whole
+ * config (nothing resolves at /, or a glob that would mark the root
+ * filesystem).
  */
 static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
                             int *base_len, const char *raw)
@@ -200,7 +224,13 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
             log_msg(LOG_ERR, "config_load: path too long: %.64s", raw);
             return -1;
         }
-        canonicalize_path(raw, out, outsz);
+        if (canonicalize_path(raw, out, outsz) < 0)
+        {
+            log_msg(LOG_ERR,
+                    "config_load: no ancestor of %s resolves (realpath "
+                    "failed at /); refusing the config", raw);
+            return -2;
+        }
         if (has_unresolved_dot_segment(out))
         {
             log_msg(LOG_ERR,
@@ -302,7 +332,13 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
     }
 
     char base_canon[PATH_MAX];
-    canonicalize_path(base, base_canon, sizeof(base_canon));
+    if (canonicalize_path(base, base_canon, sizeof(base_canon)) < 0)
+    {
+        log_msg(LOG_ERR,
+                "config_load: no ancestor of the glob base of %s resolves "
+                "(realpath failed at /); refusing the config", raw);
+        return -2;
+    }
 
     size_t canon_len = strlen(base_canon);
     size_t suffix_len = strlen(suffix);
@@ -317,13 +353,27 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
         return -1;
     }
 
+    /* A wildcard-free base of "/" would make fanotify_add_protected()
+     * attach a mark to the root mount: the 2026-09-16 freeze class (the
+     * daemon's own state-file opens then block on events only it could
+     * answer).  Refuse the whole config instead of installing it;
+     * skipping the pattern silently would leave the path it appears to
+     * cover unprotected.  Checking the canonicalized base also catches
+     * a base that resolves to "/" through a symlink. */
+    if (canon_len == 1)
+    {
+        log_msg(LOG_ERR,
+                "config_load: glob pattern based at / would mark the root "
+                "filesystem; refusing the config: %s", raw);
+        return -2;
+    }
+
     /* Always store base_canon + suffix so that the wildcard-free base is
      * exactly the first base_len characters of the stored pattern (the
-     * mark target and the protected-prefix check slice it that way).
-     * When the base is "/" and the suffix starts with '/', skip the
-     * junction duplicate instead of concatenating "//". */
-    size_t suffix_skip = (canon_len == 1 && suffix[0] == '/') ? 1 : 0;
-    size_t sfx_len = suffix_len - suffix_skip;
+     * mark target and the protected-prefix check slice it that way).  A
+     * base of "/" is refused above, so the suffix already starts with
+     * the '/' that joins it and there is no "//" junction to skip. */
+    size_t sfx_len = suffix_len;
 
     if (canon_len + sfx_len >= outsz)
     {
@@ -332,15 +382,10 @@ static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
     }
 
     memcpy(out, base_canon, canon_len);
-    memcpy(out + canon_len, suffix + suffix_skip, sfx_len + 1);
+    memcpy(out + canon_len, suffix, sfx_len + 1);
 
     *is_glob = 1;
     *base_len = (int)canon_len;
-
-    if (canon_len == 1)
-        log_msg(LOG_WARNING,
-                "config_load: glob pattern based at / can be expensive to walk: %s",
-                raw);
     return 0;
 }
 
@@ -455,7 +500,8 @@ static int parse_rule_line(const char *line, char *buf, const char **binary,
  * each resulting entry.  When only one side expands, the fixed side is
  * shared by every entry.  Entries whose expanded paths fail validation
  * are skipped with a log.  Returns 0 on success, -1 on allocation
- * failure or when the section's MAX_RULES cap is reached.
+ * failure, when the section's MAX_RULES cap is reached, or for a
+ * fail-closed pattern rejection that must refuse the whole config.
  */
 static int expand_and_append_rule(RuleEntry *rules, int *count,
                                   const char *line, const char *bin_raw,
@@ -494,14 +540,29 @@ static int expand_and_append_rule(RuleEntry *rules, int *count,
 
         RuleEntry e;
         memset(&e, 0, sizeof(e));
-        if (rule_pattern_set(e.binary, sizeof(e.binary), &e.binary_is_glob,
-                             &e.binary_base_len, bpath) < 0)
+        int rc = rule_pattern_set(e.binary, sizeof(e.binary),
+                                  &e.binary_is_glob, &e.binary_base_len,
+                                  bpath);
+        if (rc == -2)
+        {
+            free_string_array(bins);
+            free_string_array(tgts);
+            return -1;
+        }
+        if (rc < 0)
             continue; /* malformed glob: rejected with a log */
         if (tpath[0] != '\0')
         {
-            if (rule_pattern_set(e.target_path, sizeof(e.target_path),
-                                 &e.target_is_glob, &e.target_base_len,
-                                 tpath) < 0)
+            rc = rule_pattern_set(e.target_path, sizeof(e.target_path),
+                                  &e.target_is_glob, &e.target_base_len,
+                                  tpath);
+            if (rc == -2)
+            {
+                free_string_array(bins);
+                free_string_array(tgts);
+                return -1;
+            }
+            if (rc < 0)
                 continue;
         }
 
@@ -553,7 +614,9 @@ static int add_rule(RuleEntry *rules, int *count, const char *line)
  * pattern syntax, so both share one implementation).  Exact entries
  * keep the historical behavior; malformed globs are rejected.
  *
- * Returns 0 on success, -1 when the entry is rejected.
+ * Returns the shared rule_pattern_set() code: 0 on success, -1 when the
+ * entry is rejected (skipped with a log), -2 when the whole config must
+ * be refused.
  */
 static int protected_path_set(ProtectedPath *pp, const char *raw)
 {
@@ -566,7 +629,8 @@ static int protected_path_set(ProtectedPath *pp, const char *raw)
  * Add one [protected_paths] line (positive, or '!' exclusion) to cfg,
  * expanding '~/...' once per real user.  Returns 0 on success (including
  * entries rejected by validation, which are logged) and -1 when the
- * config must be refused (allocation failure or MAX_PATHS reached).
+ * config must be refused (allocation failure, MAX_PATHS reached, or a
+ * fail-closed pattern rejection).
  */
 static int add_protected_entry(Config *cfg, char *s)
 {
@@ -617,7 +681,15 @@ static int add_protected_entry(Config *cfg, char *s)
             return -1;
         }
         ProtectedPath *pp = &cfg->protected[cfg->protected_count];
-        if (protected_path_set(pp, paths[pi]) < 0)
+        int rc = protected_path_set(pp, paths[pi]);
+        if (rc == -2)
+        {
+            /* Fail-closed rejection (nothing resolves, or a root-based
+             * glob): the whole config is refused, never a silent skip. */
+            free_string_array(paths);
+            return -1;
+        }
+        if (rc < 0)
             continue; /* malformed or relative: rejected with a log */
         pp->is_exclude = is_exclude;
         if (is_exclude)
@@ -644,8 +716,9 @@ static int load_rules(RuleEntry *rules, int *count, const char *section_name,
     if (add_rule(rules, count, line) < 0)
     {
         log_msg(LOG_ERR,
-                "config_load: cannot add to [%s] (out of memory or rule cap "
-                "reached); refusing the config",
+                "config_load: cannot add to [%s] (out of memory, rule cap "
+                "reached, or a fail-closed pattern rejection); refusing the "
+                "config",
                 section_name);
         return -1;
     }
@@ -1006,11 +1079,10 @@ int config_load(const char *path, Config *cfg)
         return -1;
     }
 
-    /* Apply the staged [settings] debug only now that the config is
-     * accepted; a refused config leaves the previous logging state. */
-    if (cfg->debug_set)
-        log_set_debug(cfg->debug);
-
+    /* [settings] debug stays staged in cfg (see apply_setting): the
+     * caller applies it only after the config is accepted, so a config
+     * refused by the scope guard or a failed mark install cannot toggle
+     * global logging (config.h). */
     fclose(fp);
     /*
      * Deliberately do NOT publish cfg through g_config here.  The caller
