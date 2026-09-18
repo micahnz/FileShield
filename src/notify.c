@@ -632,6 +632,12 @@ int notify_test_kdialog_choice(int status)
     return kdialog_status_to_choice(status);
 }
 
+/* Both dialog children exec this kdialog; notify_test_set_kdialog_path()
+ * can swap it for a scripted stand-in so the fork/pipe/drain mechanics,
+ * the argv shape and the hash-change body can be proven without a
+ * desktop click. */
+static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
+
 /*
  * run_kdialog: show a kdialog --yesnocancel prompt with custom button
  * labels and return 0 = yes, 1 = no, 2 = cancel/window close,
@@ -644,9 +650,8 @@ int notify_test_kdialog_choice(int status)
  * helper behind the daemon's blocked event.
  *
  * kdialog returns 1 both for a deliberate No click and for some runtime
- * errors.  The stage-2 scope dialogs map No to the permanent "Always"
- * choice by explicit UX decision (documented trade-off in the README);
- * timeouts, exec failures and Cancel/window close always deny.
+ * errors.  Only exit 0 (the Yes result) approves; No, Cancel, window
+ * close, timeouts, exec failures and runtime errors all deny.
  */
 static int run_kdialog(const DisplaySession *session,
                        const DialogEnvSetting *env, int env_count,
@@ -682,13 +687,20 @@ static int run_kdialog(const DisplaySession *session,
          * child's argv[0] to the command path itself, so the previous
          * "kdialog" string landed as a stray positional (KMessageBox
          * showed it as the details text). */
+        /* Preselect the deny button: kdialog's --default takes a button
+         * label, so reuse --no-label.  Only exit 0 approves (see
+         * kdialog_status_to_choice()).  kdialog 22.12+ documents
+         * --default for menu/combobox/color/calendar only and ignores
+         * it on message boxes, so the preselection is best-effort
+         * there; the exit-code contract below is the enforced part. */
         execl("/usr/bin/timeout", "timeout", "30",
-              "/usr/bin/kdialog",
+              g_kdialog_path,
               "--title", "Fileshield",
               "--yesnocancel", text,
               "--yes-label", yes_label,
               "--no-label", no_label,
               "--cancel-label", cancel_label,
+              "--default", no_label,
               (char *)NULL);
         _exit(127);
     }
@@ -857,13 +869,7 @@ typedef struct
 #define DIALOG_MENU_MAX_ITEMS 8
 #define DIALOG_TOKEN_MAX 64
 
-/* The menu child execs this kdialog. Test seam below swaps it for a
- * scripted stand-in so the fork/pipe/dup2/drain mechanics and the
- * argv shape can be proven without a desktop click; the yesnocancel
- * hash prompt always execs the production path. */
-static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
-
-/* Test seam (notify.h): override the menu kdialog binary (NULL = reset). */
+/* Test seam (notify.h): override the dialog kdialog binary (NULL = reset). */
 void notify_test_set_kdialog_path(const char *path)
 {
     if (!path)
@@ -1392,7 +1398,6 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     char path[512];
     char old_hash[64];
     char new_hash[64];
-    char body[4096];
 
     /* Sanitized, bounded copies: even the rule pattern and the digests
      * are treated as untrusted so control characters cannot forge dialog
@@ -1412,20 +1417,56 @@ int notify_ask_hash_change(const NotifyHashChange *req)
                                                             : "(unknown)",
                   new_hash, sizeof(new_hash));
 
-    /* Full digests are journal-logged by the caller; the prompt shows
-     * only the 16-hex prefixes a human can compare at a glance. */
-    snprintf(body, sizeof(body),
-             "SHA-512 changed for allowlist rule:\n"
-             "%s\n\n"
-             "Binary:   %s\n"
-             "Target:   %s\n"
-             "Command:  %s\n\n"
-             "Old SHA-512: %.16s\xe2\x80\xa6\n"
-             "New SHA-512: %.16s\xe2\x80\xa6\n\n"
-             "Update & Allow trusts the new binary and records the new "
-             "hash.\n"
-             "Deny / Cancel blocks this attempt and keeps the old hash.",
-             rule, exe, path, cmd, old_hash, new_hash);
+    /*
+     * kdialog's message body renders as rich text (KMessageBox builds a
+     * Qt::AutoText QLabel), so every interpolated value must arrive as
+     * entities: sanitize_text() leaves '<', '>' and '&' alone, which a
+     * crafted file name could otherwise use to inject markup into the
+     * prompt itself.  Each escape buffer holds the worst case (5 bytes
+     * per input byte: "&amp;") plus the NUL, exactly like the --menu
+     * body.  body_text stays on the static fallback unless the whole
+     * document rendered: a failed escape or a truncating snprintf must
+     * never leave partial markup on screen, and the fallback contains
+     * no interpolated value at all.
+     */
+    char e_rule[512 * 5 + 1];
+    char e_exe[512 * 5 + 1];
+    char e_cmd[256 * 5 + 1];
+    char e_path[512 * 5 + 1];
+    char e_old_hash[64 * 5 + 1];
+    char e_new_hash[64 * 5 + 1];
+    char body[16384];
+    static const char fallback_body[] =
+        "SHA-512 changed for an allowlist rule.\n\n"
+        "Update & Allow trusts the new binary and records the new hash.\n"
+        "Deny / Cancel blocks this attempt and keeps the old hash.";
+    const char *body_text = fallback_body;
+
+    if (html_escape(rule, e_rule, sizeof(e_rule)) == 0 &&
+        html_escape(exe, e_exe, sizeof(e_exe)) == 0 &&
+        html_escape(path, e_path, sizeof(e_path)) == 0 &&
+        html_escape(cmd, e_cmd, sizeof(e_cmd)) == 0 &&
+        html_escape(old_hash, e_old_hash, sizeof(e_old_hash)) == 0 &&
+        html_escape(new_hash, e_new_hash, sizeof(e_new_hash)) == 0)
+    {
+        /* Full digests are journal-logged by the caller; the prompt
+         * shows only the 16-hex prefixes a human can compare at a
+         * glance. */
+        int need = snprintf(body, sizeof(body),
+                 "SHA-512 changed for allowlist rule:\n"
+                 "%s\n\n"
+                 "Binary:   %s\n"
+                 "Target:   %s\n"
+                 "Command:  %s\n\n"
+                 "Old SHA-512: %.16s\xe2\x80\xa6\n"
+                 "New SHA-512: %.16s\xe2\x80\xa6\n\n"
+                 "Update & Allow trusts the new binary and records the new "
+                 "hash.\n"
+                 "Deny / Cancel blocks this attempt and keeps the old hash.",
+                 e_rule, e_exe, e_path, e_cmd, e_old_hash, e_new_hash);
+        if (need >= 0 && (size_t)need < sizeof(body))
+            body_text = body;
+    }
 
     DisplaySession session;
     int have_session = detect_display_session(req->user_uid, &session);
@@ -1452,7 +1493,7 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    int r = run_kdialog(&session, dialog_env, dialog_env_count, body,
+    int r = run_kdialog(&session, dialog_env, dialog_env_count, body_text,
                         "Update & Allow", "Deny", "Cancel");
     if (r == 0)
     {
@@ -1483,6 +1524,14 @@ int notify_ask_hash_change(const NotifyHashChange *req)
 /* Defensive fallback only: the effective cap comes from [settings] notify_max. */
 #define NOTIFY_GLOBAL_MAX NOTIFY_MAX_DEFAULT
 #define NOTIFY_GLOBAL_WINDOW_S 60
+/*
+ * A *successful* notify-send availability probe is cached for this many
+ * seconds (one notification window, so a helper removed at runtime is
+ * noticed on the first hit after the window).  A failed probe is never
+ * cached: it re-runs on every hit so a re-installed helper is picked up
+ * immediately.  access() is cheap and the probe never reaches a decision.
+ */
+#define NOTIFY_SEND_RECHECK_S 60
 #define NOTIFY_SEND_PATH "/usr/bin/notify-send"
 
 typedef struct
@@ -1501,8 +1550,9 @@ static int g_notify_window_count = 0;
 static time_t g_notify_window_start = 0;
 static int g_notify_window_logged = 0;
 
-static int g_notify_send_checked = 0;
-static int g_notify_send_ok = 0;
+static int g_notify_send_ok = 0;       /* last access() probe result       */
+static int g_notify_send_logged = 0;   /* miss warning already emitted     */
+static time_t g_notify_send_check = 0; /* mono_seconds() of the last probe */
 
 /* 1 = this hit may be delivered (and is counted / remembered). */
 static int notify_rate_allow(int kind, const char *binary, const char *target,
@@ -1576,24 +1626,38 @@ static int notify_rate_allow(int kind, const char *binary, const char *target,
 }
 
 /*
- * One-time, cached availability check for notify-send.  A missing
+ * Availability check for notify-send, cached only briefly.  A missing
  * helper must not spend the dedup or flood budget on notifications that
- * can never be shown; the "not found" warning is emitted once.
+ * can never be shown; the "not found" warning is emitted once per
+ * missing episode.  A success is trusted for NOTIFY_SEND_RECHECK_S, so
+ * a helper removed at runtime is detected (and logged once) on the next
+ * hit after the window; a failure is re-probed every hit, so a
+ * re-installed helper is picked up immediately.  The probe is
+ * best-effort only and never influences an access decision.
  */
 static int notify_send_available(void)
 {
-    if (g_notify_send_ok)
+    time_t now = mono_seconds();
+
+    if (g_notify_send_ok && now - g_notify_send_check < NOTIFY_SEND_RECHECK_S)
         return 1;
 
     g_notify_send_ok = access(NOTIFY_SEND_PATH, X_OK) == 0;
-    if (!g_notify_send_ok && !g_notify_send_checked)
+    g_notify_send_check = now;
+
+    if (!g_notify_send_ok)
     {
-        g_notify_send_checked = 1;
-        log_msg(LOG_WARNING,
-                "notify_rule_hit: %s not found; rule notifications "
-                "disabled (see README)",
-                NOTIFY_SEND_PATH);
+        if (!g_notify_send_logged)
+        {
+            g_notify_send_logged = 1;
+            log_msg(LOG_WARNING,
+                    "notify_rule_hit: %s not found; rule notifications "
+                    "disabled (see README)",
+                    NOTIFY_SEND_PATH);
+        }
     }
+    else
+        g_notify_send_logged = 0; /* re-arm for a later removal */
     return g_notify_send_ok;
 }
 
@@ -1645,9 +1709,11 @@ static void build_hit_notification(const NotifyHit *hit, char *title,
 /*
  * Deliver a notification through notify-send from a double-forked
  * grandchild reparented to init: the daemon reaps only the intermediate,
- * with a bounded wait so the event loop never stalls.  A 127 exit means
- * exec failed (notify-send removed since the cached check), so the
- * availability flag is dropped for the next hit to re-check.
+ * with a bounded wait so the event loop never stalls.  The grandchild's
+ * exec failure is deliberately unobservable (fire-and-forget); a 127
+ * observed here is the intermediate's own fork failure, so the
+ * availability flag is dropped to force an immediate re-probe on the
+ * next hit.
  */
 static void spawn_notify_send(const DisplaySession *session,
                               const char *title, const char *body,
@@ -1711,9 +1777,9 @@ static void spawn_notify_send(const DisplaySession *session,
      * transient condition, NOT "notify-send is gone": the helper's exec
      * failure happens in the reparented grandchild and is deliberately
      * unobservable (fire-and-forget).  A genuinely missing helper is
-     * caught by notify_send_available()'s access() probe on the next
-     * hit.  Reset the cached availability so that next hit re-probes
-     * before spending another fork pair.
+     * caught by notify_send_available()'s access() probe within its
+     * recheck window.  Reset the cached success anyway so the next hit
+     * re-probes before spending another fork pair.
      */
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127)
         g_notify_send_ok = 0;

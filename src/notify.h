@@ -152,10 +152,12 @@ int notify_test_kdialog_choice(int status);
 int notify_test_menu_choice(const char *token);
 
 /*
- * Test seam: override the kdialog binary spawned by the --menu prompt
- * (NULL restores /usr/bin/kdialog). Lets an integration test drive the
- * full fork/pipe/drain/token flow with a scripted stand-in, proving the
- * argv shape and that only a stdout tag grants.
+ * Test seam: override the kdialog binary spawned by both prompts (NULL
+ * restores /usr/bin/kdialog). Lets an integration test drive the full
+ * fork/pipe/drain/token flow with a scripted stand-in, proving the
+ * --menu argv shape and that only a stdout tag grants; the hash-change
+ * yesnocancel prompt can likewise be driven to pin its argv (including
+ * --default Deny) and its HTML-escaped body.
  */
 void notify_test_set_kdialog_path(const char *path);
 
