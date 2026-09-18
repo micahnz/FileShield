@@ -1134,8 +1134,44 @@ static void print_cell(const char *s, int width)
     fputs(buf, stdout);
 }
 
+static void format_time(time_t t, char *out, size_t outsz)
+{
+    struct tm tm;
+
+    if (t <= 0)
+    {
+        snprintf(out, outsz, "(unknown)");
+        return;
+    }
+    localtime_r(&t, &tm);
+    strftime(out, outsz, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+/*
+ * One group member: ID, keep/remove and creation time.  The call chain is
+ * part of the grouping key, so a member can only differ there if the key
+ * comparison is broken; print it when it does so such a bug can never
+ * hide behind the kept entry's chain.
+ */
+static void print_prune_member(const PersistEntry *e, const char *tag,
+                               const char *keep_chain)
+{
+    char when[32];
+    char chain[4 * 256];
+    int idlen = g_wide ? RULEID_HEX_LEN : 8;
+
+    format_time(e->created_at, when, sizeof(when));
+    printf("    %.*s  %-6s  %s\n", idlen,
+           e->rule_id[0] ? e->rule_id : "(none)", tag, when);
+
+    cli_ui_chain_column(e->chain_comm, e->chain_depth, chain, sizeof(chain));
+    if (strcmp(chain, keep_chain) != 0)
+        printf("      chain: %s\n", chain);
+}
+
 static void print_prune_groups(int deny, const PersistEntry *entries,
-                               const PruneGroup *groups, int ngroups)
+                               const PruneGroup *groups, int ngroups,
+                               const int *removals)
 {
     printf("%s: %d duplicate group(s)\n", rule_label(deny), ngroups);
     for (int g = 0; g < ngroups; g++)
@@ -1160,6 +1196,13 @@ static void print_prune_groups(int deny, const PersistEntry *entries,
             printf(")");
         }
         printf("  [%d duplicate(s)]\n", groups[g].remove_count);
+
+        print_prune_member(keep, "keep", chain);
+        for (int r = groups[g].remove_offset;
+             r < groups[g].remove_offset + groups[g].remove_count; r++)
+        {
+            print_prune_member(&entries[removals[r]], "remove", chain);
+        }
     }
 }
 
@@ -1201,7 +1244,7 @@ static int prune_list(int deny)
         return -1;
     }
     if (ngroups > 0)
-        print_prune_groups(deny, entries, groups, ngroups);
+        print_prune_groups(deny, entries, groups, ngroups, removals);
 
     free(groups);
     free(removals);

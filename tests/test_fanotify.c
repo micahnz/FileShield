@@ -1120,6 +1120,19 @@ static void dyn_entry_fill(PersistEntry *e, const char *binary, const char *sha,
     e->created_at = created_at;
 }
 
+/* Give a fixture entry a recorded three-level call chain. */
+static void dyn_entry_set_chain(PersistEntry *e, const char *c0,
+                                const char *c1, const char *c2)
+{
+    e->chain_depth = 3;
+    snprintf(e->chain_comm[0], sizeof(e->chain_comm[0]), "%s", c0);
+    snprintf(e->chain_comm[1], sizeof(e->chain_comm[1]), "%s", c1);
+    snprintf(e->chain_comm[2], sizeof(e->chain_comm[2]), "%s", c2);
+    snprintf(e->chain_sha512[0], sizeof(e->chain_sha512[0]), "%s", PIN_SHA_C);
+    snprintf(e->chain_sha512[1], sizeof(e->chain_sha512[1]), "%s", PIN_SHA_C);
+    snprintf(e->chain_sha512[2], sizeof(e->chain_sha512[2]), "%s", PIN_SHA_C);
+}
+
 static int is_hex16(const char *s)
 {
     size_t i;
@@ -1450,6 +1463,55 @@ static void test_dyn_prune_interleaved(void)
     ASSERT(n == 2 && strcmp(out[0].rule_id, "aaaaaaaaaaaaaaa3") == 0 &&
                strcmp(out[1].rule_id, "bbbbbbbbbbbbbbb2") == 0,
            "the kept pair was persisted in order");
+}
+
+/*
+ * The call chain is part of the prune key: the same helper run from two
+ * terminals (same binary, target and args, different terminal comms at
+ * the end of the chain) is two rules, not a duplicate.  Only the
+ * same-chain pair is pruned and the other terminal's grant survives.
+ */
+static void test_dyn_prune_chain_separation(void)
+{
+    PersistEntry e[3];
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int removed = -1;
+    int n;
+
+    dyn_fixture_reset();
+
+    dyn_entry_fill(&e[0], "/usr/bin/gcloud-helper", PIN_SHA_A,
+                   "/home/u/gcloud/credentials.db",
+                   "gcloud-helper --format=json", "aaaaaaaaaaaaaaa1",
+                   (time_t)1700060000);
+    dyn_entry_set_chain(&e[0], "gke-gcloud-auth", "kubectl", "zsh");
+
+    dyn_entry_fill(&e[1], "/usr/bin/gcloud-helper", PIN_SHA_B,
+                   "/home/u/gcloud/credentials.db",
+                   "gcloud-helper --format=json", "bbbbbbbbbbbbbbb1",
+                   (time_t)1700060001);
+    dyn_entry_set_chain(&e[1], "gke-gcloud-auth", "kubectl", "warp");
+
+    dyn_entry_fill(&e[2], "/usr/bin/gcloud-helper", PIN_SHA_C,
+                   "/home/u/gcloud/credentials.db",
+                   "gcloud-helper --format=json", "ccccccccccccccc1",
+                   (time_t)1700060002);
+    dyn_entry_set_chain(&e[2], "gke-gcloud-auth", "kubectl", "zsh");
+
+    fanotify_load_dyn_allowlist(e, 3);
+
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == 0 && removed == 1,
+           "only the same-chain duplicate is pruned");
+
+    n = persist_load(g_dyn_allow_file, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "the warp grant and the newest zsh grant survive");
+    ASSERT(strcmp(out[0].rule_id, "bbbbbbbbbbbbbbb1") == 0 &&
+               strcmp(out[1].rule_id, "ccccccccccccccc1") == 0,
+           "survivors are the warp and the newest zsh entries");
+
+    removed = -1;
+    ASSERT(fanotify_prune_dyn_list(0, &removed) == 0 && removed == 0,
+           "a second prune finds no cross-chain duplicates");
 }
 
 /*
@@ -3028,6 +3090,7 @@ int main(void) {
     test_dyn_clear();
     test_dyn_prune();
     test_dyn_prune_interleaved();
+    test_dyn_prune_chain_separation();
     test_dyn_write_failure_restores();
     test_cmdline_fingerprint_full();
     test_defer_flush_contract();
