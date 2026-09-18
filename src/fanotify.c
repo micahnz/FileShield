@@ -1716,13 +1716,21 @@ static int nearest_existing_ancestor(const char *path, char *out,
     return 0;
 }
 
-/* Init-namespace mount that would be marked for `path` (the nearest
- * existing ancestor when it does not exist yet).  0 when unknown. */
+/* Init-namespace mount that would be marked for `path`: the mount of the
+ * path itself when it exists, else the nearest existing ancestor (the
+ * path a mount mark would actually be attached to).  0 when unknown.
+ *
+ * stat() must come first: nearest_existing_ancestor() presumes the path
+ * is missing and starts by stripping the last component, so walking an
+ * existing path would compare its parent's mount instead of the mount
+ * that will actually be marked. */
 static unsigned long long mark_target_mount_id(const char *path)
 {
     char ancestor[PATH_MAX];
     struct stat st;
 
+    if (stat(path, &st) == 0)
+        return mount_id_of(path);
     if (!nearest_existing_ancestor(path, ancestor, sizeof(ancestor), &st))
         return 0;
     return mount_id_of(ancestor);

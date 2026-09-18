@@ -2745,6 +2745,58 @@ static void test_scope_guard(void) {
 }
 
 /*
+ * Part 0f: an existing protected path must resolve to the mount it is
+ * actually marked on, not the mount of its parent.  mark_target_mount_id()
+ * called nearest_existing_ancestor() unconditionally, so a mount point
+ * like /dev compared equal to the root mount: a root-anchored config path
+ * (or a state directory on the root mount) was falsely flagged as sharing
+ * a mount with the protected path.  Pre-fix this fails wherever
+ * statx(STATX_MNT_ID) is available; without it the check SKIPs.
+ */
+static void test_scope_guard_existing_path_mount(void) {
+    static Config cfg;
+    Config *saved = g_config;
+    unsigned long long id_dev = fanotify_test_mount_id("/dev");
+    unsigned long long id_tmp = fanotify_test_mount_id("/tmp");
+    unsigned long long id_root = fanotify_test_mount_id("/");
+    char config_path[80];
+
+    if (id_dev == 0 || id_tmp == 0) {
+        printf("SKIP: statx mount IDs unavailable; existing-path mount resolution check skipped\n");
+        return;
+    }
+    if (id_dev == id_tmp || id_dev == id_root) {
+        printf("SKIP: /dev is not a separate mount; existing-path mount resolution check skipped\n");
+        return;
+    }
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.protected[0].path, sizeof(cfg.protected[0].path), "/dev");
+    cfg.protected_count = 1;
+    g_config = &cfg;
+
+    /*
+     * A root-anchored path that does not exist resolves to the root mount
+     * both before and after the fix (stat fails and the ancestor walk
+     * lands on "/"), so a refusal here can only come from /dev resolving
+     * to its parent (root) instead of its own mount.  This makes the pin
+     * host-independent: it holds wherever /dev is its own mount.
+     */
+    snprintf(config_path, sizeof(config_path),
+             "/fileshield-scope-guard-%d.conf", (int)getpid());
+    ASSERT(fanotify_scope_guard(config_path) == 0,
+           "existing protected path is compared by its own mount, not its parent's");
+
+    /* The realistic shape: a config path on another mount is accepted. */
+    snprintf(config_path, sizeof(config_path),
+             "/tmp/scope-guard-conflict-%d.conf", (int)getpid());
+    ASSERT(fanotify_scope_guard(config_path) == 0,
+           "scope guard accepts an existing path on a separate mount");
+
+    g_config = saved;
+}
+
+/*
  * Part 1b: the shutdown drain denies and closes every permission event the
  * kernel still holds.  A socketpair stands in for the group fd: drain()
  * reads event metadata from it and writes fanotify responses back, exactly
@@ -3197,6 +3249,7 @@ int main(void) {
     test_mark_mask_rejects_fid_events();
     test_mark_paths();
     test_scope_guard();
+    test_scope_guard_existing_path_mount();
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_merge_proc_environ();
