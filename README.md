@@ -487,7 +487,7 @@ The files stay plain root-only JSON, so manual inspection still works (`sudo cat
 
 ```text
 fileshield-cli list [rules|allow|deny|pins]     # no argument: all three tables
-fileshield-cli describe allow|deny|pin <ID>     # every stored field and digest
+fileshield-cli describe allow|deny|pin [ID]     # every field/digest; all when no ID
 fileshield-cli remove allow|deny|pin <ID>...    # asks [y/N] unless -y
 fileshield-cli clear allow|deny|pins            # asks [y/N] unless -y
 fileshield-cli prune [allow|deny] [-n]          # lists groups, asks [y/N] unless -y
@@ -526,7 +526,7 @@ c54d92cd  /nix/store/.../binary    2026-09-12 13:52:33
 
 Every persisted allow/deny rule stores a **16-character lowercase hex rule ID**; tables show the first 8 characters by default and all 16 with `--wide`, while `describe` always prints the full ID together with every recorded digest. Pin IDs are not stored: they are derived from the pin's canonical binary pattern (the first 16 hex characters of SHA-512 over the pattern) whenever they are needed.
 
-Commands that take an ID accept the full 16 characters or any **unambiguous prefix of at least 8 characters**. A shorter, non-hex or ambiguous prefix is rejected and nothing is removed, so add characters to pick between candidates.
+Commands that take an ID accept the full 16 characters or any **unambiguous prefix of at least 8 characters**. A shorter, non-hex or ambiguous prefix is rejected before anything happens and the error asks for the full ID to tell the candidates apart; `describe allow|deny|pin` with no ID prints every entry of that kind so the IDs can be read off.
 
 ### Reads, mutations and the control socket
 
@@ -541,7 +541,7 @@ Commands that take an ID accept the full 16 characters or any **unambiguous pref
 
 ### Prune
 
-A rebuilt or updated binary stops matching its old _Always_ entry (the stored binary SHA-512 changed), so the next prompt records a new entry and leaves the old one behind as a stale duplicate. `prune` groups entries that share the same **binary path, target file, raw command line and call chain** (digests are deliberately not part of the key), keeps the newest entry of each group and removes the rest — exact duplicates collapse to one. It never hashes a binary and never opens a path. Every matched group is listed with its duplicate count before the confirmation prompt; `-n`/`--dry-run` lists and exits without touching anything, and `-y` skips the prompt. The same grouping runs inside the daemon when it applies a live prune, so memory and disk stay consistent.
+A rebuilt or updated binary stops matching its old _Always_ entry (the stored binary SHA-512 changed), so the next prompt records a new entry and leaves the old one behind as a stale duplicate. `prune` groups entries that share the same **binary path, target file, raw command line and call chain** (digests are deliberately not part of the key), keeps the newest entry of each group and removes the rest — exact duplicates collapse to one. It never hashes a binary and never opens a path. Every matched group is listed with its duplicate count before the confirmation prompt; when nothing matches, it prints `there are no results to prune` and exits without prompting. `-n`/`--dry-run` lists and exits without touching anything, and `-y` skips the prompt. The same grouping runs inside the daemon when it applies a live prune, so memory and disk stay consistent.
 
 ### Confirmation
 

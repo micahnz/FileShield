@@ -28,7 +28,7 @@
 #include "prune.h"
 #include "ruleid.h"
 
-#define CLI_VERSION "2.0.0"
+#define CLI_VERSION "0.1.0"
 
 /*
  * `session list` can show both 256-entry tables at once.  A payload line
@@ -47,6 +47,9 @@ static int g_json; /* --json: machine-readable list/describe */
 /* Allocated on first socket use so read-only commands never pay for it. */
 static char *g_resp_buf;
 
+/* argv[0], so per-command usage hints name the same binary as the help. */
+static const char *g_prog = "fileshield-cli";
+
 /* ------------------------------------------------------------------ */
 /*  small helpers                                                      */
 /* ------------------------------------------------------------------ */
@@ -58,7 +61,7 @@ static void print_usage(FILE *f, const char *prog)
             "\n"
             "Commands:\n"
             "  list [rules|allow|deny|pins]     list entries (default: all)\n"
-            "  describe allow|deny|pin <ID>     full description of one entry\n"
+            "  describe allow|deny|pin [ID]     full description (all when no ID)\n"
             "  remove allow|deny|pin <ID>...    remove entries by ID\n"
             "  clear allow|deny|pins            remove every entry\n"
             "  prune [allow|deny]               remove stale duplicate rules\n"
@@ -78,6 +81,43 @@ static void print_usage(FILE *f, const char *prog)
             "\n"
             "IDs are the first 8+ hex characters of an entry's rule ID.\n",
             prog);
+}
+
+/* One concrete command line under an error message, so a usage mistake
+ * shows what to type next instead of only what went wrong. */
+static void usage_hint(const char *syntax)
+{
+    fprintf(stderr, "usage: %s %s\n", g_prog, syntax);
+}
+
+/*
+ * Ambiguous ID prefix (or duplicate full IDs in a hand-edited file): no
+ * action is taken anywhere this is called.  An abbreviated prefix gets
+ * told to use the full ID; a full-length collision cannot be split this
+ * way and says so.
+ */
+static void print_ambiguous(const char *kind, const char *input)
+{
+    if (!input)
+    {
+        fprintf(stderr,
+                "error: the ID matches more than one %s; use the full "
+                "%d-character ID to differentiate\n",
+                kind, RULEID_HEX_LEN);
+        return;
+    }
+    if (strlen(input) >= RULEID_HEX_LEN)
+    {
+        fprintf(stderr,
+                "error: %s matches more than one %s even at full length "
+                "(duplicate stored IDs); nothing changed\n",
+                input, kind);
+        return;
+    }
+    fprintf(stderr,
+            "error: %s matches more than one %s; use the full %d-character "
+            "ID to differentiate\n",
+            input, kind, RULEID_HEX_LEN);
 }
 
 static const char *rule_path(int deny)
@@ -278,8 +318,7 @@ static int resolve_rule_set(const PersistEntry *entries, int count,
         }
         if (rc == -2)
         {
-            fprintf(stderr, "error: %s matches more than one rule\n",
-                    inputs[i]);
+            print_ambiguous("rule", inputs[i]);
             return -1;
         }
         memcpy(full[i], entries[indices[i]].rule_id,
@@ -308,8 +347,7 @@ static int resolve_pin_set(const PinRecord *rows, int count,
         }
         if (rc == -2)
         {
-            fprintf(stderr, "error: %s matches more than one pin\n",
-                    inputs[i]);
+            print_ambiguous("pin", inputs[i]);
             return -1;
         }
     }
@@ -452,6 +490,7 @@ static int cmd_list(const char *filter)
         {
             fprintf(stderr, "error: unknown list filter: %s "
                             "(expected rules|allow|deny|pins)\n", filter);
+            usage_hint("list [rules|allow|deny|pins]");
             return 2;
         }
     }
@@ -513,9 +552,13 @@ static int cmd_list(const char *filter)
     }
     else if (rc == 0)
     {
-        if (want_allow || want_deny)
+        int rules_shown = want_allow || want_deny;
+
+        if (rules_shown)
             cli_ui_render_rules(stdout, rule_rows, n_rules,
                                 cli_ui_terminal_width(stdout), g_wide);
+        if (rules_shown && want_pins)
+            fputc('\n', stdout); /* visually split the two tables */
         if (want_pins)
             cli_ui_render_pins(stdout, pin_rows, n_pins,
                                cli_ui_terminal_width(stdout), g_wide);
@@ -539,16 +582,50 @@ static int cmd_describe(const char *kind, const char *input)
     if (strcmp(kind, "pin") == 0)
     {
         PinRecord *pins = NULL;
-        int np = 0, idx = -1;
-        int rc;
+        int np = 0;
 
         if (load_pins(&pins, &np) < 0)
             return 1;
-        rc = resolve_pin(pins, np, input, &idx, (char[RULEID_HEX_LEN + 1]){0});
+
+        if (!input)
+        {
+            /* `describe pin` with no ID describes every pin, in the same
+             * oldest-updated-first order list uses. */
+            CliPinRow *rows = calloc((size_t)np + 1, sizeof(*rows));
+            int nr = 0;
+
+            if (!rows)
+            {
+                fprintf(stderr, "error: out of memory\n");
+                free(pins);
+                return 1;
+            }
+            build_pin_rows(pins, np, rows, &nr);
+            if (g_json)
+                cli_ui_render_list_json(stdout, CLI_UI_SECTION_PINS, NULL, 0,
+                                        rows, nr, NULL, 0, time(NULL));
+            else
+            {
+                for (int i = 0; i < nr; i++)
+                {
+                    if (i > 0)
+                        putchar('\n');
+                    cli_ui_render_pin_describe(stdout, &rows[i]);
+                }
+            }
+            free(rows);
+            free(pins);
+            return 0;
+        }
+
+        int idx = -1;
+        int rc = resolve_pin(pins, np, input, &idx,
+                             (char[RULEID_HEX_LEN + 1]){0});
+
         if (rc == 0)
             fprintf(stderr, "error: no pin matches %s\n", input);
         else if (rc == -2)
-            fprintf(stderr, "error: %s matches more than one pin\n", input);
+            print_ambiguous("pin", input);
         else if (rc == -1)
             fprintf(stderr, "error: invalid pin ID: %s\n", input);
         if (rc != 1)
@@ -576,21 +653,60 @@ static int cmd_describe(const char *kind, const char *input)
     {
         fprintf(stderr, "error: unknown describe type: %s "
                         "(expected allow|deny|pin)\n", kind);
+        usage_hint("describe allow|deny|pin [ID]");
         return 2;
     }
 
     PersistEntry *entries = NULL;
-    int count = 0, idx = -1;
+    int count = 0;
 
     if (load_entries(deny, &entries, &count) < 0)
         return 1;
+
+    if (!input)
+    {
+        /* `describe allow|deny` with no ID describes every rule of that
+         * list, oldest creation first, separated for readability. */
+        CliRuleRow *rows = calloc((size_t)count + 1, sizeof(*rows));
+        int nr = 0;
+
+        if (!rows)
+        {
+            fprintf(stderr, "error: out of memory\n");
+            free(entries);
+            return 1;
+        }
+        if (deny)
+            build_rule_rows(NULL, 0, entries, count, rows, &nr);
+        else
+            build_rule_rows(entries, count, NULL, 0, rows, &nr);
+        if (g_json)
+            cli_ui_render_list_json(stdout,
+                                    deny ? CLI_UI_SECTION_DENY
+                                         : CLI_UI_SECTION_ALLOW,
+                                    rows, nr, NULL, 0, NULL, 0, time(NULL));
+        else
+        {
+            for (int i = 0; i < nr; i++)
+            {
+                if (i > 0)
+                    putchar('\n');
+                cli_ui_render_rule_describe(stdout, &rows[i]);
+            }
+        }
+        free(rows);
+        free(entries);
+        return 0;
+    }
+
+    int idx = -1;
     int rc = resolve_rule(entries, count, input, &idx);
+
     if (rc == 0)
         fprintf(stderr, "error: no %s rule matches %s\n", rule_label(deny),
                 input);
     else if (rc == -2)
-        fprintf(stderr, "error: %s matches more than one %s rule\n", input,
-                rule_label(deny));
+        print_ambiguous("rule", input);
     else if (rc == -1)
         fprintf(stderr, "error: invalid rule ID: %s\n", input);
     if (rc != 1)
@@ -1047,13 +1163,14 @@ static void print_prune_groups(int deny, const PersistEntry *entries,
     }
 }
 
+/* Report the duplicate groups of one list; returns the group count,
+ * or -1 on a read/allocation/analysis failure. */
 static int prune_list(int deny)
 {
     PersistEntry *entries = NULL;
     int count = 0, ngroups = 0, nremovals = 0;
     PruneGroup *groups;
     int *removals;
-    int rc = 0;
 
     if (load_entries(deny, &entries, &count) < 0)
         return -1;
@@ -1078,17 +1195,18 @@ static int prune_list(int deny)
     if (ngroups < 0)
     {
         fprintf(stderr, "error: could not analyze %s\n", rule_path(deny));
-        rc = -1;
+        free(groups);
+        free(removals);
+        free(entries);
+        return -1;
     }
-    else if (ngroups > 0)
-    {
+    if (ngroups > 0)
         print_prune_groups(deny, entries, groups, ngroups);
-    }
 
     free(groups);
     free(removals);
     free(entries);
-    return rc;
+    return ngroups;
 }
 
 static int prune_apply_local(int deny)
@@ -1164,6 +1282,7 @@ static int cmd_prune(const char *which)
         {
             fprintf(stderr, "error: unknown prune filter: %s "
                             "(expected allow|deny)\n", which);
+            usage_hint("prune [allow|deny] [-n]");
             return 2;
         }
     }
@@ -1173,10 +1292,30 @@ static int cmd_prune(const char *which)
      * can hold entries whose state-file write failed earlier, so its
      * prune may remove a group this report never showed; the daemon's
      * removed count (printed below) stays authoritative. */
-    if (want_allow && prune_list(0) < 0)
-        return 1;
-    if (want_deny && prune_list(1) < 0)
-        return 1;
+    int total_groups = 0;
+
+    if (want_allow)
+    {
+        int g = prune_list(0);
+
+        if (g < 0)
+            return 1;
+        total_groups += g;
+    }
+    if (want_deny)
+    {
+        int g = prune_list(1);
+
+        if (g < 0)
+            return 1;
+        total_groups += g;
+    }
+    if (total_groups == 0)
+    {
+        /* Nothing matched: no prompt, no socket round trip. */
+        printf("there are no results to prune\n");
+        return 0;
+    }
 
     if (g_dry)
     {
@@ -1484,8 +1623,7 @@ static int session_list_cmd(const char *list, const char *id, int describe)
         if (rc == 0)
             fprintf(stderr, "error: no session rule matches %s\n", id);
         else if (rc == -2)
-            fprintf(stderr, "error: %s matches more than one session rule\n",
-                    id);
+            print_ambiguous("session rule", id);
         else if (rc == -1)
             fprintf(stderr, "error: invalid rule ID: %s\n", id);
         if (rc != 1)
@@ -1586,8 +1724,7 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         if (rc == 0)
             fprintf(stderr, "error: no session rule matches %s\n", ids[i]);
         else if (rc == -2)
-            fprintf(stderr, "error: %s matches more than one session rule\n",
-                    ids[i]);
+            print_ambiguous("session rule", ids[i]);
         else if (rc == -1)
             fprintf(stderr, "error: invalid rule ID: %s\n", ids[i]);
         if (rc != 1)
@@ -1689,6 +1826,7 @@ static int session_cmd(char **args, int nargs)
     {
         fprintf(stderr, "error: session requires a subcommand "
                         "(list|describe|remove|clear)\n");
+        usage_hint("session list|describe|remove|clear [allow|deny] [ID]");
         return 2;
     }
     const char *sub = args[0];
@@ -1705,6 +1843,7 @@ static int session_cmd(char **args, int nargs)
         if (pos != nargs)
         {
             fprintf(stderr, "error: session list takes at most one list\n");
+            usage_hint("session list [allow|deny]");
             return 2;
         }
         return session_list_cmd(list, NULL, 0);
@@ -1717,7 +1856,9 @@ static int session_cmd(char **args, int nargs)
             id = args[pos++];
         if (pos != nargs || (id && !list && nargs > 2))
         {
-            fprintf(stderr, "error: session describe [allow|deny] [ID]\n");
+            fprintf(stderr, "error: session describe takes at most a list "
+                            "and an ID\n");
+            usage_hint("session describe [allow|deny] [ID]");
             return 2;
         }
         return session_list_cmd(list, id, 1);
@@ -1727,6 +1868,7 @@ static int session_cmd(char **args, int nargs)
         if (pos >= nargs)
         {
             fprintf(stderr, "error: session remove needs at least one ID\n");
+            usage_hint("session remove [allow|deny] <ID> [<ID>...]");
             return 2;
         }
         return session_remove_cmd(list, &args[pos], nargs - pos);
@@ -1736,12 +1878,14 @@ static int session_cmd(char **args, int nargs)
         if (pos != nargs)
         {
             fprintf(stderr, "error: session clear takes at most one list\n");
+            usage_hint("session clear [allow|deny]");
             return 2;
         }
         return session_clear_cmd(list);
     }
     fprintf(stderr, "error: unknown session subcommand: %s "
                     "(expected list|describe|remove|clear)\n", sub);
+    usage_hint("session list|describe|remove|clear [allow|deny] [ID]");
     return 2;
 }
 
@@ -1772,6 +1916,7 @@ static int cmd_reload(void)
 
 int main(int argc, char *argv[])
 {
+    g_prog = argv[0];
     static struct option long_opts[] = {
         {"yes", no_argument, 0, 'y'},
         {"dry-run", no_argument, 0, 'n'},
@@ -1820,24 +1965,28 @@ int main(int argc, char *argv[])
         if (rest > 1)
         {
             fprintf(stderr, "error: list takes at most one filter\n");
+            usage_hint("list [rules|allow|deny|pins]");
             return 2;
         }
         return cmd_list(rest == 1 ? argv[optind] : NULL);
     }
     if (strcmp(cmd, "describe") == 0)
     {
-        if (rest != 2)
+        if (rest < 1 || rest > 2)
         {
-            fprintf(stderr, "error: describe needs a type and an ID\n");
+            fprintf(stderr, "error: describe needs a type "
+                            "(and at most one ID)\n");
+            usage_hint("describe allow|deny|pin [ID]");
             return 2;
         }
-        return cmd_describe(argv[optind], argv[optind + 1]);
+        return cmd_describe(argv[optind], rest == 2 ? argv[optind + 1] : NULL);
     }
     if (strcmp(cmd, "remove") == 0)
     {
         if (rest < 2)
         {
             fprintf(stderr, "error: remove needs a type and at least one ID\n");
+            usage_hint("remove allow|deny|pin <ID> [<ID>...]");
             return 2;
         }
         if (strcmp(argv[optind], "pin") == 0)
@@ -1847,6 +1996,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: unknown remove type: %s "
                             "(expected allow|deny|pin)\n", argv[optind]);
+            usage_hint("remove allow|deny|pin <ID> [<ID>...]");
             return 2;
         }
         return remove_rules(deny, &argv[optind + 1], rest - 1);
@@ -1857,6 +2007,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: clear needs exactly one type "
                             "(allow|deny|pins)\n");
+            usage_hint("clear allow|deny|pins");
             return 2;
         }
         if (strcmp(argv[optind], "pins") == 0)
@@ -1866,6 +2017,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: unknown clear type: %s "
                             "(expected allow|deny|pins)\n", argv[optind]);
+            usage_hint("clear allow|deny|pins");
             return 2;
         }
         return clear_rules(deny);
@@ -1875,6 +2027,7 @@ int main(int argc, char *argv[])
         if (rest > 1)
         {
             fprintf(stderr, "error: prune takes at most one filter\n");
+            usage_hint("prune [allow|deny] [-n]");
             return 2;
         }
         return cmd_prune(rest == 1 ? argv[optind] : NULL);
@@ -1886,6 +2039,7 @@ int main(int argc, char *argv[])
         if (rest != 0)
         {
             fprintf(stderr, "error: reload takes no arguments\n");
+            usage_hint("reload");
             return 2;
         }
         return cmd_reload();
