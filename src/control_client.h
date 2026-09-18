@@ -41,14 +41,21 @@
  * is OK\n1\n<number>\n; control_response_scalar() reads it back.
  */
 
-/* Root-owned socket the daemon listens on. */
-#define CONTROL_SOCKET_PATH "/run/fileshield.sock"
+/*
+ * Root-owned socket the daemon listens on.  The parent directory is
+ * /run/fileshield: systemd creates it 0700 through the unit's
+ * RuntimeDirectory=, and a foreground/direct run creates it on demand
+ * (also 0700) before binding.
+ */
+#define CONTROL_SOCKET_PATH "/run/fileshield/control.sock"
 
 /*
- * Maximum request size, including the terminating newline (the server
- * reads up to CONTROL_REQ_MAX - 1 bytes in one bounded attempt).  A
- * request that does not fit, or that arrives without a newline, is
- * closed without a response: the CLI writes its single line up front.
+ * Maximum request size in bytes, including the terminating newline.
+ * The server reads at most CONTROL_REQ_MAX bytes per connection (its
+ * buffer is one byte larger for the NUL terminator), so a line of
+ * exactly this size including its newline is accepted.  A request that
+ * does not fit, or that arrives without a newline, is closed without a
+ * response: the CLI writes its single line up front.
  */
 #define CONTROL_REQ_MAX 4096
 

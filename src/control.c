@@ -35,18 +35,30 @@
  * starve the fanotify queue. */
 #define CONTROL_ACCEPT_MAX 8
 
+/* Read attempts per request line.  The CLI writes the request and its
+ * terminating newline with two send() calls, so one non-blocking read
+ * can return the request before the newline lands; a bounded retry
+ * collects the already-queued remainder.  No attempt ever waits, so a
+ * silent or slow client still costs at most this many immediate reads
+ * before the connection closes. */
+#define CONTROL_READ_MAX 8
+
 /* Source bytes escaped per chunk.  A 32-byte chunk expands to at most
  * 192 bytes of JSON plus the NUL, so the scratch stays tiny while a
  * PATH_MAX-sized field is streamed chunk by chunk. */
 #define CONTROL_ESCAPE_CHUNK 32
 
 /*
- * Path bound by the last successful control_setup_at().  teardown()
- * unlinks exactly this, so it can never unlink a caller-supplied or
- * never-bound path (unlink(2) on a socket fails harmlessly for a bound
- * one, but the type/owner checks must stay in setup).
+ * Identity of the socket bound by the last successful control_setup_at().
+ * teardown() unlinks exactly this path and only while the path still
+ * refers to this socket: the close() it performs first can race a
+ * concurrently restarting daemon that has already bound a fresh socket
+ * at the same path, and unlinking that socket would take the new
+ * daemon's listener down with it.
  */
 static char g_bound_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static struct stat g_bound_stat;
+static int g_bound_stat_valid;
 
 /* ------------------------------------------------------------------ */
 /* Request parsing                                                    */
@@ -549,6 +561,55 @@ static int dispatch(int fd, const ControlRequest *req)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Create the parent directory of 'path' when it is missing (mode 0700).
+ * The systemd unit gets /run/fileshield from RuntimeDirectory=, but a
+ * foreground/direct run must work without it.  Only the immediate
+ * parent is created -- production's /run always exists -- and an
+ * existing directory is left exactly as it is, so RuntimeDirectoryMode=
+ * wins.  An existing entry is accepted only when it really is a
+ * directory (root-owned when running as root), so a planted symlink or
+ * another user's directory cannot host the socket.  Returns 0 to
+ * proceed, -1 when the directory cannot be created (fail closed:
+ * bind() could not have succeeded either).
+ */
+static int ensure_parent_dir(const char *path)
+{
+    char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    const char *slash;
+    size_t len;
+    struct stat st;
+
+    slash = strrchr(path, '/');
+    if (!slash || slash == path)
+        return 0; /* no directory component, or the root directory */
+
+    len = (size_t)(slash - path);
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+
+    if (mkdir(dir, 0700) == 0)
+    {
+        log_msg(LOG_INFO, "control: created %s", dir);
+        return 0;
+    }
+    if (errno != EEXIST)
+    {
+        log_msg(LOG_ERR, "control: cannot create %s: %s", dir, strerror(errno));
+        return -1;
+    }
+
+    /* Already there (systemd's RuntimeDirectory=, or a previous run):
+     * use it only if it really is a directory this process can trust;
+     * a symlink or another user's directory must not receive the socket
+     * (fail closed). */
+    if (lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+        (geteuid() != 0 || st.st_uid == 0))
+        return 0;
+    log_msg(LOG_ERR, "control: %s exists but is not a usable directory", dir);
+    return -1;
+}
+
+/*
  * Make 'path' safe to bind: missing is fine; an existing socket owned by
  * us is unlinked only when no live listener answers on it; anything else
  * (regular file, directory, symlink, foreign owner) is refused because
@@ -654,6 +715,9 @@ int control_setup_at(const char *path)
         return -1;
     }
 
+    if (ensure_parent_dir(path) < 0)
+        return -1;
+
     if (clear_stale_socket(path) < 0)
         return -1;
 
@@ -701,6 +765,26 @@ int control_setup_at(const char *path)
         return -1;
     }
 
+    /* Record the exact inode this setup bound: teardown() uses it to
+     * tell this socket apart from one a concurrently restarting daemon
+     * binds at the same path.  Recording it must not fail closed into
+     * an unowned path. */
+    {
+        struct stat st;
+
+        if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
+        {
+            log_msg(LOG_ERR,
+                    "control: %s vanished or changed type after bind; "
+                    "refusing",
+                    path);
+            close(fd);
+            return -1;
+        }
+        g_bound_stat = st;
+        g_bound_stat_valid = 1;
+    }
+
     /* The pre-check above proved this fits. */
     memcpy(g_bound_path, path, path_len + 1);
     log_msg(LOG_INFO, "control: listening on %s", g_bound_path);
@@ -718,9 +802,26 @@ void control_teardown(int fd)
         close(fd);
     if (g_bound_path[0] != '\0')
     {
-        unlink(g_bound_path);
+        struct stat st;
+
+        /* The close above may have raced a restart that already bound a
+         * fresh socket at this path; only unlink the exact socket setup
+         * bound (same device and inode), and treat a vanished path as
+         * already cleaned up.  The lstat/unlink pair is not atomic, but
+         * it closes the restart window this daemon can observe. */
+        if (g_bound_stat_valid && lstat(g_bound_path, &st) == 0)
+        {
+            if (S_ISSOCK(st.st_mode) && st.st_dev == g_bound_stat.st_dev &&
+                st.st_ino == g_bound_stat.st_ino)
+                (void)unlink(g_bound_path);
+            else
+                log_msg(LOG_WARNING,
+                        "control: not unlinking %s (owned by another daemon)",
+                        g_bound_path);
+        }
         g_bound_path[0] = '\0';
     }
+    g_bound_stat_valid = 0;
 }
 
 void control_handle(int listen_fd)
@@ -744,12 +845,14 @@ void control_handle(int listen_fd)
 
 int control_handle_client(int fd)
 {
-    char line[CONTROL_REQ_MAX];
+    /* One byte spare for the NUL: CONTROL_REQ_MAX includes the newline. */
+    char line[CONTROL_REQ_MAX + 1];
     ControlRequest req;
     struct ucred cred;
     socklen_t cred_len = sizeof(cred);
     char *nl;
     ssize_t n;
+    size_t used = 0;
     int flags;
 
     if (fd < 0)
@@ -778,22 +881,46 @@ int control_handle_client(int fd)
         return 0;
     }
 
-    do
+    /*
+     * Accumulate one line with a bounded number of non-blocking reads.
+     * A single read can return the request before the CLI's separate
+     * newline send lands; only a line already in progress is retried, so
+     * a silent connection still costs one read.  Every attempt returns
+     * immediately -- a slow client is closed after at most
+     * CONTROL_READ_MAX of them, never waited for -- and the total is
+     * bounded by the buffer, so "oversized" still means past
+     * CONTROL_REQ_MAX including the newline.
+     */
+    for (int attempt = 0;
+         attempt < CONTROL_READ_MAX && used + 1 < sizeof(line); attempt++)
     {
-        n = read(fd, line, sizeof(line) - 1);
-    } while (n < 0 && errno == EINTR);
+        n = read(fd, line + used, sizeof(line) - 1 - used);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue; /* signal, not a client wait */
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && used > 0)
+                continue; /* the rest of the line may still be landing */
+            break;
+        }
+        if (n == 0)
+            break; /* peer closed */
+        used += (size_t)n;
+        if (memchr(line, '\n', used) != NULL)
+            break;
+    }
 
-    if (n <= 0)
+    if (used == 0)
     {
-        close(fd); /* EAGAIN: connected but silent; never wait */
+        close(fd); /* connected but silent; never wait */
         return 0;
     }
-    if (memchr(line, '\0', (size_t)n) != NULL)
+    if (memchr(line, '\0', used) != NULL)
     {
         close(fd); /* a request line cannot carry NUL bytes */
         return 0;
     }
-    nl = memchr(line, '\n', (size_t)n);
+    nl = memchr(line, '\n', used);
     if (!nl)
     {
         close(fd); /* partial or oversized: the CLI writes one whole line */

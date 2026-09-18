@@ -27,6 +27,12 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 StateDirectory=fileshield
 StateDirectoryMode=0700
+# The control socket lives in /run/fileshield, created 0700 by systemd
+# and removed when the service stops.  ProtectSystem=strict mounts the
+# hierarchy read-only; RuntimeDirectory= is one of the writable
+# exceptions, so control_setup() can bind() without opening /run itself.
+RuntimeDirectory=fileshield
+RuntimeDirectoryMode=0700
 UMask=0077
 RestrictSUIDSGID=yes
 ProtectProc=invisible
