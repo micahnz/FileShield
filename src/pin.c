@@ -216,6 +216,13 @@ static int has_duplicate_pattern(const PinRecord *out, int count,
  * -> (} with all three fields) S_IN_PINS -> (]) S_OUTSIDE -> (}) S_DONE.
  * An entry reaches 'out' only when it is complete, and the caller zeroes
  * 'out' on failure, so a damaged file never yields a partial table.
+ *
+ * Staging model: this function writes only into the caller's 'out'
+ * array.  pin_load_file() zeroes that array on -1, and pin_load()
+ * parses into g_stage and copies into g_pins only after a count came
+ * back, so a damaged file can neither publish a partial table nor
+ * silently drop one bad row from the live table.
+ *
  * Blank lines, comments (#) and unknown keys are tolerated; a second
  * "pins" array, junk after an entry close, an incomplete entry, a
  * duplicate pattern, a missing closer or more entries than max marks
@@ -415,6 +422,8 @@ static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
                     ok = 0;
                     break;
                 }
+                /* Complete, unique entry: the only point a draft is
+                 * allowed to reach 'out'. */
                 out[count] = cur->pin;
                 count++;
                 cur = NULL;
@@ -466,6 +475,9 @@ static int pin_read_entries(FILE *fp, const char *path, PinRecord *out,
     if (ferror(fp))
         ok = 0;
 
+    /* Every closer must have been seen and no entry may still be open:
+     * a file cut off at any point fails here instead of loading the
+     * prefix that was parsed so far. */
     if (!ok || !saw_pins || !closed_array || !closed_object ||
         state == S_IN_ENTRY)
     {
@@ -817,6 +829,8 @@ int pin_store(const char *pattern, const char *sha512)
     unsigned long snap_seq = g_pin_seq;
     memcpy(g_snapshot, g_pins, sizeof(g_pins));
 
+    /* One row per pattern: an existing pattern is refreshed in place,
+     * a new one takes the next slot while the table has room. */
     for (i = 0; i < g_pin_count; i++)
     {
         if (strcmp(g_pins[i].pattern, pattern) == 0)
@@ -932,6 +946,8 @@ int pin_remove_by_id(const char *id)
         return 0; /* well-formed prefix, but no pin matches it */
     }
 
+    /* Stage the removal like pin_store(): memory commits only after the
+     * rewritten file lands, and the compaction keeps table order. */
     snap_count = g_pin_count;
     snap_seq = g_pin_seq;
     memcpy(g_snapshot, g_pins, sizeof(g_pins));

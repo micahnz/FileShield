@@ -363,6 +363,9 @@ void cli_ui_render_rules(FILE *out, const CliRuleRow *rows, int count,
     if (!rows || count < 0)
         count = 0;
 
+    /* Widths start at the header width and grow to the raw content width:
+     * sanitization maps each control byte to exactly one '?', so raw
+     * strlen is already the display width. */
     for (i = 0; i < count; i++)
     {
         const PersistEntry *e = rows[i].entry;
@@ -387,7 +390,8 @@ void cli_ui_render_rules(FILE *out, const CliRuleRow *rows, int count,
     if (!wide)
     {
         /* Binary, ARG and TARGET share the leftover width equally; ID,
-         * Rule and CHAIN never shrink. */
+         * Rule and CHAIN never shrink.  The fixed sum carries the five
+         * inter-column gaps of the six columns. */
         int cap = flexible_cap(width, id_w + rule_w + chain_w + 5 * CLI_UI_GAP,
                                3);
 
@@ -400,6 +404,9 @@ void cli_ui_render_rules(FILE *out, const CliRuleRow *rows, int count,
             id_w, "ID", rule_w, "Rule", bin_w, "Binary", arg_w, "ARG",
             tgt_w, "TARGET", "CHAIN");
 
+    /* Dynamic cells go through the sanitizing tail-truncating shapers: the
+     * end of a path is its identifying part, and --wide lifts the width
+     * cap but never the sanitization. */
     for (i = 0; i < count; i++)
     {
         const CliRuleRow *r = &rows[i];
@@ -492,6 +499,10 @@ void cli_ui_render_sessions(FILE *out, const CliSessionRow *rows, int count,
     if (!rows || count < 0)
         count = 0;
 
+    /* SID and Expires are measured from rendered content (Expires is
+     * "until session ends" or a timestamp plus remaining time) and never
+     * shrink; only Binary and Target flex below.  Expires is last, so a
+     * narrow terminal overflows rather than hiding the deadline. */
     for (i = 0; i < count; i++)
     {
         char expbuf[CLI_UI_EXPIRES_TEXT_MAX];
@@ -515,7 +526,8 @@ void cli_ui_render_sessions(FILE *out, const CliSessionRow *rows, int count,
     if (!wide)
     {
         /* Binary and Target share the leftover width; SID and Expires
-         * are bounded by their content. */
+         * are bounded by their content.  The fixed sum carries the five
+         * inter-column gaps of the six columns. */
         int cap = flexible_cap(width,
                                id_w + rule_w + sid_w + exp_w + 5 * CLI_UI_GAP,
                                2);
@@ -551,7 +563,9 @@ void cli_ui_render_sessions(FILE *out, const CliSessionRow *rows, int count,
     }
 }
 
-/* Append a totals part, inserting ", " only when the whole part fits. */
+/* Append a totals part, inserting ", " only when the whole part fits.  A
+ * part that does not fit is dropped whole rather than truncated; the
+ * footer is one summary line and a partial count would misstate it. */
 static void totals_append(char *buf, size_t size, size_t *used,
                           const char *text)
 {
@@ -781,7 +795,9 @@ static void json_session_object(FILE *out, const CliSessionRow *row,
 /*
  * An array of rule objects filtered by is_deny (0 = allow, 1 = deny),
  * pretty-printed.  'indent' is the indentation of the enclosing key and
- * 'child' the object indentation.
+ * 'child' the object indentation.  The pre-scan keeps an empty array (or
+ * one filtered to empty) as a single-line [], while a populated array
+ * breaks lines around its objects.
  */
 static void json_rule_array(FILE *out, const char *indent, const char *child,
                             const CliRuleRow *rows, int count, int want_deny)
@@ -842,6 +858,9 @@ void cli_ui_render_list_json(FILE *out, unsigned sections,
 
     fputs("{\n", out);
 
+    /* One array per requested section in a fixed key order; unrequested
+     * sections are omitted entirely, never emitted empty.  `first` drives
+     * the separating commas between keys. */
     if ((sections & CLI_UI_SECTION_ALLOW) != 0)
     {
         fputs("  \"allow\": ", out);

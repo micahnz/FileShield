@@ -148,6 +148,10 @@ static void cache_insert_starttime(pid_t pid, unsigned long long starttime,
 
     now = mono_seconds();
 
+    /* One slot per (pid, binary, target): a refresh reuses its own
+     * slot, a new key takes the first free one, so the table stays
+     * dense up to the high-water mark and duplicate entries cannot
+     * shadow each other. */
     for (i = 0; i < cache_high; i++)
     {
         if (cache[i].pid != 0)
@@ -187,6 +191,9 @@ static void cache_insert_starttime(pid_t pid, unsigned long long starttime,
     if (free_slot >= cache_high)
         cache_high = free_slot + 1;
 
+    /* starttime is the PID-reuse key: cache_lookup() compares it with
+     * the requester's current /proc value and drops the slot when a
+     * recycled PID has moved on. */
     cache[free_slot].pid = pid;
     cache[free_slot].starttime = starttime;
     strncpy(cache[free_slot].binary_path, binary, PATH_MAX - 1);

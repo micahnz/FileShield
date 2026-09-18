@@ -71,8 +71,9 @@ int notify_ask(const NotifyRequest *req);
  * access); the preselected "Deny", window close, timeout, kdialog
  * failure and a NULL req all return NOTIFY_DENY with the old pin
  * untouched.  The grant rides on the same positive stdout-tag channel as
- * notify_ask().  Refuses to prompt without a non-root desktop session,
- * mirroring notify_ask() (fail closed).
+ * notify_ask().  When running as root, refuses to prompt without a
+ * detected non-root desktop session (every other failure path also
+ * denies and keeps the old pin).
  */
 int notify_ask_hash_change(const NotifyHashChange *req);
 

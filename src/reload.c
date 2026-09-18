@@ -132,11 +132,13 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
     int failures = install_marks(fan_fd, new_cfg, "reload", &skipped);
 
     /* Fail closed: never leave the daemon partially or fully
-     * unprotected.  A failed (or protection-less) reload rolls back to
-     * the previous mark set and keeps the old config; if even that
-     * cannot be restored, shut down so systemd restarts from a clean
-     * state.  Config paths that do not exist yet (rc 1) are skipped,
-     * not fatal. */
+     * unprotected.  Three rejection triggers: some mark failed to install,
+     * the new config protects nothing (every entry is an exclusion), or
+     * every install was skipped so no mark went active.  A failed (or
+     * protection-less) reload rolls back to the previous mark set and
+     * keeps the old config; if even that cannot be restored, shut down so
+     * systemd restarts from a clean state.  Config paths that do not exist
+     * yet (rc 1) are skipped, not fatal. */
     if (failures > 0 ||
         new_cfg->protected_count - new_cfg->exclude_count <= 0 ||
         !fanotify_any_mark_active())
@@ -177,6 +179,9 @@ int reload_protection(int fan_fd, const char *config_path, Config **cfg)
         return g_fatal ? -1 : 0;
     }
 
+    /* Accepted: the new mark set is live with at least one active mark and
+     * no install failures.  Only now is the old config released, so the
+     * caller's pointer stays valid on every rejected path above. */
     log_msg(LOG_INFO,
             "config reloaded, watching %d paths (%d exclusions, "
             "%d missing, covered by mount marks)",

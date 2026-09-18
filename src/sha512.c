@@ -327,6 +327,13 @@ void sha512_set_wait_hook(void (*hook)(void))
  * Read sha512sum's stdout until EOF (or the buffer is full), enforce the
  * deadline, reap the child and validate the digest.  Output format:
  * "<128-hex-digits>  <filename>\n"; only the first 128 bytes are used.
+ *
+ * fd is the read end of the helper's stdout pipe and is owned here: every
+ * return path closes it, and the caller must not close fd or reap pid.
+ * Wait protocol: the child gets SHA512_TIMEOUT_S to produce the digest; a
+ * short read or timeout kills it immediately, while a full digest still
+ * gets REAP_DEADLINE_S to exit before the same bounded SIGKILL reap
+ * (kill_helper_bounded never blocks the event loop).
  */
 static int collect_digest(int fd, pid_t pid, const char *label,
                           char hex_out[129])
@@ -366,7 +373,7 @@ static int collect_digest(int fd, pid_t pid, const char *label,
             continue;
         }
         if (pr < 0)
-            break;
+            break; /* poll error: fail like a short read (kill, -1) */
 
         ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
         if (n < 0 && errno == EINTR)
@@ -467,6 +474,9 @@ int sha512_file(const char *path, char hex_out[129])
     if (pid == 0)
     {
         close(pipefd[0]);
+        /* dup2() clears CLOEXEC on the copy: after exec the helper's
+         * stdout is the pipe, while the O_CLOEXEC original is closed here
+         * so no descriptor leaks. */
         if (dup2(pipefd[1], STDOUT_FILENO) < 0)
             _exit(127);
         close(pipefd[1]);

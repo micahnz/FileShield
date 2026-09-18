@@ -106,6 +106,8 @@ int control_request_parse(char *line, ControlRequest *out)
         return -1;
     memset(out, 0, sizeof(*out));
     out->list = -1;
+    /* Default reason first: every early return below -- including the
+     * NULL-line one -- must leave a printable error (control.h). */
     out->error = "invalid request";
     if (!line)
         return -1;
@@ -179,6 +181,9 @@ int control_request_parse(char *line, ControlRequest *out)
 
     if (spec->first_id >= 0)
     {
+        /* first_id is an argument index (verb excluded), so argument i
+         * lives at fields[1 + i]; the spec's max_args already bounded
+         * the count by CONTROL_MAX_IDS. */
         for (int i = spec->first_id; i < args; i++)
             out->ids[out->id_count++] = fields[1 + i];
     }
@@ -670,6 +675,8 @@ static int clear_stale_socket(const char *path)
         paddr.sun_family = AF_UNIX;
         memcpy(paddr.sun_path, path, strlen(path) + 1);
         prc = connect(probe, (struct sockaddr *)&paddr, sizeof(paddr));
+        /* close() may clobber errno; the probe verdict below uses
+         * connect()'s. */
         saved = errno;
         close(probe);
         errno = saved;
@@ -772,6 +779,9 @@ int control_setup_at(const char *path)
     {
         struct stat st;
 
+        /* No unlink on failure: the path no longer provably refers to
+         * the socket just bound, so removing it could destroy another
+         * process's object (a concurrent restart's listener included). */
         if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
         {
             log_msg(LOG_ERR,
@@ -867,6 +877,9 @@ int control_handle_client(int fd)
         return -1;
     }
 
+    /* Kernel-authenticated peer identity; the 0600 socket mode already
+     * gates the path, but the per-connection check is authoritative and
+     * a short reply is as unusable as an error. */
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0 ||
         cred_len != sizeof(cred))
     {
@@ -917,7 +930,9 @@ int control_handle_client(int fd)
     }
     if (memchr(line, '\0', used) != NULL)
     {
-        close(fd); /* a request line cannot carry NUL bytes */
+        /* A NUL would silently end the string for every check and the
+         * parser below, masking a malformed request. */
+        close(fd);
         return 0;
     }
     nl = memchr(line, '\n', used);

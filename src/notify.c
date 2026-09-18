@@ -392,6 +392,8 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
 {
     memset(out, 0, sizeof(*out));
 
+    /* 1. Explicitly configured display (unit override or manual run):
+     * trusted as-is; only the session uid needs resolving. */
     const char *env_wayland = getenv("WAYLAND_DISPLAY");
     const char *env_display = getenv("DISPLAY");
 
@@ -444,6 +446,8 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
         return 0;
     }
 
+    /* 2. The requester's own session: the prompt must never be shown to
+     * a different user. */
     if (preferred_uid != (uid_t)-1 && preferred_uid != 0)
     {
         if (find_wayland_session((unsigned long)preferred_uid, out))
@@ -454,6 +458,14 @@ static int detect_display_session(uid_t preferred_uid, DisplaySession *out)
         return 0;
     }
 
+    /*
+     * 3. Last resort for an unknown requester: the first active Wayland
+     * session under /run/user.  Auto-detection is Wayland-only because
+     * an X11 DISPLAY cannot be resolved to a user (the server socket
+     * sits in the shared /tmp/.X11-unix, not under a per-user
+     * directory), so an X11 session must arrive through the explicit
+     * environment above.
+     */
     DIR *top = opendir("/run/user");
     if (!top)
         return 0;
@@ -787,6 +799,11 @@ static int run_kdialog_menu(const DisplaySession *session,
         return -1;
     }
 
+    /*
+     * Phase 1 (child): drop to the desktop user, export the detected
+     * session environment, and exec timeout/kdialog with stdout on the
+     * pipe.  Never returns.
+     */
     if (pid == 0)
     {
         /* Same child posture as run_kdialog: own process group, session
@@ -808,6 +825,8 @@ static int run_kdialog_menu(const DisplaySession *session,
          * --menu tag/item pairs by one (a selected row would then echo a
          * wrong token and deny — the exact bug an earlier build shipped
          * with).  The KF6 --menu shape is: --menu TEXT tag item [...]. */
+        /* Sizing: timeout + seconds + kdialog + --title + title + --menu
+         * + TEXT (7), then 2 per row, the optional --default pair, NULL. */
         char *argv[7 + 2 * DIALOG_MENU_MAX_ITEMS + 2 + 1];
         int n = 0;
         argv[n++] = "/usr/bin/timeout";
@@ -838,6 +857,12 @@ static int run_kdialog_menu(const DisplaySession *session,
     log_msg(LOG_DEBUG, "[dialog] forked kdialog menu child pid=%d", (int)pid);
     close(pipefd[1]);
 
+    /*
+     * Phase 2: pump fanotify events while the dialog is open -- a
+     * pending permission event on a mount mark would otherwise deadlock
+     * the opener -- and reap the child.  Ends on child exit, the
+     * deadline, or shutdown (the dialog is then killed, which denies).
+     */
     int child_exited = 0;
     int status = 0;
     long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
@@ -863,6 +888,8 @@ static int run_kdialog_menu(const DisplaySession *session,
             nfds = 1;
         }
 
+        /* With no fanotify fd this is a bounded sleep; the 200 ms tick
+         * keeps waitpid polling without busy-looping. */
         int ret = poll(nfds ? &pfd : NULL, (nfds_t)nfds, 200);
         if (ret < 0)
         {
@@ -899,7 +926,9 @@ static int run_kdialog_menu(const DisplaySession *session,
     log_msg(LOG_DEBUG, "[dialog] kdialog menu exited status=0x%x ec=%d",
             status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 
-    /* The child flushed its stdout before exiting (kdialog prints the tag
+    /* Phase 3: stdout token drain.
+     *
+     * The child flushed its stdout before exiting (kdialog prints the tag
      * then leaves, and the write is far below the pipe capacity), so one
      * non-blocking drain after the reap captures the token.  Anything
      * unexpected — no data, oversized, no newline — leaves an empty or
@@ -968,9 +997,10 @@ typedef struct
  * One menu prompt replaces the old two-stage button flow.  Every outcome
  * is an explicit row choice reported by kdialog on stdout; Cancel, window
  * close, timeouts, exec failures and every runtime error leave no token
- * and deny (see run_kdialog_menu).  The first row is the mildest grant:
- * focus lands there, so Enter confirms only the least-permissive allow,
- * and a persistent rule takes selecting "always" deliberately.
+ * and deny (see run_kdialog_menu).  The Deny Once row is preselected via
+ * --default, so an accidental Enter denies this attempt; every grant
+ * takes a deliberate row selection, and a persistent grant takes the
+ * "Allow Always" row.
  */
 int notify_ask(const NotifyRequest *req)
 {
@@ -1097,6 +1127,8 @@ int notify_ask(const NotifyRequest *req)
     snprintf(label_deny_always, sizeof(label_deny_always),
              "Deny Always - %s", deny_always_desc);
 
+    /* Tags are the wire contract with menu_token_to_decision(): labels
+     * are for the user, tags are matched byte-for-byte after the prompt. */
     const DialogMenuItem items[] = {
         { "once",          label_once },
         { "session",       label_session },
@@ -1117,6 +1149,7 @@ int notify_ask(const NotifyRequest *req)
      * Any escape failure or snprintf truncation leaves `body` on the
      * plain msg built above: readable, unstyled, never half-markup.
      */
+    /* Worst-case escape growth: 5 bytes per input byte ("&amp;"). */
     char e_comm[64 * 5 + 1];
     char e_pcomm[64 * 5 + 1];
     char e_exe[512 * 5 + 1];
@@ -1179,6 +1212,8 @@ int notify_ask(const NotifyRequest *req)
             body = html;
     }
 
+    /* Run the menu, then re-vet the returned tag: a zero exit alone is
+     * not a grant (empty and unknown tokens map to NOTIFY_DENY). */
     char token[DIALOG_TOKEN_MAX];
     int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body,
                              label_deny,
@@ -1246,8 +1281,8 @@ int notify_ask_hash_change(const NotifyHashChange *req)
                   new_hash, sizeof(new_hash));
 
     /*
-     * kdialog's message body renders as rich text (KMessageBox builds a
-     * Qt::AutoText QLabel), so every interpolated value must arrive as
+     * kdialog's --menu body renders as rich text (Qt::AutoText QLabel,
+     * like notify_ask()'s body), so every interpolated value must arrive as
      * entities: sanitize_text() leaves '<', '>' and '&' alone, which a
      * crafted file name could otherwise use to inject markup into the
      * prompt itself.  Each escape buffer holds the worst case (5 bytes
@@ -1336,6 +1371,8 @@ int notify_ask_hash_change(const NotifyHashChange *req)
                              "Deny", items,
                              (int)(sizeof(items) / sizeof(items[0])), token,
                              sizeof(token));
+    /* Update tag only: a normal zero exit is not a grant by itself, and
+     * the preselected "deny" row lands in the deny branch below. */
     if (r == 1 && strcmp(token, "update") == 0)
     {
         log_msg(LOG_WARNING,

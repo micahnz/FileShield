@@ -102,7 +102,8 @@ typedef struct
     const char *binary;
     const char *target;
     /* Seconds left; negative means the entry lives until the session
-     * leader exits (the design's TTL 0; cli.c maps 0 to -1). */
+     * leader exits.  The daemon puts -1 on the wire for TTL 0; cli.c
+     * stores that value verbatim. */
     long ttl_remaining;
 } CliSessionRow;
 

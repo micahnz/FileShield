@@ -175,6 +175,8 @@ static int commit_atomic_temp(FILE *fp, const char *tmp_file,
         return -1;
     }
 
+    /* An error surfacing at close must fail the write before the rename
+     * can publish the file. */
     if (fclose(fp) < 0)
     {
         log_msg(LOG_ERR, "%s: close %s: %s", what, tmp_file, strerror(errno));
@@ -338,6 +340,15 @@ static void copy_field(const char *filepath, char *dst, size_t dstsz,
  * A plain %[^"] sscanf scan cannot handle escaped quotes, which command
  * lines contain routinely (`sh -c "..."`), so the value is decoded
  * escape-aware instead.  Returns 0 for numeric fields or malformed input.
+ *
+ * Keys are writer-generated and never contain escapes or ':', so the
+ * first quoted token and the first ':' locate the pair; anything after
+ * the closing quote (the writer's optional comma) is ignored.  out must
+ * hold the decoded value plus its NUL: a value that does not fit
+ * returns 0 with out left empty, and the caller falls through to its
+ * numeric parser.  Accepted escapes are JSON's \" \\ \/ \b \f \n \r
+ * \t and \uXXXX; an unknown escape, a raw control byte, \u0000 (not
+ * representable in a C string) or a lone surrogate all return 0.
  */
 int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
                                 char *out, size_t outsz)
@@ -350,6 +361,8 @@ int persist_json_extract_string(const char *line, char *key_out, size_t keysz,
         return 0;
     out[0] = '\0';
 
+    /* Key scan: keys are writer-generated and escape-free, so a plain
+     * quoted token suffices; the value is decoded escape-aware below. */
     if (sscanf(line, " \"%255[^\"]\"", found_key) != 1)
         return 0;
 
@@ -665,14 +678,26 @@ static int apply_rule_id(const char *filepath, PersistEntry *e,
  *   }
  *
  * Each line holds at most one "key": "value" string pair or one numeric
- * field.  Blank lines, comments (#) and unknown keys are tolerated;
- * structural incompleteness (no "entries" array, missing ] or }, an
- * entry cut off mid-way), a malformed line, or a line longer than
- * JSON_LINE_MAX (which the writer can never emit) returns -1: the
- * caller then clears the in-memory lists (fail secure) and the journal
- * records the damage.  A line without a rule_id is legacy state and
- * loads with an empty ID (the daemon assigns one when migrating); a
- * present-but-malformed rule_id drops only that entry, never the file.
+ * field.  Blank lines, comments (#) and unknown keys are tolerated.
+ * Damage is layered by what it can affect:
+ *
+ *   - file-damaging (returns -1; the caller clears the in-memory
+ *     lists): open/read errors, a line longer than JSON_LINE_MAX
+ *     (which the writer can never emit), and structural incompleteness
+ *     (no "entries" array, a missing ] or }, an entry cut off
+ *     mid-way).  A partial or foreign file must never load as state.
+ *   - entry-damaging (dropped at that entry's '}', the file still
+ *     loads): a present-but-malformed rule_id, or a string value on a
+ *     known numeric field -- admitting either would silently weaken a
+ *     stored rule.
+ *   - field-damaging (the entry may still load): an over-long value is
+ *     truncated by copy_field() with a warning; a non-rule_id value
+ *     whose escapes cannot be decoded is left at its default, and the
+ *     caller's completeness check later drops an entry that ends up
+ *     missing a key.
+ *
+ * A line without a rule_id is legacy state and loads with an empty ID
+ * (the daemon assigns one when migrating).
  */
 int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries)
 {
@@ -772,7 +797,9 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                             "truncating", filepath, max_entries);
                     warned_truncated = 1;
                 }
-                current = NULL; /* parse the object but store nothing */
+                /* Over the cap: skip the fields but keep tracking the
+                 * object's braces so the state machine still advances. */
+                current = NULL;
             }
             else
             {
@@ -810,7 +837,10 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
             continue;
         }
 
-        /* End of entries array or outer closing brace. */
+        /* End of entries array or outer closing brace.  A '}' seen
+         * while inside the array is tolerated as a missing ']'
+         * hand-edit; the completeness check still requires the outer
+         * '}'. */
         if ((state == S_IN_ENTRIES && (*p == ']' || *p == '}')) ||
             (state == S_OUTSIDE && *p == '}'))
         {
@@ -824,6 +854,8 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
             continue;
         }
 
+        /* No field to apply on this line: array/object clutter, a line
+         * outside any entry, or a field of an over-cap entry. */
         if (state != S_IN_ENTRY || !current)
             continue;
 
@@ -866,6 +898,8 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 log_bad_rule_id(filepath, val_buf);
             }
             else
+                /* Not rule_id: only the known numeric fields can still
+                 * apply; an unknown or undecodable line is tolerated. */
                 apply_entry_number(current, p);
         }
     }
@@ -961,6 +995,17 @@ int persist_write_text(const char *filepath, const char *text)
         }                                                                     \
     } while (0)
 
+/*
+ * persist_save: serialize entries[0..count-1] in exactly the shape
+ * persist_load() reads and commit it atomically (temp file, fsync,
+ * rename): until the rename the previous file is untouched, so a
+ * failure never leaves a half-written state file behind.
+ *
+ * Returns 0 on success; -1 for out-of-range arguments, a field that
+ * does not fit the escape buffer, or any write failure.  Memory is not
+ * touched: callers that mirror a live table on disk must roll their
+ * in-memory changes back on -1 (fanotify.c and pin.c do).
+ */
 int persist_save(const char *filepath, const PersistEntry *entries, int count)
 {
     FILE *fp;

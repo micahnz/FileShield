@@ -200,7 +200,8 @@ static int has_unresolved_dot_segment(const char *path)
  * Returns 0 on success, -1 when the pattern is rejected (the entry is
  * skipped with a log), or -2 when the rejection must refuse the whole
  * config (nothing resolves at /, or a glob that would mark the root
- * filesystem).
+ * filesystem).  On a negative return the contents of out are
+ * unspecified: callers copy or count the pattern only on 0.
  */
 static int rule_pattern_set(char *out, size_t outsz, int *is_glob,
                             int *base_len, const char *raw)
@@ -522,6 +523,10 @@ static int expand_and_append_rule(RuleEntry *rules, int *count,
         }
     }
 
+    /* Zip the two expanded lists: a '~' side yields one entry per real
+     * user, a fixed side or an absent target exactly one, and the
+     * shorter list reuses its last entry so every expansion of the
+     * longer side still gets a rule. */
     int nb = string_array_len(bins);
     int nt = tgts ? string_array_len(tgts) : 1;
     int n = nb > nt ? nb : nt;
@@ -680,6 +685,8 @@ static int add_protected_entry(Config *cfg, char *s)
             free_string_array(paths);
             return -1;
         }
+        /* Fill the next slot first; protected_count is the commit point,
+         * so a rejected path leaves only an uncounted, zeroed slot. */
         ProtectedPath *pp = &cfg->protected[cfg->protected_count];
         int rc = protected_path_set(pp, paths[pi]);
         if (rc == -2)
@@ -694,6 +701,9 @@ static int add_protected_entry(Config *cfg, char *s)
         pp->is_exclude = is_exclude;
         if (is_exclude)
         {
+            /* Index recorded before the count advances: the event hot
+             * path walks exclude_idx[] instead of scanning protected[]
+             * for is_exclude. */
             cfg->exclude_idx[cfg->exclude_count] = cfg->protected_count;
             cfg->exclude_count++;
             /* Audit trail: every carve-out is visible in the journal. */
@@ -730,6 +740,12 @@ static int load_rules(RuleEntry *rules, int *count, const char *section_name,
  * logged and ignored; an invalid value keeps the current/default one.
  * Settings can never make a config unusable, so there is no failure
  * return: a typo is visible in the journal instead of failing startup.
+ *
+ * Only "debug" is staged (debug_set/debug): it drives the global
+ * logging gate, which must not change unless the whole config is
+ * accepted.  Every other key mutates cfg alone, and cfg stays
+ * unpublished until config_load() returns 0, so those are applied
+ * immediately during the parse.
  */
 static void apply_setting(Config *cfg, const char *key, const char *val)
 {
@@ -866,6 +882,24 @@ enum
     SECTION_UNSAFE_ALLOWLIST
 };
 
+/*
+ * config_load: parse 'path' into cfg, which is reset first.  Phases:
+ *
+ *   1. open the file and, when running as root, refuse a regular file
+ *      another user can modify;
+ *   2. reset cfg and seed the notification defaults;
+ *   3. walk the file section by section; helpers append entries and log
+ *      every skip where it happens;
+ *   4. verify the stream ended cleanly;
+ *   5. return with [settings] debug staged in cfg and g_config
+ *      deliberately unpublished (the caller decides whether to accept).
+ *
+ * Every failure is fail closed.  A -1 leaves *cfg partially filled and
+ * must be discarded in favor of the previous config.  Caps (MAX_PATHS,
+ * MAX_RULES) and fail-closed pattern rejections refuse the whole config
+ * instead of dropping entries, because a dropped protection or rule
+ * silently changes access behavior.
+ */
 int config_load(const char *path, Config *cfg)
 {
     if (!path)
@@ -880,7 +914,9 @@ int config_load(const char *path, Config *cfg)
 
     /* The daemon runs as root: a config another user can modify is a
      * privilege-escalation path (e.g. adding an [unsafe_allowlist]
-     * rule), so it is refused rather than merely warned about. */
+     * rule), so it is refused rather than merely warned about.  The
+     * check covers regular files only: a non-regular source (fifo,
+     * device) skips it and reaches the parser. */
     if (geteuid() == 0)
     {
         struct stat st;
@@ -912,6 +948,8 @@ int config_load(const char *path, Config *cfg)
     char line[PATH_MAX * 2];
     int section = SECTION_NONE;
 
+    /* Phase 2: reset the caller's Config (a retry must not inherit the
+     * previous attempt's counts) and seed documented defaults. */
     memset(cfg, 0, sizeof(*cfg));
 
     /*
@@ -926,6 +964,7 @@ int config_load(const char *path, Config *cfg)
     cfg->notify_dedup_seconds = NOTIFY_DEDUP_DEFAULT_S;
     cfg->notify_max = NOTIFY_MAX_DEFAULT;
 
+    /* Phase 3: section walk -- one line at a time, no cross-line state. */
     while (fgets(line, sizeof(line), fp))
     {
         if (!strchr(line, '\n') && !feof(fp))
@@ -1071,6 +1110,7 @@ int config_load(const char *path, Config *cfg)
         }
     }
 
+    /* Phase 4: the stream must have ended cleanly, not on an I/O error. */
     if (ferror(fp))
     {
         log_msg(LOG_ERR, "config_load: read error on %s; refusing the config",

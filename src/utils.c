@@ -220,6 +220,9 @@ int path_under_len(const char *path, const char *dir, size_t dlen)
     if (plen == 0 || dlen == 0)
         return 0; /* an empty directory matches nothing */
 
+    /* Compare on the trailing-slash-free form so "/etc" and "/etc/" mean
+     * the same directory; a bare "/" (root) contains every absolute
+     * path. */
     while (dlen > 1 && dir[dlen - 1] == '/')
         dlen--;
 
@@ -310,6 +313,7 @@ int glob_base_len(const char *pattern)
                 return 0; /* wildcard in the first segment: no base */
             if (seg == pattern + 1 && pattern[0] == '/')
                 return 1; /* wildcard directly under root: base is "/" */
+            /* Base excludes the '/' that opens the wildcard segment. */
             return (int)(seg - pattern - 1);
         }
         if (*end == '\0')
@@ -325,6 +329,9 @@ int glob_match_path(const char *pattern, const char *path)
     size_t plen = seg_len(pp);
     size_t slen = seg_len(sp);
 
+    /* One backtrack slot only: config.c rejects a pattern carrying a
+     * second "**" segment, so the globstar branch can simply overwrite
+     * the remembered one. */
     const char *star_pp = NULL; /* pattern just after the active "**" */
     const char *star_sp = NULL; /* path position the "**" started at */
     size_t star_slen = 0;
@@ -498,6 +505,20 @@ int proc_stat_session(pid_t pid, unsigned long long *sid_out,
 /*  multi-user home expansion                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Regular-user uid range for ~/... expansion: below 1000 are system and
+ * service accounts; 65534 is nobody (the kernel's overflow uid), which is
+ * not a real login and on some systems aliases nfsnobody.
+ */
+#define HOME_UID_MIN 1000
+#define HOME_UID_MAX 65534
+
+/*
+ * All-or-nothing by design: a user silently dropped here (OOM, or a
+ * /etc/passwd read that fails mid-enumeration) would leave that user's
+ * home unprotected while the config still "loads fine", so every failure
+ * path returns NULL and config_load() refuses the config.
+ */
 char **expand_home_all_users(const char *path)
 {
     /* Not a ~/... pattern: return a single-element array unchanged. */
@@ -536,7 +557,7 @@ char **expand_home_all_users(const char *path)
             break;
 
         /* Skip system/service accounts; only expand for real users. */
-        if (pw->pw_uid < 1000 || pw->pw_uid >= 65534)
+        if (pw->pw_uid < HOME_UID_MIN || pw->pw_uid >= HOME_UID_MAX)
             continue;
         if (!pw->pw_dir || pw->pw_dir[0] == '\0')
             continue;
@@ -597,7 +618,9 @@ char **expand_home_all_users(const char *path)
 
     if (count == 0)
     {
-        /* No users found — return the original path unchanged. */
+        /* No real users: hand the unexpanded path back so validation still
+         * sees (and logs) it as a relative path, instead of it silently
+         * expanding to zero protected entries. */
         free(result);
         result = malloc(2 * sizeof(char *));
         if (!result)

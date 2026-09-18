@@ -160,9 +160,9 @@ static const char *session_label(int deny)
 }
 
 /*
- * Parse a "allow"/"deny" argument.  Returns 0/1, or -1 when the token is
- * not a list name.  NULL means "not given"; the caller decides the
- * default.
+ * Parse an "allow"/"deny" argument.  Returns 0 for allow, 1 for deny, -2
+ * when the token is not a list name, and -1 for NULL ("not given"; the
+ * caller decides the default).  Every caller only tests for < 0.
  */
 static int parse_list(const char *arg)
 {
@@ -509,6 +509,8 @@ static int cmd_list(const char *filter)
     PersistEntry *allow = NULL, *deny = NULL;
     PinRecord *pins = NULL;
     int na = 0, nd = 0, np = 0;
+    /* Sticky failure flag: a failed load or allocation skips rendering but
+     * must still flow through the single cleanup path below. */
     int rc = 0;
 
     if (want_allow && load_entries(0, &allow, &na) < 0)
@@ -537,6 +539,8 @@ static int cmd_list(const char *filter)
 
     if (want_allow || want_deny)
     {
+        /* +1 keeps the allocation nonzero when both lists are empty, so
+         * an empty table is never mistaken for an allocation failure. */
         rule_rows = calloc((size_t)(na + nd) + 1, sizeof(*rule_rows));
         if (!rule_rows)
         {
@@ -558,6 +562,9 @@ static int cmd_list(const char *filter)
             build_pin_rows(pins, np, pin_rows, &n_pins);
     }
 
+    /* All shaping of stored fields (control bytes -> '?', tail truncation,
+     * JSON escaping) happens inside the cli_ui renderers; cli.c only hands
+     * over the loaded records. */
     if (rc == 0 && g_json)
     {
         cli_ui_render_list_json(stdout, sections, rule_rows, n_rules,
@@ -1376,6 +1383,8 @@ static int cmd_prune(const char *which)
      * removed count (printed below) stays authoritative. */
     int total_groups = 0;
 
+    /* Each prune_list() prints one list's duplicate report and returns its
+     * group count; only the sum matters here, as the prompt gate. */
     if (want_allow)
     {
         int g = prune_list(0);
@@ -1410,6 +1419,9 @@ static int cmd_prune(const char *which)
         return 1;
     }
 
+    /* One request: the daemon prunes its in-memory lists and rewrites the
+     * files together.  "both" mirrors this default scope; the no-listener
+     * branch below recomputes the same groups locally. */
     const char *what = want_allow && want_deny ? "both"
                        : want_allow             ? "allow"
                                                 : "deny";
@@ -1807,6 +1819,9 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
+    /* Session rules live only in daemon memory, so the snapshot the IDs
+     * are resolved against has to come over the socket first; there is no
+     * state file to fall back to (unlike rules and pins). */
     if ((want_allow &&
          session_fetch(0, store, CLI_SESSION_MAX, &count) < 0) ||
         (want_deny &&
@@ -1816,10 +1831,12 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         return 1;
     }
 
-    /* Resolve every ID before asking, then act on the snapshot.  As in
-     * the rules/pins paths, repeated IDs collapse to one: a duplicate
-     * would otherwise be removed twice and the second daemon reply
-     * ("no match") would fail an otherwise successful request. */
+    /* Resolve every ID before asking, then act on the snapshot; a failed
+     * resolve aborts before the first request, so a typo cannot remove
+     * part of the batch.  As in the rules/pins paths, repeated IDs
+     * collapse to one: a duplicate would otherwise be removed twice and
+     * the second daemon reply ("no match") would fail an otherwise
+     * successful request. */
     int *indices = calloc((size_t)n + 1, sizeof(*indices));
     char (*full)[RULEID_HEX_LEN + 1] =
         calloc((size_t)n + 1, sizeof(*full));
@@ -1872,6 +1889,10 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         return 1;
     }
 
+    /* One request per ID (the current wire verb removes exactly one
+     * record).  The batch was resolved and deduped up front, so the only
+     * partial state reachable here is the daemon going away mid-loop; the
+     * error branch reports how many IDs already went through. */
     for (int i = 0; i < n; i++)
     {
         char request[128];
@@ -2052,6 +2073,9 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}};
     int opt;
 
+    /* GNU getopt permutes argv, so global flags may follow the command
+     * word (e.g. `prune -n`); when parsing stops, argv[optind..] holds
+     * the command and its arguments only. */
     while ((opt = getopt_long(argc, argv, "ynhv", long_opts, NULL)) != -1)
     {
         switch (opt)
@@ -2085,9 +2109,12 @@ int main(int argc, char *argv[])
     const char *cmd = argv[optind++];
     int rest = argc - optind;
 
-    /* Command dispatch.  Each branch validates its own arity first and
-     * prints the concrete command line on a usage error (exit 2); data
-     * and transport errors are reported by the handlers (exit 1). */
+    /* Command dispatch, a flat if-chain: each branch validates its own
+     * arity first and prints the concrete command line on a usage error
+     * (exit 2); data and transport errors are reported by the handlers
+     * (exit 1).  Exit codes: 0 success (including "nothing to do"), 1
+     * domain failure, 2 usage.  The first match returns; an unknown
+     * command falls through to the usage dump below. */
     if (strcmp(cmd, "list") == 0)
     {
         if (rest > 1)
