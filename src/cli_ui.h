@@ -27,6 +27,10 @@
  *    a narrow terminal (the end is the informative part of a path);
  *    control characters become '?' first.  --wide disables truncation
  *    of binary/args/target.  ID/Rule/SID/Expires are never truncated.
+ *  - Confirmation listings (cli_ui_render_confirm_line()) shape their
+ *    dynamic fields with the same cell shaping the tables use, so the
+ *    [y/N] listing can never echo raw bytes and shows exactly what the
+ *    table would have shown.
  *  - Column widths are natural (header and content) when the line fits
  *    the terminal; otherwise the flexible columns are capped so the
  *    table fits.  A table always prints its header, even with no rows.
@@ -136,8 +140,11 @@ void cli_ui_arg_column(const char *cmdline, char *dst, size_t dst_size);
 
 /*
  * Create the CHAIN cell: "comm1 > comm2 > comm3" from the first 'depth'
- * entries of comms with empty entries skipped.  Depth 0 (or every entry
- * empty) renders "(none)".  Control characters are sanitized.
+ * entries of comms with empty entries skipped.  'depth' is clamped to
+ * PERSIST_CHAIN_MAX inside the renderer (a damaged entry may carry a
+ * larger value), so it can never index past comms[PERSIST_CHAIN_MAX-1].
+ * Depth 0 (or every entry empty) renders "(none)".  Control characters
+ * are sanitized.
  */
 void cli_ui_chain_column(const char (*comms)[CLI_UI_COMM_MAX], int depth,
                          char *dst, size_t dst_size);
@@ -179,6 +186,26 @@ int cli_confirm_parse(const char *line);
  * and reads one line from stdin: only y/Y confirms.
  */
 int cli_confirm(const char *prompt, int yes_flag);
+
+/*
+ * One confirmation-listing line, printed before a [y/N] prompt:
+ *
+ *   "  <id>: <from>"
+ *   "  <id>: <from> -> <to>"    (only when 'to' is non-NULL)
+ *
+ * Dynamic (attacker-influenced) fields are shaped exactly like table
+ * cells through cli_ui_truncate_tail(): control bytes become '?' and a
+ * value longer than the cell cap is tail-truncated behind a leading
+ * "...".  A confirmation listing therefore cannot echo raw terminal
+ * escapes, and a long path keeps its informative end.  'id' is printed
+ * at CLI_UI_ID_WIDE (16) chars.  'wide' non-zero disables truncation
+ * (sanitization stays), matching --wide tables; otherwise each cell is
+ * capped at an equal share of 'width' (see cli_ui_terminal_width()) left
+ * after the fixed line parts, never below CLI_UI_COL_MIN.  A NULL 'from'
+ * renders as an empty cell; nothing is written when out is NULL.
+ */
+void cli_ui_render_confirm_line(FILE *out, const char *id, const char *from,
+                                const char *to, int width, int wide);
 
 /* ------------------------------------------------------------------ */
 /* Tables                                                             */

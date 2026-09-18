@@ -855,6 +855,25 @@ static int fallback_remove_pins(const char (*full)[RULEID_HEX_LEN + 1], int n)
 }
 
 /*
+ * Append one TAB-separated field to the request under construction.
+ * 'used' is its current length; returns the new length, or -1 when the
+ * field does not fit.  The caller refuses a request that would be
+ * truncated: it is never assembled past the buffer or sent half-formed.
+ */
+static int request_append(char *request, size_t size, int used,
+                          const char *field)
+{
+    int n;
+
+    if (used < 0 || (size_t)used >= size)
+        return -1;
+    n = snprintf(request + used, size - (size_t)used, "\t%s", field);
+    if (n < 0 || (size_t)n >= size - (size_t)used)
+        return -1;
+    return used + n;
+}
+
+/*
  * Send the remove request in chunks of CONTROL_MAX_IDS IDs.  On return:
  * 0 with *removed_out set when the daemon applied the chunks; 0 with
  * *no_listener set when no daemon answered (the caller then edits the
@@ -878,14 +897,25 @@ static int remove_over_socket(const char *verb, const char *list_arg,
             chunk = CONTROL_MAX_IDS;
 
         /* "VERB[\tlist]" then one "\t<id>" per chunk member; IDs are 16
-         * hex chars, so the 4 KiB request bound cannot be reached. */
+         * hex chars, so the 4 KiB request bound cannot be reached.  The
+         * checks below still refuse a request that would not fit instead
+         * of letting sizeof(request) - pos underflow. */
         pos = snprintf(request, sizeof(request), "%s", verb);
+        if (pos < 0 || (size_t)pos >= sizeof(request))
+        {
+            fprintf(stderr, "error: control request does not fit its buffer\n");
+            return -1;
+        }
         if (list_arg)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", list_arg);
-        for (int i = 0; i < chunk; i++)
-            pos += snprintf(request + pos, sizeof(request) - (size_t)pos,
-                            "\t%s", full[start + i]);
+            pos = request_append(request, sizeof(request), pos, list_arg);
+        for (int i = 0; i < chunk && pos >= 0; i++)
+            pos = request_append(request, sizeof(request), pos,
+                                 full[start + i]);
+        if (pos < 0)
+        {
+            fprintf(stderr, "error: control request does not fit its buffer\n");
+            return -1;
+        }
 
         int rc = ctl_call(request, &resp);
 
@@ -936,9 +966,13 @@ static int remove_rules(int deny, char *const *inputs, int n)
     n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d %s rule(s):\n", n, rule_label(deny));
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s -> %s\n", entries[indices[i]].rule_id,
-               entries[indices[i]].binary, entries[indices[i]].target_path);
+        cli_ui_render_confirm_line(stdout, full[i], entries[indices[i]].binary,
+                                   entries[indices[i]].target_path, width,
+                                   g_wide);
 
     if (!cli_confirm("Remove these rules?", g_yes))
     {
@@ -996,8 +1030,12 @@ static int remove_pins(char *const *inputs, int n)
     n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d pin(s):\n", n);
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s\n", full[i], rows[indices[i]].pattern);
+        cli_ui_render_confirm_line(stdout, full[i], rows[indices[i]].pattern,
+                                   NULL, width, g_wide);
 
     if (!cli_confirm("Remove these pins?", g_yes))
     {
@@ -1140,13 +1178,12 @@ static void format_time(time_t t, char *out, size_t outsz)
 {
     struct tm tm;
 
-    if (t <= 0)
-    {
+    /* Mirror cli_ui.c's format_epoch(): a time_t the libc cannot convert
+     * (corrupt created_at) must not make strftime() read a struct tm
+     * localtime_r() never filled. */
+    if (t <= 0 || localtime_r(&t, &tm) == NULL ||
+        strftime(out, outsz, "%Y-%m-%d %H:%M:%S", &tm) == 0)
         snprintf(out, outsz, "(unknown)");
-        return;
-    }
-    localtime_r(&t, &tm);
-    strftime(out, outsz, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
 /*
@@ -1576,9 +1613,33 @@ static int session_by_id(const SessionStore *store, int count,
     return 1;
 }
 
+/*
+ * now + ttl for display, bounded so a corrupt or hostile TTL (it arrives
+ * over the control socket) can never overflow time_t: saturation lands
+ * outside localtime_r()'s range, which renders "(unknown)" instead.  The
+ * unsigned sum is well defined; a failed time(NULL) (-1) is treated as
+ * the epoch for the base.
+ */
+static time_t deadline_after(time_t now, long ttl)
+{
+    unsigned long long sum;
+
+    if (ttl <= 0)
+        return now;
+    if (now < 0)
+        now = 0;
+    sum = (unsigned long long)now + (unsigned long long)ttl;
+    if (sum > (unsigned long long)LLONG_MAX)
+        return (time_t)LLONG_MAX;
+    return (time_t)sum;
+}
+
 static void format_expiry(long ttl, char *out, size_t outsz)
 {
     char human[32];
+    char abs_time[32];
+    struct tm tm;
+    time_t when;
 
     if (ttl < 0)
     {
@@ -1593,12 +1654,13 @@ static void format_expiry(long ttl, char *out, size_t outsz)
     else
         snprintf(human, sizeof(human), "%lds", ttl);
 
-    time_t when = time(NULL) + ttl;
-    struct tm tm;
-    char abs_time[32];
-
-    localtime_r(&when, &tm);
-    strftime(abs_time, sizeof(abs_time), "%Y-%m-%d %H:%M:%S", &tm);
+    /* Mirrors cli_ui.c's format_epoch(): a deadline the libc cannot
+     * convert renders "(unknown)" instead of reading an uninitialized
+     * struct tm. */
+    when = deadline_after(time(NULL), ttl);
+    if (localtime_r(&when, &tm) == NULL ||
+        strftime(abs_time, sizeof(abs_time), "%Y-%m-%d %H:%M:%S", &tm) == 0)
+        snprintf(abs_time, sizeof(abs_time), "(unknown)");
     snprintf(out, outsz, "%s (in %s)", abs_time, human);
 }
 
@@ -1754,12 +1816,20 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         return 1;
     }
 
-    /* Resolve every ID before asking, then act on the snapshot. */
+    /* Resolve every ID before asking, then act on the snapshot.  As in
+     * the rules/pins paths, repeated IDs collapse to one: a duplicate
+     * would otherwise be removed twice and the second daemon reply
+     * ("no match") would fail an otherwise successful request. */
     int *indices = calloc((size_t)n + 1, sizeof(*indices));
-    if (!indices)
+    char (*full)[RULEID_HEX_LEN + 1] =
+        calloc((size_t)n + 1, sizeof(*full));
+
+    if (!indices || !full)
     {
         fprintf(stderr, "error: out of memory\n");
         free(store);
+        free(indices);
+        free(full);
         return 1;
     }
     for (int i = 0; i < n; i++)
@@ -1776,20 +1846,29 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         {
             free(store);
             free(indices);
+            free(full);
             return 1;
         }
+        memcpy(full[i], store[indices[i]].row.id, RULEID_HEX_LEN + 1);
     }
+    n = dedupe_full_ids(full, indices, n);
 
     printf("Will remove %d session rule(s):\n", n);
+
+    int width = cli_ui_terminal_width(stdout);
+
     for (int i = 0; i < n; i++)
-        printf("  %.16s: %s -> %s\n", store[indices[i]].row.id,
-               store[indices[i]].row.binary, store[indices[i]].row.target);
+        cli_ui_render_confirm_line(stdout, full[i],
+                                   store[indices[i]].row.binary,
+                                   store[indices[i]].row.target, width,
+                                   g_wide);
 
     if (!cli_confirm("Remove these session rules?", g_yes))
     {
         printf("aborted; nothing removed\n");
         free(store);
         free(indices);
+        free(full);
         return 1;
     }
 
@@ -1799,21 +1878,21 @@ static int session_remove_cmd(const char *list, char **ids, int n)
         ControlResponse resp;
 
         snprintf(request, sizeof(request), "SESSION_REMOVE\t%s\t%s",
-                 store[indices[i]].row.is_deny ? "deny" : "allow",
-                 store[indices[i]].row.id);
+                 store[indices[i]].row.is_deny ? "deny" : "allow", full[i]);
         int rc = ctl_call(request, &resp);
 
-        if (rc == 1)
+        if (rc != 0)
         {
-            fprintf(stderr, "error: the fileshield daemon is not running\n");
+            if (rc == 1)
+                fprintf(stderr,
+                        "error: the fileshield daemon is not running\n");
+            /* IDs earlier in the batch are already gone; report the
+             * partial count instead of a bare failure. */
+            if (removed > 0)
+                printf("removed %d session rule(s)\n", removed);
             free(store);
             free(indices);
-            return 1;
-        }
-        if (rc < 0)
-        {
-            free(store);
-            free(indices);
+            free(full);
             return 1;
         }
         removed++;
@@ -1821,6 +1900,7 @@ static int session_remove_cmd(const char *list, char **ids, int n)
     printf("removed %d session rule(s)\n", removed);
     free(store);
     free(indices);
+    free(full);
     return 0;
 }
 

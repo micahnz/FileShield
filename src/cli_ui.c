@@ -75,6 +75,10 @@ static int chain_text_width(const char (*comms)[CLI_UI_COMM_MAX], int depth)
     int width = 0;
     int parts = 0;
 
+    /* Damaged state can carry depth > PERSIST_CHAIN_MAX; never read past
+     * the last real chain entry. */
+    if (depth > PERSIST_CHAIN_MAX)
+        depth = PERSIST_CHAIN_MAX;
     for (i = 0; comms != NULL && i < depth; i++)
     {
         if (comms[i][0] == '\0')
@@ -206,6 +210,10 @@ void cli_ui_chain_column(const char (*comms)[CLI_UI_COMM_MAX], int depth,
         return;
     dst[0] = '\0';
 
+    /* Damaged state can carry depth > PERSIST_CHAIN_MAX; never read past
+     * the last real chain entry. */
+    if (depth > PERSIST_CHAIN_MAX)
+        depth = PERSIST_CHAIN_MAX;
     for (i = 0; comms != NULL && i < depth; i++)
     {
         if (comms[i][0] == '\0')
@@ -300,6 +308,43 @@ int cli_confirm(const char *prompt, int yes_flag)
     if (!fgets(line, sizeof(line), stdin))
         return 0; /* EOF/error is never consent */
     return cli_confirm_parse(line);
+}
+
+/* Per-cell cap for a confirmation line: equal share of 'width' after the
+ * fixed parts ("  ", the 16-char ID and ": ", plus " -> " for two
+ * fields), never below CLI_UI_COL_MIN so a narrow terminal overflows
+ * instead of hiding the cells (the table rule). */
+static int confirm_cell_cap(int width, int fields)
+{
+    int fixed = 2 + CLI_UI_ID_WIDE + 2 + (fields > 1 ? 4 : 0);
+    int cap;
+
+    if (width < 0)
+        width = 0;
+    cap = (width - fixed) / fields;
+    if (cap < CLI_UI_COL_MIN)
+        cap = CLI_UI_COL_MIN;
+    return cap;
+}
+
+void cli_ui_render_confirm_line(FILE *out, const char *id, const char *from,
+                                const char *to, int width, int wide)
+{
+    char from_cell[PATH_MAX];
+    char to_cell[PATH_MAX];
+    int cap = wide ? PATH_MAX - 1
+                   : confirm_cell_cap(width, to != NULL ? 2 : 1);
+
+    if (!out)
+        return;
+    cli_ui_truncate_tail(from, cap, from_cell, sizeof(from_cell));
+    if (to)
+    {
+        cli_ui_truncate_tail(to, cap, to_cell, sizeof(to_cell));
+        fprintf(out, "  %.16s: %s -> %s\n", id ? id : "", from_cell, to_cell);
+    }
+    else
+        fprintf(out, "  %.16s: %s\n", id ? id : "", from_cell);
 }
 
 void cli_ui_render_rules(FILE *out, const CliRuleRow *rows, int count,
