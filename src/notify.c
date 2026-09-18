@@ -30,7 +30,7 @@ static long long now_ms(void)
 }
 
 /*
- * Fanotify fd stored here so run_kdialog() can pump pending events
+ * Fanotify fd stored here so the dialog runners can pump pending events
  * while waiting for the dialog child (prevents mount-mark deadlock).
  */
 static int g_fan_fd = -1;
@@ -600,188 +600,11 @@ static void kill_and_reap(pid_t pid, int *status, int *child_exited)
                 (int)pid);
 }
 
-/*
- * Map a reaped dialog child's wait(2) status to its button index
- * (0 = Yes, 1 = No, 2 = Cancel), or -1 for anything that must deny.
- * Pure apart from the timeout log, so the fail-closed mapping can be
- * reviewed and table-tested in one place:
- *   - not a normal exit (killed by the outer timeout path)  -> -1
- *   - 124: coreutils timeout(1) killed kdialog               -> -1
- *   - 0/1/2: Yes / No / Cancel                               -> 0/1/2
- *   - anything else (e.g. 127 exec failure)                  -> -1
- */
-static int kdialog_status_to_choice(int status)
-{
-    if (!WIFEXITED(status))
-        return -1;
-
-    int ec = WEXITSTATUS(status);
-    if (ec == 124) /* coreutils timeout(1) */
-    {
-        log_msg(LOG_WARNING, "[dialog] kdialog timed out (30s)");
-        return -1;
-    }
-    if (ec >= 0 && ec <= 2)
-        return ec;
-    return -1;
-}
-
-/* Test seam (notify.h): the dialog exit-status mapping. */
-int notify_test_kdialog_choice(int status)
-{
-    return kdialog_status_to_choice(status);
-}
-
 /* Both dialog children exec this kdialog; notify_test_set_kdialog_path()
  * can swap it for a scripted stand-in so the fork/pipe/drain mechanics,
  * the argv shape and the hash-change body can be proven without a
  * desktop click. */
 static char g_kdialog_path[PATH_MAX] = "/usr/bin/kdialog";
-
-/*
- * run_kdialog: show a kdialog --yesnocancel prompt with custom button
- * labels and return 0 = yes, 1 = no, 2 = cancel/window close,
- * -1 = failure/timeout.
- *
- * kdialog is wrapped in timeout(1) so a hung compositor cannot block the
- * event loop forever.  While waiting, pending fanotify events are pumped:
- * kdialog opens its own config files, which can generate FAN_OPEN_PERM
- * events on mount-marked filesystems and would otherwise deadlock the
- * helper behind the daemon's blocked event.
- *
- * kdialog returns 1 both for a deliberate No click and for some runtime
- * errors.  Only exit 0 (the Yes result) approves; No, Cancel, window
- * close, timeouts, exec failures and runtime errors all deny.
- */
-static int run_kdialog(const DisplaySession *session,
-                       const DialogEnvSetting *env, int env_count,
-                       const char *text, const char *yes_label,
-                       const char *no_label, const char *cancel_label)
-{
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        log_msg(LOG_ERR, "fork failed for kdialog: %m");
-        return -1;
-    }
-
-    if (pid == 0)
-    {
-        /* Own process group so the timeout kill cannot touch the daemon
-         * and so events from every dialog helper can be recognized. */
-        setpgid(0, 0);
-        drop_to_session_user(session);
-        /* Export the detected display only here, in the child: the daemon
-         * environment stays untouched so one user's session cannot leak
-         * into another prompt or into unrelated helpers. */
-        apply_display_env(session);
-        /* Let kdialog see the user's theme/font/scale/locale settings. */
-        apply_dialog_env(env, env_count);
-        close_fds_from(3);
-
-        /* exec resets only caught/default dispositions, so the daemon's
-         * SIG_IGN would leak into kdialog/timeout as ignored SIGPIPE. */
-        signal(SIGPIPE, SIG_DFL);
-
-        /* No argv[0] slot for kdialog here either: timeout sets the
-         * child's argv[0] to the command path itself, so the previous
-         * "kdialog" string landed as a stray positional (KMessageBox
-         * showed it as the details text). */
-        /* Preselect the deny button: kdialog's --default takes a button
-         * label, so reuse --no-label.  Only exit 0 approves (see
-         * kdialog_status_to_choice()).  kdialog 22.12+ documents
-         * --default for menu/combobox/color/calendar only and ignores
-         * it on message boxes, so the preselection is best-effort
-         * there; the exit-code contract below is the enforced part. */
-        execl("/usr/bin/timeout", "timeout", "30",
-              g_kdialog_path,
-              "--title", "Fileshield",
-              "--yesnocancel", text,
-              "--yes-label", yes_label,
-              "--no-label", no_label,
-              "--cancel-label", cancel_label,
-              "--default", no_label,
-              (char *)NULL);
-        _exit(127);
-    }
-
-    /* Parent-only: the child never reaches here (it execs or exits), so
-     * logging before the branch would double-log and stamp the journal
-     * with a second, confusing fileshield[pid]. */
-    log_msg(LOG_DEBUG, "[dialog] forked kdialog child pid=%d", (int)pid);
-
-    log_msg(LOG_DEBUG, "[dialog] parent waiting for kdialog (pid=%d)", (int)pid);
-    int child_exited = 0;
-    int status = 0;
-    long long deadline = now_ms() + DIALOG_OUTER_TIMEOUT_S * 1000;
-
-    while (!child_exited && now_ms() < deadline)
-    {
-        if (!g_running || g_fatal)
-        {
-            /* Shutdown while a dialog is open: stop waiting so the daemon
-             * terminates promptly (bounded shutdown latency). */
-            log_msg(LOG_WARNING,
-                    "[dialog] shutdown while a dialog is open; denying it");
-            break;
-        }
-
-        struct pollfd pfd;
-        int nfds = 0;
-
-        if (g_fan_fd >= 0)
-        {
-            pfd.fd = g_fan_fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            nfds = 1;
-        }
-
-        int ret = poll(nfds ? &pfd : NULL, (nfds_t)nfds, 200); /* 200 ms tick */
-        if (ret < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-
-        /* Pump fanotify first so the dialog child is never stalled. */
-        if (nfds && (pfd.revents & POLLIN))
-            fanotify_pump(g_fan_fd, pid);
-
-        /* Non-blocking child-exit check. */
-        pid_t wr = waitpid(pid, &status, WNOHANG);
-        if (wr == pid)
-        {
-            child_exited = 1;
-        }
-        else if (wr < 0 && errno != EINTR)
-        {
-            log_msg(LOG_ERR, "waitpid failed: %m");
-            /* Do not leak the child: it may still be on screen, and an
-             * unreaped zombie would linger. */
-            kill_and_reap(pid, &status, &child_exited);
-            return -1;
-        }
-    }
-
-    if (!child_exited)
-    {
-        log_msg(LOG_WARNING,
-                "[dialog] kdialog timeout or shutdown, killing pid=%d",
-                (int)pid);
-        kill_and_reap(pid, &status, &child_exited);
-    }
-
-    log_msg(LOG_DEBUG, "[dialog] kdialog exited status=0x%x ec=%d",
-            status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-
-    /* A child killed by the outer timeout, an exec failure (127) or any
-     * unexpected exit code is a failure: the caller fails closed. */
-    if (!child_exited)
-        return -1;
-    return kdialog_status_to_choice(status);
-}
 
 /*
  * Escape a plain string for safe embedding in the prompt's rich text.
@@ -1377,11 +1200,16 @@ int notify_ask(const NotifyRequest *req)
 }
 
 /*
- * Prompt for a changed [allowlist] binary hash.  One decision only:
- * Yes = "Update & Allow" (the caller persists new_hash and grants the
- * access), No/Cancel/window close/timeout/failure = deny this attempt
- * with the old pin kept.  The two-stage grant flow is deliberately not
- * involved: the change already names one rule, one binary and one file.
+ * Prompt for a changed [allowlist] binary hash.  A two-row --menu
+ * (Update & Allow first, Deny preselected): only the "update" tag on
+ * kdialog's stdout with a zero exit code approves (the caller persists
+ * new_hash and grants the access); Deny, window close, timeout, exec or
+ * runtime failures leave no usable tag and deny this attempt with the
+ * old pin kept.  The menu's positive stdout channel is what makes an
+ * accidental Enter safe: the preselected deny row emits "deny", so
+ * kdialog's message-box default-to-Yes behavior is not involved.  The
+ * two-stage grant flow is deliberately not involved: the change already
+ * names one rule, one binary and one file.
  *
  * Rate limiting is the caller's job (see notify.h): the pipeline must
  * reject dialog_rate_limited() binaries before calling so a tampered
@@ -1439,7 +1267,8 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     static const char fallback_body[] =
         "SHA-512 changed for an allowlist rule.\n\n"
         "Update & Allow trusts the new binary and records the new hash.\n"
-        "Deny / Cancel blocks this attempt and keeps the old hash.";
+        "Deny (or closing this dialog) blocks this attempt and keeps the "
+        "old hash.";
     const char *body_text = fallback_body;
 
     if (html_escape(rule, e_rule, sizeof(e_rule)) == 0 &&
@@ -1462,7 +1291,8 @@ int notify_ask_hash_change(const NotifyHashChange *req)
                  "New SHA-512: %.16s\xe2\x80\xa6\n\n"
                  "Update & Allow trusts the new binary and records the new "
                  "hash.\n"
-                 "Deny / Cancel blocks this attempt and keeps the old hash.",
+                 "Deny (or closing this dialog) blocks this attempt and "
+                 "keeps the old hash.",
                  e_rule, e_exe, e_path, e_cmd, e_old_hash, e_new_hash);
         if (need >= 0 && (size_t)need < sizeof(body))
             body_text = body;
@@ -1493,9 +1323,20 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     log_msg(LOG_DEBUG, "[dialog] forwarding %d session variables",
             dialog_env_count);
 
-    int r = run_kdialog(&session, dialog_env, dialog_env_count, body_text,
-                        "Update & Allow", "Deny", "Cancel");
-    if (r == 0)
+    /* Two-row menu, same positive stdout channel as the access prompt:
+     * only the "update" tag grants; the deny row is preselected so an
+     * accidental confirm emits "deny".  Every other outcome leaves no
+     * usable tag and denies. */
+    const DialogMenuItem items[] = {
+        { "update", "Update & Allow" },
+        { "deny", "Deny" },
+    };
+    char token[DIALOG_TOKEN_MAX];
+    int r = run_kdialog_menu(&session, dialog_env, dialog_env_count, body_text,
+                             "Deny", items,
+                             (int)(sizeof(items) / sizeof(items[0])), token,
+                             sizeof(token));
+    if (r == 1 && strcmp(token, "update") == 0)
     {
         log_msg(LOG_WARNING,
                 "hash change approved for allowlist rule %s (%s); "
@@ -1505,8 +1346,9 @@ int notify_ask_hash_change(const NotifyHashChange *req)
     }
 
     log_msg(LOG_WARNING,
-            "hash change denied for allowlist rule %s (%s); old pin kept",
-            rule, exe);
+            "hash change denied for allowlist rule %s (%s, selection '%s'); "
+            "old pin kept",
+            rule, exe, token[0] != '\0' ? token : "(none)");
     return NOTIFY_DENY;
 }
 

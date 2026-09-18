@@ -1766,20 +1766,6 @@ static void test_cmdline_fingerprint_full(void) {
 }
 
 /*
- * Part 0k: the dialog exit-status mapping fails closed for everything
- * that is not a definite Yes/No/Cancel.
- */
-static void test_kdialog_status_mapping(void) {
-    ASSERT(notify_test_kdialog_choice(0 << 8) == 0, "exit 0 is Yes");
-    ASSERT(notify_test_kdialog_choice(1 << 8) == 1, "exit 1 is No");
-    ASSERT(notify_test_kdialog_choice(2 << 8) == 2, "exit 2 is Cancel");
-    ASSERT(notify_test_kdialog_choice(124 << 8) == -1, "timeout denies");
-    ASSERT(notify_test_kdialog_choice(127 << 8) == -1, "exec failure denies");
-    ASSERT(notify_test_kdialog_choice(3 << 8) == -1, "unknown code denies");
-    ASSERT(notify_test_kdialog_choice(SIGKILL) == -1, "signal death denies");
-}
-
-/*
  * The kdialog --menu decision seam: a grant exists only as an explicit
  * tag the user selected.  Every other string — including empty, NULL,
  * near-misses and tokens an error path or forged stream might produce —
@@ -2159,13 +2145,13 @@ static void test_menu_end_to_end(void) {
 }
 
 /*
- * Hash-change yesnocancel end-to-end (B1 regression): the scripted
- * kdialog stand-in asserts the exact argv shape (12 args, the
- * --yesnocancel pair, the three labels and --default Deny) and dumps the
- * body, so the test can prove every interpolated value is HTML-escaped.
- * Pre-fix the body carried raw <, > and & (markup injection) and no
- * --default existed, so Enter approved a re-pin: this fails on both
- * counts there.
+ * Hash-change menu end-to-end: the scripted kdialog stand-in asserts the
+ * exact two-row --menu argv (--menu BODY update "Update & Allow" deny
+ * Deny --default Deny) and dumps the body, so the test proves every
+ * interpolated value is HTML-escaped and that only the "update" stdout
+ * tag grants.  Pre-fix (the yesnocancel form) the argv did not match and
+ * the deny default did not gate Enter; the original B1 bug also let raw
+ * <, > and & through, which the escape asserts below catch.
  */
 static void test_hash_change_prompt_escapes(void) {
     log_msg(LOG_DEBUG, "warm up syslog before hash-change child fork");
@@ -2191,39 +2177,40 @@ static void test_hash_change_prompt_escapes(void) {
              g_dlg_dir);
 
     /*
-     * timeout execs the script, so $1..$12 are the kdialog arguments:
-     * --title Fileshield --yesnocancel BODY --yes-label "Update & Allow"
-     * --no-label Deny --cancel-label Cancel --default Deny.
-     * Any mismatch writes a diagnostic to the body dump and exits; a
-     * missing dump then fails the assertions below (that is how the
-     * pre-fix argv fails this test).
+     * timeout execs the script, so $1..$10 are the kdialog arguments:
+     * --title Fileshield --menu BODY update "Update & Allow" deny Deny
+     * --default Deny.  Any mismatch writes a diagnostic to the body dump
+     * and exits; a missing dump then fails the assertions below (that is
+     * how a yesnocancel-shaped argv fails this test).
      */
     ASSERT(dlg_write_script(
                "hashchange.sh",
                "#!/bin/sh\n"
-               "body=\"$FAKE_KDIALOG_YESNO_BODY_DUMP\"\n"
-               "[ \"$#\" -eq 12 ] || { printf 'argv-count:%s' \"$#\" > "
+               "body=\"$FAKE_KDIALOG_HASH_BODY_DUMP\"\n"
+               "[ \"$#\" -eq 10 ] || { printf 'argv-count:%s' \"$#\" > "
                "\"$body\"; exit 1; }\n"
                "[ \"$1\" = \"--title\" ] && [ \"$2\" = \"Fileshield\" ] || "
                "{ printf 'argv-title' > \"$body\"; exit 1; }\n"
-               "[ \"$3\" = \"--yesnocancel\" ] || { printf 'argv-mode' > "
+               "[ \"$3\" = \"--menu\" ] || { printf 'argv-mode' > "
                "\"$body\"; exit 1; }\n"
-               "[ \"$5\" = \"--yes-label\" ] && [ \"$6\" = \"Update & "
-               "Allow\" ] || { printf 'argv-yes-label' > \"$body\"; exit 1; "
-               "}\n"
-               "[ \"$7\" = \"--no-label\" ] && [ \"$8\" = \"Deny\" ] || { "
-               "printf 'argv-no-label' > \"$body\"; exit 1; }\n"
-               "[ \"$9\" = \"--cancel-label\" ] && [ \"${10}\" = \"Cancel\" "
-               "] || { printf 'argv-cancel-label' > \"$body\"; exit 1; }\n"
-               "printf '%s|%s' \"${11}\" \"${12}\" > "
-               "\"$FAKE_KDIALOG_YESNO_DEFAULT_DUMP\"\n"
+               "[ \"$5\" = \"update\" ] && [ \"$6\" = \"Update & Allow\" ] "
+               "|| { printf 'argv-allow-row' > \"$body\"; exit 1; }\n"
+               "[ \"$7\" = \"deny\" ] && [ \"$8\" = \"Deny\" ] || { "
+               "printf 'argv-deny-row' > \"$body\"; exit 1; }\n"
+               "[ \"$9\" = \"--default\" ] && [ \"${10}\" = \"Deny\" ] || { "
+               "printf 'argv-default' > \"$body\"; exit 1; }\n"
+               "printf '%s|%s' \"$9\" \"${10}\" > "
+               "\"$FAKE_KDIALOG_HASH_DEFAULT_DUMP\"\n"
                "printf '%s' \"$4\" > \"$body\"\n"
-               "case \"$FAKE_KDIALOG_YESNO_MODE\" in approve) exit 0 ;; esac\n"
+               "case \"$FAKE_KDIALOG_HASH_MODE\" in "
+               "approve) printf 'update'; exit 0 ;; "
+               "deny) printf 'deny'; exit 0 ;; "
+               "empty) exit 0 ;; esac\n"
                "exit 1\n") == 0,
            "write fake kdialog hash-change script");
 
-    (void)setenv("FAKE_KDIALOG_YESNO_BODY_DUMP", body_dump, 1);
-    (void)setenv("FAKE_KDIALOG_YESNO_DEFAULT_DUMP", default_dump, 1);
+    (void)setenv("FAKE_KDIALOG_HASH_BODY_DUMP", body_dump, 1);
+    (void)setenv("FAKE_KDIALOG_HASH_DEFAULT_DUMP", default_dump, 1);
 
     /* Every field carries markup an attacker could use to forge the
      * body; all of them must arrive as entities. */
@@ -2240,9 +2227,9 @@ static void test_hash_change_prompt_escapes(void) {
 
     notify_test_set_kdialog_path(script);
 
-    ASSERT(setenv("FAKE_KDIALOG_YESNO_MODE", "deny", 1) == 0, "deny mode");
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "deny", 1) == 0, "deny mode");
     ASSERT(notify_ask_hash_change(&req) == NOTIFY_DENY,
-           "hash-change deny mode denies (old pin kept)");
+           "an emitted deny tag denies (old pin kept)");
 
     char dump[8192];
     ASSERT(dlg_read_dump("hashchange-body.txt", dump, sizeof(dump)) > 0,
@@ -2266,13 +2253,19 @@ static void test_hash_change_prompt_escapes(void) {
                          sizeof(defdump)) > 0,
            "hash-change default dump written");
     ASSERT(strcmp(defdump, "--default|Deny") == 0,
-           "--default preselects the deny button (Enter never re-pins)");
+           "--default preselects the deny row (Enter emits the deny tag)");
 
-    /* An explicit approve (kdialog exit 0) still updates the pin. */
-    ASSERT(setenv("FAKE_KDIALOG_YESNO_MODE", "approve", 1) == 0,
+    /* Approve mode: the script echoes the allow tag and exits 0. */
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "approve", 1) == 0,
            "approve mode");
     ASSERT(notify_ask_hash_change(&req) == NOTIFY_ALLOW_ALWAYS,
-           "explicit approve grants the update");
+           "explicit update tag grants the update");
+
+    /* Exit 0 with no tag at all must deny (no positive channel). */
+    ASSERT(setenv("FAKE_KDIALOG_HASH_MODE", "empty", 1) == 0,
+           "empty-output mode");
+    ASSERT(notify_ask_hash_change(&req) == NOTIFY_DENY,
+           "empty stdout denies (no usable token)");
 
     notify_test_set_kdialog_path(NULL);
 }
@@ -3980,7 +3973,6 @@ int main(void) {
     test_recent_decision_cache();
     test_dialog_env_whitelist();
     test_merge_proc_environ();
-    test_kdialog_status_mapping();
     test_menu_choice_mapping();
     test_menu_end_to_end();
     test_hash_change_prompt_escapes();

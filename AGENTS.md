@@ -124,8 +124,10 @@ timeout, exec failures and kdialog's runtime errors (including the exit-1
 class it shares with the old No button) produce no stdout and therefore
 **deny**, so no error path can persist a rule: this replaces the
 two-stage button flow and withdraws its accepted exit-1 trade-off.  The
-hash-change prompt stays `kdialog --yesnocancel`: only Yes (exit 0)
-approves; every other outcome denies and keeps the old pin.  The menu
+hash-change prompt is the same two-row `kdialog --menu` shape (Update &
+Allow first, Deny preselected): only its `update` tag on stdout with a
+zero exit code approves; every other outcome denies and keeps the old
+pin.  The menu
 requires KF6 kdialog argv shape (`--menu TEXT tag item [tag item] ...`);
 an older kdialog misparses it and denies (fail closed).  Each scope
 (the six rows and the body bullets) pairs its name inline with a concise
