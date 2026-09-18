@@ -4740,8 +4740,9 @@ void fanotify_loop(int fd, int wake_fd, int control_fd)
         /*
          * Serve at most one bounded batch of control clients per wake.
          * control_handle() is non-blocking by contract (bounded accepts,
-         * one bounded read per connection), so no retry or wait belongs
-         * here and a client can never hold the loop.  A broken listener
+         * bounded non-blocking reads per connection), so no retry or
+         * wait belongs here and a client can never hold the loop.  A
+         * broken listener
          * is dropped from this loop's poll set (the local copy is set to
          * -1) rather than closing it or failing the daemon: a CLI
          * transport failure must not stop protection, and main.c owns
